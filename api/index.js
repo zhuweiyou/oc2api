@@ -229,7 +229,7 @@ function healthResponse() {
 	return jsonResponse({
 		status: "ok",
 		version: PROXY_VERSION,
-		endpoints: ["/v1/chat/completions", "/chat/completions", "/v1/models", "/models", "/ip"],
+		endpoints: ["/v1/chat/completions", "/chat/completions", "/v1/models", "/models", "/health", "/ip"],
 	});
 }
 
