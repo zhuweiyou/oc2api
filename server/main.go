@@ -489,14 +489,9 @@ type zenRequest struct {
 
 const reasoningPlaceholder = " "
 
-func injectReasoningContent(model string, body map[string]interface{}) map[string]interface{} {
-	if body == nil || body["messages"] == nil {
-		return body
-	}
-
-	messages, ok := body["messages"].([]interface{})
-	if !ok {
-		return body
+func injectReasoningContent(model string, messages []interface{}) []interface{} {
+	if len(messages) == 0 {
+		return messages
 	}
 
 	var changed bool
@@ -518,12 +513,11 @@ func injectReasoningContent(model string, body map[string]interface{}) map[strin
 	}
 
 	if !changed {
-		return body
+		return messages
 	}
 
-	next := deepCopy(body).(map[string]interface{})
-	msgs, _ := next["messages"].([]interface{})
-	for _, msg := range msgs {
+	next := deepCopy(messages).([]interface{})
+	for _, msg := range next {
 		m, ok := msg.(map[string]interface{})
 		if !ok {
 			continue
@@ -542,6 +536,11 @@ func injectReasoningContent(model string, body map[string]interface{}) map[strin
 }
 
 var deepSeekRegex = regexp.MustCompile(`(?i)deepseek`)
+
+func partIsImage(p map[string]interface{}) bool {
+	t := getString(p["type"], "")
+	return t == "image_url" || t == "image"
+}
 
 // DeepSeek 是否需要图片回退:仅当最近一条 user 消息带图时路由到 mimo。
 // 历史残留的图片不触发,避免后续纯文字追问一直走 mimo。
@@ -563,7 +562,7 @@ func lastUserMessageHasImage(messages []interface{}) bool {
 			if !ok {
 				continue
 			}
-			if t := getString(p["type"], ""); t == "image_url" || t == "image" {
+			if partIsImage(p) {
 				return true
 			}
 		}
@@ -574,6 +573,103 @@ func lastUserMessageHasImage(messages []interface{}) bool {
 
 func deepSeekNeedsImageFallback(model string, messages []interface{}) bool {
 	return deepSeekRegex.MatchString(model) && lastUserMessageHasImage(messages)
+}
+
+// DeepSeek 上游对整段 messages 里任何一处的 image_url 都会反序列化报错。
+// 纯文字追问会带上前一轮的图片消息,发给 DeepSeek 前把历史里的图片剥离掉。
+func stripImagesForDeepSeek(messages []interface{}) []interface{} {
+	if len(messages) == 0 {
+		return messages
+	}
+
+	hasImage := false
+	for _, msg := range messages {
+		m, ok := msg.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		content, ok := m["content"].([]interface{})
+		if !ok {
+			continue
+		}
+		for _, part := range content {
+			p, ok := part.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if partIsImage(p) {
+				hasImage = true
+				break
+			}
+		}
+		if hasImage {
+			break
+		}
+	}
+	if !hasImage {
+		return messages
+	}
+
+	next := make([]interface{}, len(messages))
+	for i, msg := range messages {
+		m, ok := msg.(map[string]interface{})
+		if !ok {
+			next[i] = msg
+			continue
+		}
+		content, ok := m["content"].([]interface{})
+		if !ok {
+			next[i] = m
+			continue
+		}
+
+		var parts []interface{}
+		for _, part := range content {
+			p, ok := part.(map[string]interface{})
+			if !ok {
+				parts = append(parts, part)
+				continue
+			}
+			if !partIsImage(p) {
+				parts = append(parts, p)
+			}
+		}
+		if len(parts) == len(content) {
+			next[i] = m
+			continue
+		}
+
+		copied := deepCopy(m).(map[string]interface{})
+		switch {
+		case len(parts) == 0:
+			copied["content"] = "[图片]"
+		case allTextParts(parts):
+			var b strings.Builder
+			for _, part := range parts {
+				p, _ := part.(map[string]interface{})
+				t, _ := p["text"].(string)
+				b.WriteString(t)
+			}
+			copied["content"] = b.String()
+		default:
+			copied["content"] = parts
+		}
+		next[i] = copied
+	}
+	return next
+}
+
+func allTextParts(parts []interface{}) bool {
+	for _, part := range parts {
+		p, ok := part.(map[string]interface{})
+		if !ok {
+			return false
+		}
+		if getString(p["type"], "") != "text" {
+			return false
+		}
+	}
+	return true
 }
 
 func buildZenRequest(model string, messages, tools []interface{}, toolChoice interface{}, reasoningEffort, sessionId string, stream bool) *zenRequest {
@@ -895,8 +991,12 @@ func HandleOpenAI(w http.ResponseWriter, r *http.Request, env string) {
 	if useImageModel {
 		upstreamModel = ImageFallbackModel
 	}
-	transformedBody := injectReasoningContent(upstreamModel, input.Body)
-	transformedMessages, _ := transformedBody["messages"].([]interface{})
+	// 纯文字请求走 DeepSeek 时,把历史里的图片剥掉(DeepSeek 无法解析 image_url)。
+	transformedMessages := messages
+	if upstreamModel == model {
+		transformedMessages = stripImagesForDeepSeek(messages)
+	}
+	transformedMessages = injectReasoningContent(upstreamModel, transformedMessages)
 
 	msgSummary := formatMsgSummary(transformedMessages)
 	log.Println("[OAI]", time.Now().UTC().Format(time.RFC3339), user, model,
