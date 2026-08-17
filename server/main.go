@@ -23,19 +23,20 @@ import (
 )
 
 const (
-	ProxyVersion   = "v1.3.0"
-	OCVersion      = "1.15.13"
-	ZenBaseURL     = "https://opencode.ai"
-	ZenURL         = ZenBaseURL + "/zen/v1/chat/completions"
-	ZenModelsURL   = ZenBaseURL + "/zen/v1/models"
-	defaultTimeout = 5 * time.Minute
+	ProxyVersion       = "v1.3.0"
+	OCVersion          = "1.15.13"
+	ZenBaseURL         = "https://opencode.ai"
+	ZenURL             = ZenBaseURL + "/zen/v1/chat/completions"
+	ZenModelsURL       = ZenBaseURL + "/zen/v1/models"
+	defaultTimeout     = 5 * time.Minute
+	ImageFallbackModel = "mimo-v2.5-free" // DeepSeek 不支持图片,带图请求路由到该带图模型
 )
 
 type Config struct {
-	Port        int    `yaml:"port"`
-	APIKey      string `yaml:"api-key"`
-	Debug       bool   `yaml:"debug"`
-	TimeoutMs   int    `yaml:"timeout-ms"`
+	Port      int    `yaml:"port"`
+	APIKey    string `yaml:"api-key"`
+	Debug     bool   `yaml:"debug"`
+	TimeoutMs int    `yaml:"timeout-ms"`
 }
 
 var (
@@ -542,12 +543,46 @@ func injectReasoningContent(model string, body map[string]interface{}) map[strin
 
 var deepSeekRegex = regexp.MustCompile(`(?i)deepseek`)
 
+// DeepSeek 是否需要图片回退:仅当最近一条 user 消息带图时路由到 mimo。
+// 历史残留的图片不触发,避免后续纯文字追问一直走 mimo。
+func lastUserMessageHasImage(messages []interface{}) bool {
+	for i := len(messages) - 1; i >= 0; i-- {
+		m, ok := messages[i].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if getString(m["role"], "") != "user" {
+			continue
+		}
+		content, ok := m["content"].([]interface{})
+		if !ok {
+			return false
+		}
+		for _, part := range content {
+			p, ok := part.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if t := getString(p["type"], ""); t == "image_url" || t == "image" {
+				return true
+			}
+		}
+		return false
+	}
+	return false
+}
+
+func deepSeekNeedsImageFallback(model string, messages []interface{}) bool {
+	return deepSeekRegex.MatchString(model) && lastUserMessageHasImage(messages)
+}
+
 func buildZenRequest(model string, messages, tools []interface{}, toolChoice interface{}, reasoningEffort, sessionId string, stream bool) *zenRequest {
 	body := map[string]interface{}{
 		"model":    model,
 		"messages": messages,
 		"stream":   stream,
 	}
+	// 按实际发送的模型判断:路由到图片模型时跳过 DS 专属的 reasoning_effort
 	if deepSeekRegex.MatchString(model) {
 		if reasoningEffort != "high" && reasoningEffort != "max" {
 			reasoningEffort = "high"
@@ -595,7 +630,7 @@ func fetchZen(ctx context.Context, zenReq *zenRequest) (*http.Response, error) {
 		client = newZenHTTPClient()
 	}
 	return client.Do(req)
-	}
+}
 
 func parseZenError(raw string) *zenError {
 	text := strings.TrimSpace(raw)
@@ -693,8 +728,11 @@ func logUpstreamBody(env, requestId, model string, status int, raw string, zenEr
 	log.Println("[ZEN BODY]", marshalJSON(payload))
 }
 
-func normalizeOpenAIFullData(data map[string]interface{}) map[string]interface{} {
+func normalizeOpenAIFullData(data map[string]interface{}, model string) map[string]interface{} {
 	next := deepCopy(data).(map[string]interface{})
+	if model != "" {
+		next["model"] = model
+	}
 	choices, ok := next["choices"].([]interface{})
 	if !ok {
 		return next
@@ -737,10 +775,11 @@ func normalizeOpenAIFullData(data map[string]interface{}) map[string]interface{}
 
 type streamNormalizer struct {
 	contentStates map[int]*thinkState
+	model         string
 }
 
-func newStreamNormalizer() *streamNormalizer {
-	return &streamNormalizer{contentStates: make(map[int]*thinkState)}
+func newStreamNormalizer(model string) *streamNormalizer {
+	return &streamNormalizer{contentStates: make(map[int]*thinkState), model: model}
 }
 
 func (n *streamNormalizer) normalize(chunk map[string]interface{}) map[string]interface{} {
@@ -759,6 +798,9 @@ func (n *streamNormalizer) normalize(chunk map[string]interface{}) map[string]in
 
 	next := deepCopy(chunk).(map[string]interface{})
 	delete(next, "cost")
+	if n.model != "" {
+		next["model"] = n.model
+	}
 
 	var newChoices []interface{}
 	for _, c := range choices {
@@ -848,20 +890,25 @@ func HandleOpenAI(w http.ResponseWriter, r *http.Request, env string) {
 
 	sessionId := getSession(user)
 
-	transformedBody := injectReasoningContent(model, input.Body)
+	useImageModel := deepSeekNeedsImageFallback(model, messages)
+	upstreamModel := model
+	if useImageModel {
+		upstreamModel = ImageFallbackModel
+	}
+	transformedBody := injectReasoningContent(upstreamModel, input.Body)
 	transformedMessages, _ := transformedBody["messages"].([]interface{})
 
 	msgSummary := formatMsgSummary(transformedMessages)
 	log.Println("[OAI]", time.Now().UTC().Format(time.RFC3339), user, model,
 		map[bool]string{true: "stream", false: "sync"}[stream], "msgs:", msgSummary)
 
-	zenReq := buildZenRequest(model, transformedMessages, tools, toolChoice, reasoningEffort, sessionId, stream)
+	zenReq := buildZenRequest(upstreamModel, transformedMessages, tools, toolChoice, reasoningEffort, sessionId, stream)
 	logZenRequest(requestId, "openai", model, stream, user, zenReq, len(messages))
 
 	upstream, err := fetchZen(r.Context(), zenReq)
 	if err != nil {
 		debugLog("[ZEN FETCH ERROR]", map[string]interface{}{
-			"requestId": requestId, "model": model, "stream": stream,
+			"requestId": requestId, "model": upstreamModel, "stream": stream,
 			"message": err.Error(),
 		})
 		writeUpstreamError(w, err)
@@ -870,7 +917,7 @@ func HandleOpenAI(w http.ResponseWriter, r *http.Request, env string) {
 	defer upstream.Body.Close()
 
 	logZenResponse(env, map[string]interface{}{
-		"requestId": requestId, "model": model, "stream": stream,
+		"requestId": requestId, "model": upstreamModel, "stream": stream,
 		"status": upstream.StatusCode, "ok": upstream.StatusCode < 400,
 		"ms": 0,
 	})
@@ -904,7 +951,7 @@ func OpenAIFullResponse(w http.ResponseWriter, upstream *http.Response, requestI
 	}
 
 	if data != nil && data["choices"] != nil {
-		JSONResponse(w, normalizeOpenAIFullData(data), upstream.StatusCode)
+		JSONResponse(w, normalizeOpenAIFullData(data, model), upstream.StatusCode)
 		return
 	}
 
@@ -954,7 +1001,7 @@ func OpenAIStreamResponse(w http.ResponseWriter, r *http.Request, upstream *http
 		return
 	}
 
-	normalizer := newStreamNormalizer()
+	normalizer := newStreamNormalizer(model)
 	doneSent := false
 
 	sendSSE := func(data interface{}) {
@@ -1062,8 +1109,9 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		HandleOpenAI(w, r, "")
 	default:
 		JSONResponse(w, map[string]interface{}{"error": map[string]interface{}{"message": "Not found"}}, http.StatusNotFound)
+	}
 }
-}
+
 var ipv4Regex = regexp.MustCompile(`\b\d{1,3}(?:\.\d{1,3}){3}\b`)
 
 var ipProviders = []string{

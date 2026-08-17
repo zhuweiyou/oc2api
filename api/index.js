@@ -4,6 +4,7 @@ const ZEN_BASE_URL = "https://opencode.ai";
 const ZEN_URL = `${ZEN_BASE_URL}/zen/v1/chat/completions`;
 const ZEN_MODELS_URL = `${ZEN_BASE_URL}/zen/v1/models`;
 const FETCH_TIMEOUT_MS = 5 * 60 * 1000;
+const IMAGE_FALLBACK_MODEL = "mimo-v2.5-free"; // DeepSeek 不支持图片,带图请求路由到该带图模型
 
 const userSessions = new Map();
 let cachedModels = null;
@@ -160,15 +161,20 @@ async function handleOpenAI(request) {
 	}));
 	console.log("[OAI]", new Date().toISOString(), auth.user, model, stream ? "stream" : "sync", "msgs:", JSON.stringify(msgSummary));
 
-	const transformedMessages = injectReasoningContent(model, messages);
-	const zenReq = buildZenRequest(model, transformedMessages, stream, tools, tool_choice, reasoningEffort, sessionId);
+	const upstreamModel = deepSeekNeedsImageFallback(model, messages) ? IMAGE_FALLBACK_MODEL : model;
+
+	// 纯文字请求走 DeepSeek 时,把历史里的图片剥掉(DeepSeek 无法解析 image_url)。
+	const outgoingMessages = upstreamModel === model ? stripImagesForDeepSeek(messages) : messages;
+
+	const transformedMessages = injectReasoningContent(upstreamModel, outgoingMessages);
+	const zenReq = buildZenRequest(upstreamModel, transformedMessages, stream, tools, tool_choice, reasoningEffort, sessionId);
 	logZenRequest(requestId, "openai", model, stream, auth.user, zenReq, messages?.length || 0);
 
 	let upstream;
 	try {
-		upstream = await fetchZen(zenReq, requestId, model, stream);
+		upstream = await fetchZen(zenReq, requestId, upstreamModel, stream);
 	} catch (error) {
-		debugLog("[ZEN FETCH ERROR]", { requestId, model, stream: !!stream, message: error?.message || String(error) });
+		debugLog("[ZEN FETCH ERROR]", { requestId, model: upstreamModel, stream: !!stream, message: error?.message || String(error) });
 		return upstreamErrorResponse(error);
 	}
 
@@ -297,6 +303,47 @@ function cachedModelCount() {
 const reasoningPlaceholder = " ";
 const deepSeekRegex = /deepseek/i;
 
+// DeepSeek 是否需要图片回退:仅当最近一条 user 消息带图时路由到 mimo(识别走 mimo)。
+// 历史残留的图片不影响路由:纯文字追问仍走 DeepSeek(思考走 deepseek)。
+function lastUserMessageHasImage(messages) {
+	if (!Array.isArray(messages)) return false;
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const msg = messages[i];
+		if (msg?.role !== "user") continue;
+		if (!Array.isArray(msg.content)) return false;
+		return msg.content.some((part) => part?.type === "image_url" || part?.type === "image");
+	}
+	return false;
+}
+
+function deepSeekNeedsImageFallback(model, messages) {
+	return deepSeekRegex.test(model) && lastUserMessageHasImage(messages);
+}
+
+// DeepSeek 上游对整段 messages 里任何一处的 image_url 都会反序列化报错。
+// 纯文字追问会带上前一轮的图片消息,发给 DeepSeek 前把历史里的图片剥离掉。
+function stripImagesForDeepSeek(messages) {
+	if (!Array.isArray(messages)) return messages;
+	const hasImage = messages.some(
+		(msg) =>
+			Array.isArray(msg?.content) &&
+			msg.content.some((part) => part?.type === "image_url" || part?.type === "image")
+	);
+	if (!hasImage) return messages;
+
+	return messages.map((msg) => {
+		if (!Array.isArray(msg.content)) return msg;
+		const parts = msg.content.filter((part) => !(part?.type === "image_url" || part?.type === "image"));
+		if (parts.length === msg.content.length) return msg;
+
+		let content;
+		if (parts.length === 0) content = "[图片]";
+		else if (parts.every((p) => p?.type === "text")) content = parts.map((p) => p.text).join("");
+		else content = parts;
+		return { ...msg, content };
+	});
+}
+
 function injectReasoningContent(model, messages) {
 	if (!messages) return messages;
 
@@ -319,6 +366,7 @@ function injectReasoningContent(model, messages) {
 
 function buildZenRequest(model, messages, stream, tools, toolChoice, reasoningEffort, sessionId) {
 	const reqBody = { model, messages, stream: !!stream };
+	// 按实际发送的模型判断:路由到图片模型时跳过 DS 专属的 reasoning_effort
 	if (deepSeekRegex.test(model)) {
 		if (reasoningEffort !== "high" && reasoningEffort !== "max") reasoningEffort = "high";
 		reqBody.reasoning_effort = reasoningEffort;
@@ -374,7 +422,7 @@ async function openAIFullResponse(upstream, requestId, model) {
 	}
 
 	if (data?.choices) {
-		return jsonResponse(normalizeOpenAIFullData(data), upstream.status);
+		return jsonResponse(normalizeOpenAIFullData(data, model), upstream.status);
 	}
 
 	return new Response(raw, {
@@ -404,7 +452,7 @@ async function openAIStreamResponse(upstream, requestId, model) {
 
 	const encoder = new TextEncoder();
 	const decoder = new TextDecoder();
-	const normalizer = createOpenAIStreamNormalizer();
+	const normalizer = createOpenAIStreamNormalizer(model);
 
 	const stream = new ReadableStream({
 		async start(controller) {
@@ -469,8 +517,9 @@ async function openAIStreamResponse(upstream, requestId, model) {
 	});
 }
 
-function normalizeOpenAIFullData(data) {
+function normalizeOpenAIFullData(data, model) {
 	const next = { ...data };
+	if (model) next.model = model;
 	if (!Array.isArray(next.choices)) return next;
 
 	next.choices = next.choices.map((choice) => {
@@ -493,7 +542,7 @@ function normalizeOpenAIFullData(data) {
 	return next;
 }
 
-function createOpenAIStreamNormalizer() {
+function createOpenAIStreamNormalizer(model) {
 	const contentStates = new Map();
 
 	return {
@@ -503,6 +552,7 @@ function createOpenAIStreamNormalizer() {
 
 			const next = { ...chunk };
 			delete next.cost;
+			if (model) next.model = model;
 			next.choices = chunk.choices
 				.map((choice) => normalizeOpenAIStreamChoice(choice, contentStates))
 				.filter(Boolean);
