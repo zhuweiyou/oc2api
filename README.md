@@ -63,3 +63,10 @@ Authorization: Bearer <api-key>
 ## 推理强度（reasoning_effort）
 
 目前 `reasoning_effort` 仅对 DeepSeek 模型生效：DeepSeek 只接受 `high` / `max`，两者原样透传，其余值（包括未指定）会被强制为 `high`；其他模型不处理该参数，保持默认值。
+
+## 图片请求
+
+DeepSeek 仅支持文本输入。当**最近一条 `user` 消息**包含图片（`type` 为 `image_url` 或 `image` 的 content part）时，代理会把该请求路由到带图模型 `mimo-v2.5-free` 处理，并在响应中把 `model` 字段改写为您请求的 DeepSeek 模型，对客户端透明。
+
+- 路由只由**最近一条 user 消息**决定：历史中残留的图片不会再次触发回退。
+- 因此「发图提问 → 拿到结果后纯文字追问」的下一轮会**自动回到 DeepSeek**，不会一直走 `mimo-v2.5-free`。
