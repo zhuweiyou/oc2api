@@ -1,5 +1,5 @@
 const OC_VERSION = "1.15.13";
-const PROXY_VERSION = "v1.3.0";
+const PROXY_VERSION = "v1.5.0";
 const ZEN_BASE_URL = "https://opencode.ai";
 const ZEN_URL = `${ZEN_BASE_URL}/zen/v1/chat/completions`;
 const ZEN_MODELS_URL = `${ZEN_BASE_URL}/zen/v1/models`;
