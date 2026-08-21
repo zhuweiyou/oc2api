@@ -2,7 +2,7 @@
 
 OpenCode API 代理，部署在 Vercel，支持 SSE 流式响应。
 
-> ⚠️ **2025-07-11 提醒**：`deepseek-v4-flash-free` 模型已官方下线，不再提供免费额度。如需使用请更换其他模型，如 `mimo-v2.5-free`、`hy3-free` 等。
+> ⚠️ **2026-08-21 提醒**：`deepseek-v4-flash-free` 模型已官方下线，不再提供免费额度。如需使用请更换其他模型，如 `mimo-v2.5-free`、`hy3-free` 等。
 
 如需本地部署或部署到其他云平台，参见 [server/](./server/) 目录。
 
