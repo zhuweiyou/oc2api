@@ -66,6 +66,55 @@ test("invalid JSON returns an OpenAI error instead of Express HTML", async (t) =
   })
 })
 
+test("API key authentication rejects missing and wrong keys with 401", async (t) => {
+  const previousApiKey = process.env.API_KEY
+  const previousFetch = globalThis.fetch
+  process.env.API_KEY = "sk-test"
+  globalThis.fetch = async () =>
+    new Response(mockSSEBody(), {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    })
+  const server = await listen(app)
+  t.after(() => {
+    close(server)
+    restoreEnv("API_KEY", previousApiKey)
+    globalThis.fetch = previousFetch
+  })
+
+  const payload = {
+    method: "POST",
+    path: "/v1/chat/completions",
+    body: JSON.stringify({
+      model: "big-pickle",
+      messages: [{ role: "user", content: "hi" }],
+      max_tokens: 8,
+      stream: false,
+    }),
+  }
+
+  const noAuth = await request(server.url, {
+    ...payload,
+    headers: { "content-type": "application/json" },
+  })
+  assert.equal(noAuth.status, 401)
+  assert.deepEqual(JSON.parse(noAuth.text), {
+    error: { message: "Invalid API key", type: "authentication_error" },
+  })
+
+  const wrongKey = await request(server.url, {
+    ...payload,
+    headers: { "content-type": "application/json", authorization: "Bearer wrong" },
+  })
+  assert.equal(wrongKey.status, 401)
+
+  const validKey = await request(server.url, {
+    ...payload,
+    headers: { "content-type": "application/json", authorization: "Bearer sk-test" },
+  })
+  assert.equal(validKey.status, 200)
+})
+
 test("normalizers apply the same content rules to every model", () => {
   const normalizer = __test.createOpenAIStreamNormalizer("custom-model")
   const normalized = normalizer.normalize({
