@@ -39,7 +39,7 @@ async function runScenarios(t, baseURL, entryName) {
 	const first = await requestChat(baseURL, {
 		stream: false,
 		messages: [{ role: "user", content: "hi" }],
-	});
+	}, `${entryName} / non-stream hi`);
 	const firstJSON = parseJSON(first.text, `${entryName} non-stream hi`);
 	const firstContent = extractAssistantContent(firstJSON) || "hi";
 	t.diagnostic(`${entryName}: non-stream hi passed`);
@@ -47,7 +47,7 @@ async function runScenarios(t, baseURL, entryName) {
 	const streamed = await requestChat(baseURL, {
 		stream: true,
 		messages: [{ role: "user", content: "hi" }],
-	});
+	}, `${entryName} / stream hi`);
 	assert.match(streamed.text, /data:/, `${entryName} stream should contain SSE data`);
 	assert.match(streamed.text, /\[DONE\]/, `${entryName} stream should terminate with [DONE]`);
 	assert.ok(parseSSEData(streamed.text).length > 0, `${entryName} stream should contain a JSON chunk`);
@@ -58,7 +58,7 @@ async function runScenarios(t, baseURL, entryName) {
 		messages: [{ role: "user", content: "hi" }],
 		tools: [weatherTool()],
 		tool_choice: "none",
-	});
+	}, `${entryName} / custom tools`);
 	const toolsJSON = parseJSON(tools.text, `${entryName} custom tools`);
 	assert.ok(Array.isArray(toolsJSON.choices) && toolsJSON.choices.length > 0, `${entryName} tools response has no choices`);
 	t.diagnostic(`${entryName}: custom tools passed`);
@@ -70,13 +70,13 @@ async function runScenarios(t, baseURL, entryName) {
 			{ role: "assistant", content: firstContent },
 			{ role: "user", content: "reply briefly with hi again" },
 		],
-	});
+	}, `${entryName} / continuous conversation`);
 	const conversationJSON = parseJSON(conversation.text, `${entryName} continuous conversation`);
 	assert.ok(Array.isArray(conversationJSON.choices) && conversationJSON.choices.length > 0, `${entryName} conversation has no choices`);
 	t.diagnostic(`${entryName}: continuous conversation passed`);
 }
 
-async function requestChat(baseURL, payload) {
+async function requestChat(baseURL, payload, label) {
 	const headers = { "content-type": "application/json" };
 	if (process.env.API_KEY) headers.authorization = `Bearer ${process.env.API_KEY}`;
 
@@ -86,6 +86,7 @@ async function requestChat(baseURL, payload) {
 		body: JSON.stringify({ model: "big-pickle", max_tokens: 64, temperature: 0, ...payload }),
 	});
 	const text = await response.text();
+	console.log(`\n[LIVE RESPONSE] ${label} HTTP ${response.status}\n${text}\n[/LIVE RESPONSE]`);
 	if (response.status === 429) {
 		throw new LiveUnavailable(`big-pickle upstream is rate limited: ${text.trim()}`);
 	}
