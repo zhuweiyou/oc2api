@@ -66,6 +66,24 @@ test("invalid JSON returns an OpenAI error instead of Express HTML", async (t) =
   })
 })
 
+test("request body over 100MB is rejected with 413", async (t) => {
+  const server = await listen(app)
+  t.after(() => close(server))
+
+  const oversized = "x".repeat(100 * 1024 * 1024 + 1024)
+  const response = await request(server.url, {
+    method: "POST",
+    path: "/v1/chat/completions",
+    headers: { "content-type": "application/json" },
+    body: oversized,
+  })
+
+  assert.equal(response.status, 413)
+  assert.deepEqual(JSON.parse(response.text), {
+    error: { message: "Request body too large", type: "invalid_request_error" },
+  })
+})
+
 test("normalizers apply the same content rules to every model", () => {
   const normalizer = __test.createOpenAIStreamNormalizer("custom-model")
   const normalized = normalizer.normalize({

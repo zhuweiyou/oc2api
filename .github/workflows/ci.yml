@@ -36,6 +36,9 @@ jobs:
       - name: Check formatting
         run: npm run format:check
 
+      - name: Audit dependencies
+        run: npm audit --omit=dev
+
       - name: Run offline tests
         run: npm test
 
