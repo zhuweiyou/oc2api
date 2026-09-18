@@ -8,57 +8,114 @@ import { startServer } from "../../server/index.js";
 
 const live = process.env.OC2API_LIVE_TEST === "1";
 
+let localServer;
+let vercelServer;
+let localURL;
+let vercelURL;
+let localFirstContent = "hi";
+let vercelFirstContent = "hi";
+let liveUnavailableMessage = "";
+
 class LiveUnavailable extends Error {}
 
-test("real big-pickle hi scenarios through local and Vercel entries", { skip: !live }, async (t) => {
-	const localServer = startServer({ port: 0, logger: { log() {} } });
-	await once(localServer, "listening");
+test.before(async () => {
+	if (!live) return;
 
-	const vercelServer = createServer(vercelApp);
+	localServer = startServer({ port: 0, logger: { log() {} } });
+	await once(localServer, "listening");
+	localURL = `http://127.0.0.1:${localServer.address().port}`;
+
+	vercelServer = createServer(vercelApp);
 	vercelServer.listen(0, "127.0.0.1");
 	await once(vercelServer, "listening");
-
-	t.after(async () => {
-		await close(localServer);
-		await close(vercelServer);
-	});
-
-	try {
-		await runScenarios(t, `http://127.0.0.1:${localServer.address().port}`, "local");
-		await runScenarios(t, `http://127.0.0.1:${vercelServer.address().port}`, "vercel");
-	} catch (error) {
-		if (error instanceof LiveUnavailable) {
-			t.skip(error.message);
-			return;
-		}
-		throw error;
-	}
+	vercelURL = `http://127.0.0.1:${vercelServer.address().port}`;
 });
 
-async function runScenarios(t, baseURL, entryName) {
-	const first = await requestChat(baseURL, {
+test.after(async () => {
+	if (localServer) await close(localServer);
+	if (vercelServer) await close(vercelServer);
+});
+
+test("local non-stream hi", liveTestOptions(), async (t) => {
+	const response = await runOrSkip(t, () => requestChat(localURL, {
 		stream: false,
 		messages: [{ role: "user", content: "hi" }],
-	});
-	const firstJSON = parseJSON(first.text, `${entryName} non-stream hi`);
-	const firstContent = firstJSON?.choices?.[0]?.message?.content || "hi";
-	assert.ok(Array.isArray(firstJSON.choices) && firstJSON.choices.length > 0, `${entryName} non-stream response has no choices`);
-	t.diagnostic(`${entryName}: non-stream hi passed`);
+	}));
+	if (!response) return;
 
-	const tools = await requestChat(baseURL, {
+	const body = parseJSON(response.text, "local non-stream hi");
+	assert.ok(Array.isArray(body.choices) && body.choices.length > 0, "local non-stream response has no choices");
+	localFirstContent = body.choices[0]?.message?.content || "hi";
+});
+
+test("local streaming tools conversation", liveTestOptions(), async (t) => {
+	const response = await runOrSkip(t, () => requestChat(localURL, {
 		stream: true,
-		messages: [
-			{ role: "user", content: "hi" },
-			{ role: "assistant", content: firstContent },
-			{ role: "user", content: "reply briefly with hi again" },
-		],
+		messages: conversationMessages(localFirstContent),
 		tools: [weatherTool()],
 		tool_choice: "none",
-	});
-	assert.match(tools.text, /data:/, `${entryName} tools conversation should contain SSE data`);
-	assert.match(tools.text, /\[DONE\]/, `${entryName} tools conversation should terminate with [DONE]`);
-	assert.ok(parseSSEData(tools.text, `${entryName} tools conversation`).length > 0, `${entryName} tools conversation has no chunks`);
-	t.diagnostic(`${entryName}: streaming tools conversation passed`);
+	}));
+	if (!response) return;
+
+	assertStreamingResponse(response.text, "local tools conversation");
+});
+
+test("Vercel non-stream hi", liveTestOptions(), async (t) => {
+	const response = await runOrSkip(t, () => requestChat(vercelURL, {
+		stream: false,
+		messages: [{ role: "user", content: "hi" }],
+	}));
+	if (!response) return;
+
+	const body = parseJSON(response.text, "Vercel non-stream hi");
+	assert.ok(Array.isArray(body.choices) && body.choices.length > 0, "Vercel non-stream response has no choices");
+	vercelFirstContent = body.choices[0]?.message?.content || "hi";
+});
+
+test("Vercel streaming tools conversation", liveTestOptions(), async (t) => {
+	const response = await runOrSkip(t, () => requestChat(vercelURL, {
+		stream: true,
+		messages: conversationMessages(vercelFirstContent),
+		tools: [weatherTool()],
+		tool_choice: "none",
+	}));
+	if (!response) return;
+
+	assertStreamingResponse(response.text, "Vercel tools conversation");
+});
+
+function liveTestOptions() {
+	return { skip: !live, concurrency: false };
+}
+
+async function runOrSkip(t, request) {
+	if (liveUnavailableMessage) {
+		t.skip(liveUnavailableMessage);
+		return null;
+	}
+
+	try {
+		return await request();
+	} catch (error) {
+		if (!(error instanceof LiveUnavailable)) throw error;
+		liveUnavailableMessage = error.message;
+		t.skip(error.message);
+		return null;
+	}
+}
+
+function conversationMessages(assistantContent) {
+	return [
+		{ role: "user", content: "hi" },
+		{ role: "assistant", content: assistantContent || "hi" },
+		{ role: "user", content: "reply briefly with hi again" },
+	];
+}
+
+function assertStreamingResponse(text, scenario) {
+	assert.match(text, /data:/, `${scenario} should contain SSE data`);
+	assert.match(text, /\[DONE\]/, `${scenario} should terminate with [DONE]`);
+	assert.ok(parseSSEData(text, scenario).length > 0, `${scenario} has no JSON chunks`);
 }
 
 async function requestChat(baseURL, payload) {
