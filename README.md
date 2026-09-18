@@ -59,12 +59,6 @@ Docker 配置位于项目根目录：
 docker compose up -d --build
 ```
 
-也可以指定配置：
-
-```bash
-API_KEY=your-key DEBUG=true PORT=8080 docker compose up -d --build
-```
-
 ## 测试
 
 离线测试不访问 OpenCode：
