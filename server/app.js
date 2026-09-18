@@ -155,7 +155,7 @@ async function handleOpenAI(request) {
     return openAIErrorResponse("Invalid JSON body", "invalid_request_error", 400)
   }
 
-  const { model, messages, stream, tools, tool_choice, max_tokens, max_completion_tokens } = input.body
+  const { model, messages, stream, tools, tool_choice, max_tokens, max_completion_tokens, temperature } = input.body
   const reasoningEffort = input.body.reasoning_effort ?? input.body.reasoningEffort
   const maxTokens = max_tokens ?? max_completion_tokens
 
@@ -169,7 +169,17 @@ async function handleOpenAI(request) {
   })
 
   // Zen 免费层要求 OpenCode 风格的流式请求；客户端是否 stream 由响应层决定。
-  const zenReq = buildZenRequest(model, messages, true, tools, tool_choice, reasoningEffort, sessionId, maxTokens)
+  const zenReq = buildZenRequest(
+    model,
+    messages,
+    true,
+    tools,
+    tool_choice,
+    reasoningEffort,
+    sessionId,
+    maxTokens,
+    temperature,
+  )
   logZenRequest(requestId, "openai", model, stream, auth.user, zenReq, messages?.length || 0)
 
   let upstream
@@ -334,7 +344,17 @@ function appendZenCompatibilityTools(tools) {
   return result
 }
 
-function buildZenRequest(model, messages, stream, tools, toolChoice, reasoningEffort, sessionId, maxTokens) {
+function buildZenRequest(
+  model,
+  messages,
+  stream,
+  tools,
+  toolChoice,
+  reasoningEffort,
+  sessionId,
+  maxTokens,
+  temperature,
+) {
   const hadUserTools = Array.isArray(tools) && tools.length > 0
   const reqBody = {
     model,
@@ -350,6 +370,10 @@ function buildZenRequest(model, messages, stream, tools, toolChoice, reasoningEf
 
   if (reasoningEffort != null && reasoningEffort !== "") {
     reqBody.reasoning_effort = reasoningEffort
+  }
+
+  if (temperature != null && temperature !== "") {
+    reqBody.temperature = temperature
   }
 
   return {

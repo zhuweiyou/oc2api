@@ -95,9 +95,11 @@ test("normalizers apply the same content rules to every model", () => {
     "low",
     "ses_test",
     32,
+    0.7,
   )
   const body = JSON.parse(request.body)
   assert.equal(body.reasoning_effort, "low")
+  assert.equal(body.temperature, 0.7)
   assert.equal(body.messages[0].content[0].type, "image_url")
 })
 
