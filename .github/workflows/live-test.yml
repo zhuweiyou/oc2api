@@ -1,0 +1,37 @@
+name: Live integration test
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - refactor/express-single-project
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  live-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      OC2API_LIVE_TEST: "1"
+      API_KEY: ${{ secrets.API_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run live big-pickle tests
+        run: npm run test:live
