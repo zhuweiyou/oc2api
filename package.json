@@ -1,9 +1,17 @@
 {
-	"name": "oc2api",
-	"version": "1.0.0",
-	"private": true,
-	"type": "module",
-	"engines": {
-		"node": ">=20"
-	}
+  "name": "oc2api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node server/index.js",
+    "test": "node --test tests/node/*.test.js",
+    "test:live": "OC2API_LIVE_TEST=1 node --test tests/node/live.test.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  }
 }

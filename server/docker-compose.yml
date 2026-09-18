@@ -1,8 +1,0 @@
-services:
-  oc2api:
-    image: oc2api
-    build: .
-    container_name: oc2api
-    ports:
-      - "8080:8080"
-    restart: always

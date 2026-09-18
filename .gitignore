@@ -1,5 +1,10 @@
-.vercel
-node_modules
-.idea
+.vercel/
+node_modules/
+.idea/
+.env
+.env.*
+!.env.example
 oc2api
-.env*
+*.log
+.DS_Store
+coverage/

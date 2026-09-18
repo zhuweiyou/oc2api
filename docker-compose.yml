@@ -1,0 +1,12 @@
+services:
+  oc2api:
+    build: .
+    container_name: oc2api
+    ports:
+      - "${PORT:-8080}:8080"
+    environment:
+      NODE_ENV: "production"
+      PORT: "8080"
+      API_KEY: "${API_KEY:-}"
+      DEBUG: "${DEBUG:-false}"
+    restart: always

@@ -2,11 +2,15 @@
 
 > ⚠️ **2026-08-21 提醒**：`deepseek-v4-flash-free` 模型已官方下线，不再提供免费额度。如需使用请更换其他模型，如 `big-pickle`、`mimo-v2.5-free`、`hy3-free` 等。
 
-OpenCode API 代理，部署在 Vercel，支持 SSE 流式响应。
+OpenCode Zen API 代理，使用一套 Express 业务逻辑，同时支持本地运行、Docker 和 Vercel 部署，并支持 SSE 流式响应。
 
-如需本地部署或部署到其他云平台，参见 [server/](./server/) 目录。
+## 架构
 
-## 部署
+- `server/app.js`：唯一共享的 Express app 和业务逻辑
+- `server/index.js`：本地 Node.js 启动入口
+- `api/index.js`：Vercel 薄入口，导入同一个 `server/app.js`
+
+## Vercel 部署
 
 ### 一键部署
 
@@ -18,30 +22,83 @@ OpenCode API 代理，部署在 Vercel，支持 SSE 流式响应。
 2. 打开 [Vercel Dashboard](https://vercel.com)，点击 **Add New > Project**
 3. 选择你 Fork 的仓库，点击 **Import**
 4. 在 **Environment Variables** 中添加：
-    - `API_KEY` — API 密钥（留空则匿名访问）
-    - `DEBUG` — 设为 `true` 开启调试日志（可选）
+   - `API_KEY` — API 密钥（留空则匿名访问）
+   - `DEBUG` — 设为 `true` 开启调试日志（可选）
 5. 点击 **Deploy**，等待部署完成
 
 部署完成后会得到一个 `https://<项目名>.vercel.app` 的域名。
 
-你可以 Fork 后部署多个 Vercel Project，以创建多个出口 IP 不同的项目，然后在 [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI/blob/main/README_CN.md#%E5%8A%9F%E8%83%BD%E7%89%B9%E6%80%A7)、[Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api/blob/main/README_CN.md#%E9%83%A8%E7%BD%B2%E6%96%B9%E5%BC%8F)、[QuantumNous/new-api](https://github.com/QuantumNous/new-api/blob/main/README.zh_CN.md#-%E5%BF%AB%E9%80%9F%E5%BC%80%E5%A7%8B) 等工具中配置多个域名实现轮询，规避 IP 限制。
+你可以 Fork 后部署多个 Vercel Project，以创建多个出口 IP 不同的项目，然后在 [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI/blob/main/README_CN.md#%E5%8A%9F%E8%83%BD%E7%89%B9%E6%80%A7)、[Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api/blob/main/README.zh_CN.md#%E9%83%A8%E7%BD%B2%E6%96%B9%E5%BC%8F)、[QuantumNous/new-api](https://github.com/QuantumNous/new-api/blob/main/README.zh_CN.md#-%E5%BF%AB%E9%80%9F%E5%BC%80%E5%A7%8B) 等工具中配置多个域名实现轮询，规避 IP 限制。
+
+## 本地运行
+
+要求 Node.js 24 或更高版本。
+
+```bash
+npm install
+npm start
+```
+
+默认监听 `http://localhost:8080`。也可以通过环境变量配置：
+
+```bash
+API_KEY=your-key DEBUG=true PORT=8080 npm start
+```
+
+健康检查：
+
+```bash
+curl http://localhost:8080/health
+```
+
+## Docker 部署
+
+Docker 配置位于项目根目录：
+
+```bash
+docker compose up -d --build
+```
+
+也可以指定配置：
+
+```bash
+API_KEY=your-key DEBUG=true PORT=8080 docker compose up -d --build
+```
+
+## 测试
+
+离线测试不访问 Zen：
+
+```bash
+npm test
+```
+
+真实联调测试会向 `big-pickle` 发送 `hi` 请求，覆盖非流式、流式、自定义 tools 和连续对话，并分别验证本地与 Vercel 入口：
+
+```bash
+npm run test:live
+```
+
+真实测试可能受到上游限流影响；限流时测试会输出原因并跳过，不影响离线测试。
 
 ## API
 
 兼容 OpenAI API 格式，路径均支持带 `/v1` 前缀或不带：
 
-| 路径                                           | 方法   | 说明                            |
-|----------------------------------------------|------|-------------------------------|
+| 路径 | 方法 | 说明 |
+| --- | --- | --- |
 | `/v1/chat/completions` 或 `/chat/completions` | POST | Chat 补全（支持 `stream: true` 流式） |
-| `/v1/models` 或 `/models`                     | GET  | 模型列表                          |
-| `/` 或 `/health`                             | GET  | 健康检查                          |
-| `/ip`                                        | GET  | 查询出口 IP                       |
+| `/v1/models` 或 `/models` | GET | 模型列表 |
+| `/` 或 `/health` | GET | 健康检查 |
+| `/ip` | GET | 查询出口 IP |
 
-携带 API Key（如已配置）：
+配置 API Key 后，请求携带：
 
-```
+```text
 Authorization: Bearer <api-key>
 ```
+
+也支持 `X-API-Key`。
 
 ## 免费模型限制
 
