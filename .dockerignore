@@ -1,0 +1,8 @@
+node_modules/
+.git/
+.vercel/
+.idea/
+.env
+.env.*
+*.log
+.DS_Store

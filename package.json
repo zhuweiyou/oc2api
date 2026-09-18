@@ -9,9 +9,19 @@
   "scripts": {
     "start": "node server/index.js",
     "test": "node --test tests/node/*.test.js",
-    "test:live": "OC2API_LIVE_TEST=1 node --test tests/node/live.test.js"
+    "test:live": "OC2API_LIVE_TEST=1 node --test tests/node/live.test.js",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
   },
   "dependencies": {
     "express": "^5.1.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.11.0",
+    "eslint-config-prettier": "^10.1.8",
+    "globals": "^17.12.0",
+    "prettier": "^3.9.8"
   }
 }
