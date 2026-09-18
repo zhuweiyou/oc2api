@@ -189,6 +189,8 @@ test("non-stream and stream requests share the same upstream business path", asy
     }),
   })
   assert.equal(nonStream.status, 200)
+  assert.match(nonStream.headers["x-request-id"] || "", /^req_/)
+  assert.match(nonStream.headers["access-control-expose-headers"] || "", /x-request-id/i)
   const completion = JSON.parse(nonStream.text)
   assert.equal(completion.model, "big-pickle")
   assert.equal(completion.choices[0].message.content, "hi")

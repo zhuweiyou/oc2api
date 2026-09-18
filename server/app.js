@@ -15,6 +15,7 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers":
     "Authorization, X-API-Key, x-api-key, Content-Type, Anthropic-Version, Anthropic-Beta",
+  "Access-Control-Expose-Headers": "X-Request-Id",
 }
 
 const JSON_HEADERS = {
@@ -190,8 +191,11 @@ async function handleOpenAI(request) {
     return upstreamErrorResponse(error)
   }
 
-  if (stream) return openAIStreamResponse(upstream, requestId, model)
-  return openAIFullStreamResponse(upstream, requestId, model)
+  const response = stream
+    ? await openAIStreamResponse(upstream, requestId, model)
+    : await openAIFullStreamResponse(upstream, requestId, model)
+  response.headers.set("x-request-id", requestId)
+  return response
 }
 
 const IP_PROVIDERS = ["https://api.ipquery.io", "http://ip-api.com/json"]
