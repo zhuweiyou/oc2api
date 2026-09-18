@@ -431,24 +431,14 @@ async function openAIFullStreamResponse(upstream, requestId, model) {
   const raw = await upstream.text()
   const zenError = parseZenError(raw)
   logUpstreamBody(requestId, model, upstream.status, raw, zenError)
-  if (upstream.status === 429 || zenError) {
+  // 上游任何错误都归一为 429：下游账号池工具(CLIProxyAPI/sub2api/new-api)依赖 429 切换账号。
+  if (upstream.status >= 400 || zenError) {
     return openAIErrorResponse(
       `${zenError?.message || "Rate limit exceeded"} (free model rate limit)`,
       "rate_limit_error",
       429,
       "rate_limit_exceeded",
     )
-  }
-  if (upstream.status >= 400) {
-    // 上游非限流错误(如 model 不存在、服务器错误)原样透传,避免误报为限流。
-    const parsed = safeJsonParse(raw)
-    if (parsed?.error) return jsonResponse(parsed, upstream.status)
-    return new Response(raw, {
-      status: upstream.status,
-      headers: mergeHeaders({
-        "Content-Type": upstream.headers.get("content-type") || "application/json; charset=utf-8",
-      }),
-    })
   }
 
   const normalizer = createOpenAIStreamNormalizer(model)
@@ -821,13 +811,15 @@ async function readJson(request) {
 function parseZenError(raw) {
   const text = String(raw || "").trim()
   if (!text.startsWith("{")) return null
-  const parsed = safeJsonParse(text)
-  if (!parsed) return null
+  if (!text.includes("FreeUsageLimitError") && !text.includes('"error"') && !text.includes('"type"')) return null
 
-  const type = parsed.error?.type || parsed.type || ""
-  // 仅识别 Zen 免费层的明确限流错误;其余 4xx/5xx 由状态码分支原样透传。
-  if (type !== "FreeUsageLimitError") return null
-  return { message: parsed.error?.message || parsed.message || "Rate limit exceeded", type }
+  const parsed = safeJsonParse(text)
+  if (!parsed || (!parsed.error && parsed.type !== "error")) return null
+
+  return {
+    message: parsed.error?.message || parsed.message || "Rate limit exceeded",
+    type: parsed.error?.type || parsed.type || "upstream_error",
+  }
 }
 
 function upstreamErrorResponse(error) {

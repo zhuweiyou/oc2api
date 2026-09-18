@@ -216,43 +216,6 @@ test("non-stream and stream requests share the same upstream business path", asy
   assert.equal(calls.length, 2)
 })
 
-test("upstream errors keep their status instead of being masked as rate limit", async (t) => {
-  const previousFetch = globalThis.fetch
-  const previousApiKey = process.env.API_KEY
-  delete process.env.API_KEY
-
-  const server = await listen(app)
-  t.after(() => {
-    close(server)
-    globalThis.fetch = previousFetch
-    restoreEnv("API_KEY", previousApiKey)
-  })
-
-  globalThis.fetch = async () =>
-    new Response(JSON.stringify({ error: { message: "Model not found", type: "invalid_request_error" } }), {
-      status: 400,
-      headers: { "content-type": "application/json" },
-    })
-  const payload = {
-    method: "POST",
-    path: "/v1/chat/completions",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ model: "nonexistent", messages: [{ role: "user", content: "hi" }], stream: false }),
-  }
-  const badRequest = await request(server.url, payload)
-  assert.equal(badRequest.status, 400)
-  assert.equal(JSON.parse(badRequest.text).error.type, "invalid_request_error")
-
-  globalThis.fetch = async () =>
-    new Response(JSON.stringify({ error: { message: "FreeUsageLimitError" } }), {
-      status: 429,
-      headers: { "content-type": "application/json" },
-    })
-  const rateLimited = await request(server.url, payload)
-  assert.equal(rateLimited.status, 429)
-  assert.equal(JSON.parse(rateLimited.text).error.type, "rate_limit_error")
-})
-
 function mockSSEBody() {
   return [
     `data: ${JSON.stringify({ id: "chatcmpl-test", created: 1, choices: [{ index: 0, delta: { role: "assistant", content: "<think>hidden</think>hi", reasoning: "trace", reasoning_content: "legacy" } }] })}\n\n`,
