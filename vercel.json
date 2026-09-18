@@ -2,7 +2,6 @@
   "version": 2,
   "functions": {
     "api/index.js": {
-      "runtime": "nodejs24.x",
       "maxDuration": 300
     }
   },
