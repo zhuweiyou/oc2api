@@ -160,16 +160,12 @@ async function handleOpenAI(request) {
   const maxTokens = max_tokens ?? max_completion_tokens
 
   const sessionId = getSession(auth.user)
-  const msgSummary = (messages || []).map((msg) => ({
-    role: msg.role,
-    len: typeof msg.content === "string" ? msg.content.length : JSON.stringify(msg.content || "").length,
-  }))
   debugLog("[OAI]", {
     at: new Date().toISOString(),
     user: auth.user,
     model,
     mode: stream ? "stream" : "sync",
-    msgs: msgSummary,
+    messages: messages?.length || 0,
   })
 
   // Zen 免费层要求 OpenCode 风格的流式请求；客户端是否 stream 由响应层决定。
