@@ -75,16 +75,26 @@ npm run test:live
 
 真实测试可能受到上游限流影响；限流时测试会输出原因并跳过，不影响离线测试。
 
+## 代码检查
+
+```bash
+npm run lint          # ESLint 静态检查
+npm run format:check  # 检查格式是否规范
+npm run format        # 用 Prettier 自动格式化全部文件
+```
+
+GitHub Actions 与 Docker 构建都会先执行 lint 和格式检查，不通过则构建失败。
+
 ## API
 
 兼容 OpenAI API 格式，路径均支持带 `/v1` 前缀或不带：
 
-| 路径 | 方法 | 说明 |
-| --- | --- | --- |
+| 路径                                          | 方法 | 说明                                  |
+| --------------------------------------------- | ---- | ------------------------------------- |
 | `/v1/chat/completions` 或 `/chat/completions` | POST | Chat 补全（支持 `stream: true` 流式） |
-| `/v1/models` 或 `/models` | GET | 模型列表 |
-| `/` 或 `/health` | GET | 健康检查 |
-| `/ip` | GET | 查询出口 IP |
+| `/v1/models` 或 `/models`                     | GET  | 模型列表                              |
+| `/` 或 `/health`                              | GET  | 健康检查                              |
+| `/ip`                                         | GET  | 查询出口 IP                           |
 
 配置 API Key 后，请求携带：
 
