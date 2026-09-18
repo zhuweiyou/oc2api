@@ -1,4 +1,4 @@
-name: Live integration test
+name: CI
 
 on:
   workflow_dispatch:
