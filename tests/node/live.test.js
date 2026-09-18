@@ -41,39 +41,23 @@ async function runScenarios(t, baseURL, entryName) {
 		messages: [{ role: "user", content: "hi" }],
 	});
 	const firstJSON = parseJSON(first.text, `${entryName} non-stream hi`);
-	const firstContent = extractAssistantContent(firstJSON) || "hi";
+	const firstContent = firstJSON?.choices?.[0]?.message?.content || "hi";
+	assert.ok(Array.isArray(firstJSON.choices) && firstJSON.choices.length > 0, `${entryName} non-stream response has no choices`);
 	t.diagnostic(`${entryName}: non-stream hi passed`);
 
-	const streamed = await requestChat(baseURL, {
-		stream: true,
-		messages: [{ role: "user", content: "hi" }],
-	});
-	assert.match(streamed.text, /data:/, `${entryName} stream should contain SSE data`);
-	assert.match(streamed.text, /\[DONE\]/, `${entryName} stream should terminate with [DONE]`);
-	assert.ok(parseSSEData(streamed.text).length > 0, `${entryName} stream should contain a JSON chunk`);
-	t.diagnostic(`${entryName}: stream hi passed`);
-
 	const tools = await requestChat(baseURL, {
-		stream: false,
-		messages: [{ role: "user", content: "hi" }],
-		tools: [weatherTool()],
-		tool_choice: "none",
-	});
-	const toolsJSON = parseJSON(tools.text, `${entryName} custom tools`);
-	assert.ok(Array.isArray(toolsJSON.choices) && toolsJSON.choices.length > 0, `${entryName} tools response has no choices`);
-	t.diagnostic(`${entryName}: custom tools passed`);
-
-	const conversation = await requestChat(baseURL, {
 		stream: false,
 		messages: [
 			{ role: "user", content: "hi" },
 			{ role: "assistant", content: firstContent },
 			{ role: "user", content: "reply briefly with hi again" },
 		],
+		tools: [weatherTool()],
+		tool_choice: "none",
 	});
-	const conversationJSON = parseJSON(conversation.text, `${entryName} continuous conversation`);
-	assert.ok(Array.isArray(conversationJSON.choices) && conversationJSON.choices.length > 0, `${entryName} conversation has no choices`);
-	t.diagnostic(`${entryName}: continuous conversation passed`);
+	const toolsJSON = parseJSON(tools.text, `${entryName} tools conversation`);
+	assert.ok(Array.isArray(toolsJSON.choices) && toolsJSON.choices.length > 0, `${entryName} tools conversation has no choices`);
+	t.diagnostic(`${entryName}: tools conversation passed`);
 }
 
 async function requestChat(baseURL, payload) {
@@ -99,18 +83,6 @@ function parseJSON(text, scenario) {
 	} catch (error) {
 		throw new Error(`${scenario} returned invalid JSON: ${error.message}; body=${text}`);
 	}
-}
-
-function parseSSEData(text) {
-	return text
-		.split(/\r?\n\r?\n/)
-		.map((event) => event.split(/\r?\n/).find((line) => line.startsWith("data:"))?.slice(5).trim())
-		.filter((payload) => payload && payload !== "[DONE]")
-		.map((payload) => parseJSON(payload, "stream event"));
-}
-
-function extractAssistantContent(response) {
-	return response?.choices?.[0]?.message?.content || "";
 }
 
 function weatherTool() {

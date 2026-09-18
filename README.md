@@ -73,7 +73,7 @@ API_KEY=your-key DEBUG=true PORT=8080 docker compose up -d --build
 npm test
 ```
 
-真实联调测试会向 `big-pickle` 发送 `hi` 请求，覆盖非流式、流式、自定义 tools 和连续对话，并分别验证本地与 Vercel 入口：
+真实联调测试会向 `big-pickle` 发送两次请求：一次不带 tools 的非流式 `hi`，以及一次带 tools 的连续对话，并分别验证本地与 Vercel 入口（共 4 次请求）：
 
 ```bash
 npm run test:live
