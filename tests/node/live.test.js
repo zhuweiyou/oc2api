@@ -46,7 +46,7 @@ async function runScenarios(t, baseURL, entryName) {
 	t.diagnostic(`${entryName}: non-stream hi passed`);
 
 	const tools = await requestChat(baseURL, {
-		stream: false,
+		stream: true,
 		messages: [
 			{ role: "user", content: "hi" },
 			{ role: "assistant", content: firstContent },
@@ -55,9 +55,10 @@ async function runScenarios(t, baseURL, entryName) {
 		tools: [weatherTool()],
 		tool_choice: "none",
 	});
-	const toolsJSON = parseJSON(tools.text, `${entryName} tools conversation`);
-	assert.ok(Array.isArray(toolsJSON.choices) && toolsJSON.choices.length > 0, `${entryName} tools conversation has no choices`);
-	t.diagnostic(`${entryName}: tools conversation passed`);
+	assert.match(tools.text, /data:/, `${entryName} tools conversation should contain SSE data`);
+	assert.match(tools.text, /\[DONE\]/, `${entryName} tools conversation should terminate with [DONE]`);
+	assert.ok(parseSSEData(tools.text, `${entryName} tools conversation`).length > 0, `${entryName} tools conversation has no chunks`);
+	t.diagnostic(`${entryName}: streaming tools conversation passed`);
 }
 
 async function requestChat(baseURL, payload) {
@@ -83,6 +84,14 @@ function parseJSON(text, scenario) {
 	} catch (error) {
 		throw new Error(`${scenario} returned invalid JSON: ${error.message}; body=${text}`);
 	}
+}
+
+function parseSSEData(text, scenario) {
+	return text
+		.split(/\r?\n\r?\n/)
+		.map((event) => event.split(/\r?\n/).find((line) => line.startsWith("data:"))?.slice(5).trim())
+		.filter((payload) => payload && payload !== "[DONE]")
+		.map((payload) => parseJSON(payload, scenario));
 }
 
 function weatherTool() {
