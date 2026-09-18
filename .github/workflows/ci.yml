@@ -5,7 +5,6 @@ on:
   push:
     branches:
       - main
-      - refactor/express-single-project
   pull_request:
     branches:
       - main
