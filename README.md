@@ -2,7 +2,7 @@
 
 > ⚠️ **2026-08-21 提醒**：`deepseek-v4-flash-free` 模型已官方下线，不再提供免费额度。如需使用请更换其他模型，如 `big-pickle`、`mimo-v2.5-free`、`hy3-free` 等。
 
-OpenCode Zen API 代理，使用一套 Express 业务逻辑，同时支持本地运行、Docker 和 Vercel 部署，并支持 SSE 流式响应。
+OpenCode Free API 代理，使用一套 Express 业务逻辑，同时支持本地运行、Docker 和 Vercel 部署，并支持 SSE 流式响应。
 
 ## 架构
 
@@ -67,7 +67,7 @@ API_KEY=your-key DEBUG=true PORT=8080 docker compose up -d --build
 
 ## 测试
 
-离线测试不访问 Zen：
+离线测试不访问 OpenCode：
 
 ```bash
 npm test
