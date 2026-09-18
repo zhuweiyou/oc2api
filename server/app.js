@@ -6,7 +6,6 @@ const ZEN_BASE_URL = "https://opencode.ai"
 const ZEN_URL = `${ZEN_BASE_URL}/zen/v1/chat/completions`
 const ZEN_MODELS_URL = `${ZEN_BASE_URL}/zen/v1/models`
 const FETCH_TIMEOUT_MS = 5 * 60 * 1000
-const MAX_BODY_BYTES = 100 * 1024 * 1024
 
 const userSessions = new Map()
 let cachedModels = null
@@ -33,17 +32,7 @@ function zenUserAgent() {
 }
 
 export async function handler(request, response) {
-  let fetchRequest
-  try {
-    fetchRequest = isWebRequest(request) ? request : await nodeRequestToFetchRequest(request)
-  } catch (error) {
-    if (error?.status === 413) {
-      const fetchResponse = openAIErrorResponse("Request body too large", "invalid_request_error", 413)
-      return response ? sendNodeResponse(response, fetchResponse) : fetchResponse
-    }
-    throw error
-  }
-
+  const fetchRequest = isWebRequest(request) ? request : await nodeRequestToFetchRequest(request)
   const fetchResponse = await handleRequest(fetchRequest)
 
   if (!response) return fetchResponse
@@ -113,34 +102,17 @@ function nodeRequestOrigin(request) {
   return `${proto || "https"}://${host}`
 }
 
-class BodyTooLargeError extends Error {
-  constructor() {
-    super("Request body too large")
-    this.status = 413
-  }
-}
-
-function bodyByteLength(body) {
-  if (typeof body === "string") return Buffer.byteLength(body)
-  return body.byteLength
-}
-
 async function readNodeRequestBody(request) {
   if (request.body !== undefined && request.body !== null) {
     if (typeof request.body === "string" || Buffer.isBuffer(request.body) || request.body instanceof Uint8Array) {
-      if (bodyByteLength(request.body) > MAX_BODY_BYTES) throw new BodyTooLargeError()
       return request.body
     }
     return JSON.stringify(request.body)
   }
 
   const chunks = []
-  let size = 0
   for await (const chunk of request) {
-    const buffer = typeof chunk === "string" ? Buffer.from(chunk) : chunk
-    size += buffer.length
-    if (size > MAX_BODY_BYTES) throw new BodyTooLargeError()
-    chunks.push(buffer)
+    chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk)
   }
   return Buffer.concat(chunks)
 }
