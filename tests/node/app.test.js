@@ -116,13 +116,14 @@ test("API key authentication rejects missing and wrong keys with 401", async (t)
 })
 
 test("normalizers apply the same content rules to every model", () => {
+  // 开启思考（默认）：content 剥离 think 块，reasoning/reasoning_content 归一为 reasoning_content
   const normalizer = __test.createOpenAIStreamNormalizer("custom-model")
   const normalized = normalizer.normalize({
     choices: [
       {
         index: 0,
         delta: {
-          content: "<think>hidden</think>hi",
+          content: "<thinking>hidden</thinking>hi",
           reasoning: "trace",
           reasoning_content: "legacy",
         },
@@ -132,9 +133,26 @@ test("normalizers apply the same content rules to every model", () => {
 
   assert.equal(normalized.model, "custom-model")
   assert.equal(normalized.choices[0].delta.content, "hi")
-  assert.equal(normalized.choices[0].delta.reasoning_content, undefined)
+  assert.equal(normalized.choices[0].delta.reasoning_content, "tracelegacyhidden")
   assert.equal(normalized.choices[0].delta.reasoning, undefined)
 
+  // 关闭思考：reasoning 系列字段全部删除，think 块剥离后丢弃
+  const disabled = __test.createOpenAIStreamNormalizer("custom-model", false)
+  const stripped = disabled.normalize({
+    choices: [
+      {
+        index: 0,
+        delta: {
+          content: "<thinking>hidden</thinking>hi",
+          reasoning: "trace",
+          reasoning_content: "legacy",
+        },
+      },
+    ],
+  })
+  assert.deepEqual(stripped.choices[0].delta, { content: "hi" })
+
+  // reasoning_effort 原样透传（"none" 关闭思考，其余开启）
   const request = __test.buildZenRequest(
     "custom-model",
     [{ role: "user", content: [{ type: "image_url", image_url: { url: "data:image/png;base64,abc" } }] }],
@@ -194,8 +212,9 @@ test("non-stream and stream requests share the same upstream business path", asy
   const completion = JSON.parse(nonStream.text)
   assert.equal(completion.model, "big-pickle")
   assert.equal(completion.choices[0].message.content, "hi")
+  // 默认开启思考：reasoning_content 聚合上游 reasoning/reasoning_content
   assert.equal(completion.choices[0].message.reasoning, undefined)
-  assert.equal(completion.choices[0].message.reasoning_content, undefined)
+  assert.equal(completion.choices[0].message.reasoning_content, "tracelegacyhidden")
 
   const upstreamBody = JSON.parse(calls[0].init.body)
   assert.equal(upstreamBody.model, "big-pickle")
@@ -218,7 +237,7 @@ test("non-stream and stream requests share the same upstream business path", asy
 
 function mockSSEBody() {
   return [
-    `data: ${JSON.stringify({ id: "chatcmpl-test", created: 1, choices: [{ index: 0, delta: { role: "assistant", content: "<think>hidden</think>hi", reasoning: "trace", reasoning_content: "legacy" } }] })}\n\n`,
+    `data: ${JSON.stringify({ id: "chatcmpl-test", created: 1, choices: [{ index: 0, delta: { role: "assistant", content: "<thinking>hidden</thinking>hi", reasoning: "trace", reasoning_content: "legacy" } }] })}\n\n`,
     `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`,
     `data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } })}\n\n`,
     "data: [DONE]\n\n",
