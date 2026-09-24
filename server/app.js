@@ -1,7 +1,7 @@
 import express from "express"
 
 const OC_VERSION = "1.18.31"
-const PROXY_VERSION = "v2.0.0"
+const PROXY_VERSION = "v2.1.0"
 const ZEN_BASE_URL = "https://opencode.ai"
 const ZEN_URL = `${ZEN_BASE_URL}/zen/v1/chat/completions`
 const ZEN_MODELS_URL = `${ZEN_BASE_URL}/zen/v1/models`
