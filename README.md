@@ -4,12 +4,6 @@
 
 OpenCode Free API 代理，使用一套 Express 业务逻辑，同时支持本地运行、Docker 和 Vercel 部署，并支持 SSE 流式响应。
 
-## 架构
-
-- `server/app.js`：唯一共享的 Express app 和业务逻辑
-- `server/index.js`：本地 Node.js 启动入口
-- `api/index.js`：Vercel 薄入口，导入同一个 `server/app.js`
-
 ## Vercel 部署
 
 ### 一键部署
@@ -122,3 +116,18 @@ Authorization: Bearer <api-key>
 - `output`：最大单次输出长度，**32,000** tokens
 
 以上限制数据来源于接口 [https://models.opencode.ai/api.json](https://models.opencode.ai/api.json)（`opencode` key 下对应模型的 `limit` 字段），可自行查看核实，以实际使用为准。
+
+## 架构
+
+按功能域拆分，各文件内聚一类职责：
+
+- `server/app.js`：Express app 组装——全局中间件 + 路由声明（`router.get` / `router.post`）
+- `server/middleware.js`：CORS（[`cors`](https://www.npmjs.com/package/cors) 库）、URL 归一化、原始体缓冲、**路由级鉴权** `requireAuth`、404/错误兜底
+- `server/handler.js`：业务端点编排（health / ip / models / chat）
+- `server/zen.js`：OpenCode Zen 上游客户端（URL、超时、请求构造、模型列表、会话）
+- `server/openai.js`：OpenAI 兼容响应转换（非流式聚合、SSE 流式转发、thinking 归一化）
+- `server/shared.js`：跨文件共用的响应/解析工具；`server/config.js`：版本与鉴权配置；`server/log.js`：调试日志
+- `server/index.js`：本地 Node.js 启动入口
+- `api/index.js`：Vercel 薄入口，导入同一个 `server/app.js`
+
+公开路由（`/`、`/health`、`/ip`）免鉴权；`/v1/models`、`/v1/chat/completions` 等受保护路由通过路由级中间件鉴权，未知路径直接返回 404。

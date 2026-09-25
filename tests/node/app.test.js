@@ -5,7 +5,9 @@ import test from "node:test"
 
 import vercelApp from "../../api/index.js"
 import localApp from "../../server/index.js"
-import app, { __test } from "../../server/app.js"
+import app from "../../server/app.js"
+import { createOpenAIStreamNormalizer } from "../../server/openai.js"
+import { buildZenRequest } from "../../server/zen.js"
 
 const CUSTOM_TOOL = {
   type: "function",
@@ -42,6 +44,55 @@ test("health and OPTIONS responses work through the Express app", async (t) => {
   })
   assert.equal(options.status, 204)
   assert.equal(options.headers["access-control-allow-methods"], "GET, POST, OPTIONS")
+})
+
+test("unknown paths return 404 without going through auth", async (t) => {
+  const previousApiKey = process.env.API_KEY
+  process.env.API_KEY = "sk-test"
+  const server = await listen(app)
+  t.after(() => {
+    close(server)
+    restoreEnv("API_KEY", previousApiKey)
+  })
+
+  // 不带 key：未注册路径不经过鉴权，直接 404
+  const noAuth = await request(server.url, { path: "/nope" })
+  assert.equal(noAuth.status, 404)
+  assert.deepEqual(JSON.parse(noAuth.text), { error: { message: "Not found" } })
+
+  // 带错误 key：同样 404，而不是 401
+  const wrongKey = await request(server.url, {
+    method: "POST",
+    path: "/nope",
+    headers: { authorization: "Bearer wrong", "content-type": "application/json" },
+    body: "{}",
+  })
+  assert.equal(wrongKey.status, 404)
+
+  // 已注册的受保护路径缺 key 仍是 401
+  const protectedNoAuth = await request(server.url, { path: "/v1/models" })
+  assert.equal(protectedNoAuth.status, 401)
+})
+
+test("public routes stay open when API_KEY is set, trailing slashes tolerated", async (t) => {
+  const previousApiKey = process.env.API_KEY
+  const previousFetch = globalThis.fetch
+  process.env.API_KEY = "sk-test"
+  // /ip 会访问外部服务商，离线测试里 mock 掉
+  globalThis.fetch = async () => new Response("your ip is 203.0.113.7", { status: 200 })
+  const server = await listen(app)
+  t.after(() => {
+    close(server)
+    restoreEnv("API_KEY", previousApiKey)
+    globalThis.fetch = previousFetch
+  })
+
+  for (const path of ["/", "/health", "/ip", "/health//"]) {
+    const response = await request(server.url, { path })
+    assert.equal(response.status, 200, `expected 200 for ${path}`)
+  }
+  assert.equal(JSON.parse((await request(server.url, { path: "/health" })).text).status, "ok")
+  assert.equal(JSON.parse((await request(server.url, { path: "/ip" })).text).ip, "203.0.113.7")
 })
 
 test("invalid JSON returns an OpenAI error instead of Express HTML", async (t) => {
@@ -117,7 +168,7 @@ test("API key authentication rejects missing and wrong keys with 401", async (t)
 
 test("normalizers apply the same content rules to every model", () => {
   // 开启思考（默认）：content 剥离 think 块，reasoning/reasoning_content 归一为 reasoning_content
-  const normalizer = __test.createOpenAIStreamNormalizer("custom-model")
+  const normalizer = createOpenAIStreamNormalizer("custom-model")
   const normalized = normalizer.normalize({
     choices: [
       {
@@ -137,7 +188,7 @@ test("normalizers apply the same content rules to every model", () => {
   assert.equal(normalized.choices[0].delta.reasoning, undefined)
 
   // 关闭思考：reasoning 系列字段全部删除，think 块剥离后丢弃
-  const disabled = __test.createOpenAIStreamNormalizer("custom-model", false)
+  const disabled = createOpenAIStreamNormalizer("custom-model", false)
   const stripped = disabled.normalize({
     choices: [
       {
@@ -153,7 +204,7 @@ test("normalizers apply the same content rules to every model", () => {
   assert.deepEqual(stripped.choices[0].delta, { content: "hi" })
 
   // reasoning_effort 原样透传（"none" 关闭思考，其余开启）
-  const request = __test.buildZenRequest(
+  const request = buildZenRequest(
     "custom-model",
     [{ role: "user", content: [{ type: "image_url", image_url: { url: "data:image/png;base64,abc" } }] }],
     true,
