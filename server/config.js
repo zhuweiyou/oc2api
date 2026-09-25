@@ -4,9 +4,11 @@
 //
 // URL、超时、协议头等常量留在各自功能文件（zen/openai/middleware）里保持内聚。
 
+import pkg from "../package.json" with { type: "json" }
+
 export const config = {
-  // 程序版本
-  version: "v2.2.0",
+  // 程序版本：取自 package.json，发版只需改 package.json（npm version）一处
+  version: pkg.version,
   // 鉴权密钥：留空则匿名访问
   apiKey: process.env.API_KEY,
   // 调试开关：只有字符串 "true" 才开启（"false" 也是真值，必须显式比较）
