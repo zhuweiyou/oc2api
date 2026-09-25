@@ -1,7 +1,7 @@
 // 请求中间件：URL 归一化、CORS（cors 库）、原始体缓冲、路由级鉴权与错误兜底。
 import corsLib from "cors"
 
-import { readApiKey } from "./config.js"
+import { config } from "./config.js"
 import { openAIErrorResponse, sendJson } from "./shared.js"
 
 // 允许的方法/请求头列表须与既有部署一致，故显式配置而不是用库默认值。
@@ -57,7 +57,7 @@ export function requireAuth(request, response, next) {
 }
 
 function authenticate(request) {
-  const apiKey = readApiKey()
+  const apiKey = config.apiKey
   if (!apiKey) return { user: "anonymous" }
 
   const header = request.headers.authorization || request.headers["x-api-key"] || ""

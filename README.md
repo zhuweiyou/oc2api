@@ -121,13 +121,13 @@ Authorization: Bearer <api-key>
 
 按功能域拆分，各文件内聚一类职责：
 
-- `server/app.js`：Express app 组装——全局中间件 + 路由声明（`router.get` / `router.post`）
+- `server/app.js`：Express app 组装——全局中间件 + 路由声明（`router.get` / `router.post`），以及 `startServer` 启动函数
 - `server/middleware.js`：CORS（[`cors`](https://www.npmjs.com/package/cors) 库）、URL 归一化、原始体缓冲、**路由级鉴权** `requireAuth`、404/错误兜底
 - `server/handler.js`：业务端点编排（health / ip / models / chat）
 - `server/zen.js`：OpenCode Zen 上游客户端（URL、超时、请求构造、模型列表、会话）
 - `server/openai.js`：OpenAI 兼容响应转换（非流式聚合、SSE 流式转发、thinking 归一化）
-- `server/shared.js`：跨文件共用的响应/解析工具；`server/config.js`：版本与鉴权配置；`server/log.js`：调试日志
-- `server/index.js`：本地 Node.js 启动入口
+- `server/shared.js`：跨文件共用的响应/解析工具；`server/config.js`：版本/鉴权/调试/端口配置；`server/log.js`：调试日志
+- `server/index.js`：本地启动脚本（`npm start` / Docker CMD），只负责启动与优雅退出
 - `api/index.js`：Vercel 薄入口，导入同一个 `server/app.js`
 
 公开路由（`/`、`/health`、`/ip`）免鉴权；`/v1/models`、`/v1/chat/completions` 等受保护路由通过路由级中间件鉴权，未知路径直接返回 404。

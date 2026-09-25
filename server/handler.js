@@ -1,5 +1,5 @@
 // 业务端点编排：health、ip、模型列表、chat completions。
-import { PROXY_VERSION } from "./config.js"
+import { config } from "./config.js"
 import { ocId, openAIErrorResponse, sendJson, upstreamErrorResponse } from "./shared.js"
 import { debugLog, logZenRequest } from "./log.js"
 import { buildZenRequest, fetchZen, getAvailableModels, getSession } from "./zen.js"
@@ -8,7 +8,7 @@ import { openAIFullStreamResponse, openAIStreamResponse } from "./openai.js"
 export function health(_request, response) {
   sendJson(response, {
     status: "ok",
-    version: PROXY_VERSION,
+    version: config.version,
     endpoints: ["/v1/chat/completions", "/chat/completions", "/v1/models", "/models", "/health", "/ip"],
   })
 }

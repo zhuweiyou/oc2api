@@ -4,7 +4,7 @@ import { once } from "node:events"
 import test from "node:test"
 
 import vercelApp from "../../api/index.js"
-import { startServer } from "../../server/index.js"
+import { startServer } from "../../server/app.js"
 
 const live = process.env.OC2API_LIVE_TEST === "1"
 

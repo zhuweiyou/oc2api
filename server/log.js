@@ -1,12 +1,13 @@
 // 调试日志：DEBUG=true 时输出请求/响应细节，错误日志始终输出。
+import { config } from "./config.js"
 
 export function debugLog(label, payload) {
-  if (process.env.DEBUG !== "true") return
+  if (!config.debug) return
   console.log(label, JSON.stringify(payload))
 }
 
 export function logZenRequest(requestId, format, model, stream, user, zenReq, messageCount) {
-  if (process.env.DEBUG !== "true") return
+  if (!config.debug) return
   debugLog("[ZEN REQ]", {
     requestId,
     format,
@@ -22,13 +23,14 @@ export function logZenRequest(requestId, format, model, stream, user, zenReq, me
 
 export function logZenResponse(payload) {
   const { status } = payload
-  if (!process.env.DEBUG && status < 400) return
+  // 仅 DEBUG 开启或上游错误(>=400)时输出
+  if (!config.debug && status < 400) return
   console.log("[ZEN RES]", JSON.stringify(payload))
 }
 
 export function logUpstreamBody(requestId, model, status, raw, zenError, firstChunk = false) {
   const body = String(raw || "")
-  const shouldLog = process.env.DEBUG || Boolean(zenError) || status >= 400
+  const shouldLog = config.debug || Boolean(zenError) || status >= 400
   if (!shouldLog) return
 
   const payload = { requestId, model, status, firstChunk, chars: body.length }

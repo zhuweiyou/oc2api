@@ -4,6 +4,7 @@ import { once } from "node:events"
 import test from "node:test"
 
 import app from "../../server/app.js"
+import { config } from "../../server/config.js"
 import { createOpenAIStreamNormalizer, stripThinkBlocks } from "../../server/openai.js"
 import { buildZenRequest } from "../../server/zen.js"
 
@@ -139,9 +140,9 @@ function mockSSEBody({ thinking = true } = {}) {
 
 test("HTTP non-stream: thinking on emits reasoning_content, thinking off does not", async (t) => {
   const previousFetch = globalThis.fetch
-  const previousApiKey = process.env.API_KEY
+  const previousApiKey = config.apiKey
   const calls = []
-  delete process.env.API_KEY
+  config.apiKey = undefined
   globalThis.fetch = async (url, init) => {
     calls.push({ url: String(url), init })
     const thinking = (() => {
@@ -160,7 +161,7 @@ test("HTTP non-stream: thinking on emits reasoning_content, thinking off does no
   t.after(() => {
     close(server)
     globalThis.fetch = previousFetch
-    restoreEnv("API_KEY", previousApiKey)
+    config.apiKey = previousApiKey
   })
 
   const post = (body) =>
@@ -203,7 +204,7 @@ test("HTTP non-stream: thinking on emits reasoning_content, thinking off does no
 
 test("HTTP stream: thinking on streams reasoning_content deltas", async (t) => {
   const previousFetch = globalThis.fetch
-  delete process.env.API_KEY
+  config.apiKey = undefined
   globalThis.fetch = async () =>
     new Response(
       [
@@ -297,9 +298,4 @@ function request(baseURL, { method = "GET", path = "/", headers = {}, body } = {
     if (body !== undefined) outgoing.write(body)
     outgoing.end()
   })
-}
-
-function restoreEnv(name, value) {
-  if (value === undefined) delete process.env[name]
-  else process.env[name] = value
 }

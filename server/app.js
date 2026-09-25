@@ -2,6 +2,7 @@
 // 由本地入口 server/index.js 与 Vercel 入口 api/index.js 共用。
 import express from "express"
 
+import { config } from "./config.js"
 import { chat, health, ip, models } from "./handler.js"
 import { cors, errorHandler, notFound, normalizeUrl, rawBody, requireAuth } from "./middleware.js"
 
@@ -23,5 +24,13 @@ app.use(api)
 // 未注册路径直接 404，不经过鉴权
 app.use(notFound)
 app.use(errorHandler)
+
+// 启动本地服务（npm start / 测试用）
+export function startServer({ port = config.port, logger = console } = {}) {
+  const server = app.listen(port, "0.0.0.0", () => {
+    logger.log(`OC2API Express server running on http://localhost:${port}`)
+  })
+  return server
+}
 
 export default app
