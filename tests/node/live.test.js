@@ -50,7 +50,7 @@ test("local non-stream hi", liveTestOptions(), async (t) => {
   localFirstContent = body.choices[0]?.message?.content || "hi"
 })
 
-test("local streaming tools conversation", liveTestOptions(), async (t) => {
+test("local streaming tools declared but not selectable", liveTestOptions(), async (t) => {
   const response = await runOrSkip(t, () =>
     requestChat(localURL, {
       stream: true,
@@ -78,7 +78,7 @@ test("Vercel non-stream hi", liveTestOptions(), async (t) => {
   vercelFirstContent = body.choices[0]?.message?.content || "hi"
 })
 
-test("Vercel streaming tools conversation", liveTestOptions(), async (t) => {
+test("Vercel streaming tools declared but not selectable", liveTestOptions(), async (t) => {
   const response = await runOrSkip(t, () =>
     requestChat(vercelURL, {
       stream: true,
@@ -92,8 +92,142 @@ test("Vercel streaming tools conversation", liveTestOptions(), async (t) => {
   assertStreamingResponse(response.text, "Vercel tools conversation")
 })
 
+test("local streaming actually invokes a custom tool", liveTestOptions(), async (t) => {
+  const response = await runOrSkip(t, () =>
+    requestChat(localURL, {
+      stream: true,
+      messages: [{ role: "user", content: "What is the weather in Tokyo? Use the get_weather tool." }],
+      tools: [weatherTool()],
+      tool_choice: "auto",
+      max_tokens: 256,
+    }),
+  )
+  if (!response) return
+
+  const chunks = parseSSEData(response.text, "local tool invocation")
+  const call = collectToolCalls(chunks)
+  assert.equal(call.name, "get_weather", `expected a get_weather call, got ${JSON.stringify(call)}`)
+  assert.ok(call.id, "tool call must carry an id so the client can answer it")
+  assert.deepEqual(JSON.parse(call.arguments), { city: "Tokyo" })
+  assert.equal(
+    chunks.flatMap((chunk) => chunk.choices).find((choice) => choice.finish_reason)?.finish_reason,
+    "tool_calls",
+  )
+})
+
+test("local tool result round-trip completes the conversation", liveTestOptions(), async (t) => {
+  // 完整 agent 循环：模型调用工具 -> 客户端回填 tool 结果 -> 模型基于结果作答。
+  const invoked = await runOrSkip(t, () =>
+    requestChat(localURL, {
+      stream: true,
+      messages: [{ role: "user", content: "What is the weather in Tokyo? Use the get_weather tool." }],
+      tools: [weatherTool()],
+      tool_choice: "auto",
+      max_tokens: 256,
+    }),
+  )
+  if (!invoked) return
+
+  const first = collectToolCalls(parseSSEData(invoked.text, "round-trip step 1"))
+  if (!first.name) {
+    t.skip("upstream chose not to call the tool this time")
+    return
+  }
+
+  const assistantText =
+    parseSSEData(invoked.text, "round-trip step 1")
+      .flatMap((chunk) => chunk.choices)
+      .map((choice) => choice.delta?.content ?? "")
+      .join("") || null
+
+  const response = await runOrSkip(t, () =>
+    requestChat(localURL, {
+      stream: true,
+      messages: [
+        { role: "user", content: "What is the weather in Tokyo? Use the get_weather tool." },
+        {
+          role: "assistant",
+          content: assistantText,
+          tool_calls: [{ id: first.id, type: "function", function: { name: first.name, arguments: first.arguments } }],
+        },
+        {
+          role: "tool",
+          tool_call_id: first.id,
+          content: '{"city":"Tokyo","temp_c":18,"condition":"cloudy"}',
+        },
+      ],
+      tools: [weatherTool()],
+      tool_choice: "auto",
+      max_tokens: 256,
+    }),
+  )
+  if (!response) return
+
+  const chunks = parseSSEData(response.text, "round-trip step 2")
+  const text = chunks
+    .flatMap((chunk) => chunk.choices)
+    .map((choice) => choice.delta?.content ?? "")
+    .join("")
+  assert.ok(text.length > 0, "模型应基于工具结果给出回答")
+  assert.equal(collectToolCalls(chunks).name, "", "拿到结果后不应再次调用工具")
+})
+
+test("Vercel streaming actually invokes a custom tool", liveTestOptions(), async (t) => {
+  const response = await runOrSkip(t, () =>
+    requestChat(vercelURL, {
+      stream: true,
+      messages: [{ role: "user", content: "What is the weather in Tokyo? Use the get_weather tool." }],
+      tools: [weatherTool()],
+      tool_choice: "auto",
+      max_tokens: 256,
+    }),
+  )
+  if (!response) return
+
+  const call = collectToolCalls(parseSSEData(response.text, "Vercel tool invocation"))
+  assert.equal(call.name, "get_weather", `expected a get_weather call, got ${JSON.stringify(call)}`)
+  assert.deepEqual(JSON.parse(call.arguments), { city: "Tokyo" })
+})
+
+test("local non-stream also invokes a custom tool", liveTestOptions(), async (t) => {
+  // 上游只支持流式，非流式靠代理聚合；工具调用必须能在聚合后还原。
+  const response = await runOrSkip(t, () =>
+    requestChat(localURL, {
+      stream: false,
+      messages: [{ role: "user", content: "What is the weather in Tokyo? Use the get_weather tool." }],
+      tools: [weatherTool()],
+      tool_choice: "auto",
+      max_tokens: 256,
+    }),
+  )
+  if (!response) return
+
+  const body = parseJSON(response.text, "local non-stream tool invocation")
+  const choice = body.choices[0]
+  const call = choice.message.tool_calls?.[0]
+  assert.equal(choice.finish_reason, "tool_calls")
+  assert.equal(call?.type, "function")
+  assert.ok(call.id, "tool call must carry an id")
+  assert.equal(call.function.name, "get_weather")
+  assert.deepEqual(JSON.parse(call.function.arguments), { city: "Tokyo" })
+})
+
 function liveTestOptions() {
   return { skip: !live, concurrency: false }
+}
+
+/** 把同一 index 的 tool_calls 增量拼成完整调用（流式分片可能跨多个 chunk）。 */
+function collectToolCalls(chunks) {
+  const merged = new Map()
+  for (const part of chunks.flatMap((chunk) => chunk.choices).flatMap((choice) => choice.delta?.tool_calls ?? [])) {
+    const index = part.index ?? 0
+    if (!merged.has(index)) merged.set(index, { id: "", name: "", arguments: "" })
+    const call = merged.get(index)
+    if (part.id) call.id = part.id
+    if (part.function?.name) call.name = part.function.name
+    if (part.function?.arguments) call.arguments += part.function.arguments
+  }
+  return merged.get(0) ?? { id: "", name: "", arguments: "" }
 }
 
 async function runOrSkip(t, request) {

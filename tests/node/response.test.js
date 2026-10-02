@@ -157,6 +157,45 @@ test("工具调用可跨帧累积并还原成完整参数", async () => {
   const streamCalls = payloads(stream.text).flatMap((c) => c.choices.flatMap((x) => x.delta.tool_calls ?? []))
   assert.ok(streamCalls.length >= 2)
   assert.equal(streamCalls.map((c) => c.function?.arguments ?? "").join(""), '{"city":"SF"}')
+
+  // 归一化不得误删 tool_calls（曾在改字段清理时把整个字段删掉）。
+  for (const chunk of [...payloads(stream.text), full.body]) {
+    assert.ok(JSON.stringify(chunk).includes("tool_calls"), "tool_calls 必须保留下来")
+  }
+  assert.equal(streamCalls[0].type, "function")
+  assert.equal(streamCalls[0].id, "call_1")
+})
+
+test("多个并行工具调用按 index 独立累积，互不串味", async () => {
+  const raw = [
+    'data: {"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"get_weather","arguments":"{\\"city\\":"}},{"index":1,"id":"call_b","type":"function","function":{"name":"get_time","arguments":"{\\"zone\\":"}}]}}]}\n\n',
+    'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"SF\\"}"}},{"index":1,"function":{"arguments":"\\"JST\\"}"}}]}}]}\n\n',
+    'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+    done,
+  ].join("")
+  const [full, stream] = await runBoth([raw])
+
+  const calls = full.body.choices[0].message.tool_calls
+  assert.equal(calls.length, 2)
+  assert.equal(calls[0].id, "call_a")
+  assert.equal(calls[0].function.name, "get_weather")
+  assert.deepEqual(JSON.parse(calls[0].function.arguments), { city: "SF" })
+  assert.equal(calls[1].id, "call_b")
+  assert.equal(calls[1].function.name, "get_time")
+  assert.deepEqual(JSON.parse(calls[1].function.arguments), { zone: "JST" })
+
+  // 流式侧两个调用都必须出现，且各自的 arguments 只拼进自己那一支。
+  const streamed = payloads(stream.text).flatMap((c) => c.choices.flatMap((x) => x.delta.tool_calls ?? []))
+  const byIndex = new Map()
+  for (const part of streamed) {
+    const index = part.index ?? 0
+    if (!byIndex.has(index)) byIndex.set(index, { name: "", arguments: "" })
+    const target = byIndex.get(index)
+    if (part.function?.name) target.name = part.function.name
+    if (part.function?.arguments) target.arguments += part.function.arguments
+  }
+  assert.deepEqual(byIndex.get(0), { name: "get_weather", arguments: '{"city":"SF"}' })
+  assert.deepEqual(byIndex.get(1), { name: "get_time", arguments: '{"zone":"JST"}' })
 })
 
 test("上游 HTTP 错误与错误事件都归一为 429", async () => {
