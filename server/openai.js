@@ -333,6 +333,18 @@ async function readErrorBody(upstream, ctx) {
 
 // ---- 对外两种响应模式 ----
 
+// 统一的完成判定，两种响应模式共用，避免同输入在流式/非流式下结论相反：
+//   - 一个 choice 都没有（只回了 usage）→ 上游异常；
+//   - 有 choice 但没收到完成信号、且仍有 choice 缺 finish_reason → 截断；
+//   - 其余（[DONE] 或所有 choice 都 finish）→ 正常完成。
+function assertCompleted({ sawDone, sawFinish, choiceIndexes, finishedIndexes }) {
+  if (!choiceIndexes.size) throw new ZenStreamError("Empty response from upstream")
+  const allFinished = [...choiceIndexes].every((index) => finishedIndexes.has(index))
+  if (!sawDone && !sawFinish && !allFinished) {
+    throw new ZenStreamError("Incomplete response from upstream")
+  }
+}
+
 export async function respondStream(response, upstream, ctx) {
   if (!upstream.ok) return sendJson(response, rateLimitError(await readErrorBody(upstream, ctx)), 429)
   if (!upstream.body) return sendJson(response, rateLimitError("Empty response from upstream"), 429)
@@ -342,9 +354,8 @@ export async function respondStream(response, upstream, ctx) {
   let started = false
   let sawDone = false
   let sawFinish = false
-  // sawContent：是否出现过正文增量；sawChoiceFrame：是否出现过 choice 帧（截断判定用）。
+  // sawContent：是否出现过正文增量（正文之前的帧允许短暂压住）。
   let sawContent = false
-  let sawChoiceFrame = false
   // 出现过的 choice index、已收尾的 choice index：完成判定必须按 choice 而非全局，
   // 否则某个 choice 先 finish 会把其它 choice 后续的 finish 帧一并吞掉。
   const sawChoiceIndexes = new Set()
@@ -403,7 +414,6 @@ export async function respondStream(response, upstream, ctx) {
       // 上游结尾的 {choices:[],cost} 之类空帧没有转发价值；
       // 但带 usage 的帧即使没有可用 choice 也要转（补齐统计）。
       if (!hasChoices && !usable.usage) continue
-      if (hasChoices) sawChoiceFrame = true
       for (const choice of usableChoices) {
         const index = Number.isInteger(choice.index) ? choice.index : 0
         sawChoiceIndexes.add(index)
@@ -432,11 +442,9 @@ export async function respondStream(response, upstream, ctx) {
       if (client.closed) break
     }
     if (client.closed) return
-    // 无完成信号即截断，不能补 [DONE] 伪装成正常完成。
-    if (!sawDone && !sawFinish) throw new ZenStreamError("Incomplete response from upstream")
-    // 明确完成的空回答算成功，但只回 usage 而无 choice 属上游异常。
-    // pending 里只有无内容帧，不算有效输出。
-    if (!sawChoiceFrame && !sawContent) throw new ZenStreamError("Empty response from upstream")
+    // 与流式共用同一判定：无完成信号即截断，不能补 [DONE] 伪装成正常完成；
+    // 但"明确完成的空回答"算成功（对齐 opencode 官方）。
+    assertCompleted({ sawDone, sawFinish, choiceIndexes: sawChoiceIndexes, finishedIndexes: finishedChoiceIndexes })
     for (const buffered of pending.splice(0)) await send(buffered)
     await send("[DONE]")
   } catch (error) {
@@ -546,12 +554,13 @@ export async function respondJson(response, upstream, ctx) {
       }
     }
     if (client.closed) return
-    // 只有 usage、连一个 choice 帧都没有：这是上游异常，不是"空回答"。
-    if (!choices.size) throw new ZenStreamError("Empty response from upstream")
-    // 仍缺 finish_reason = 流被打断，不能走到下面的 ?? "stop" 伪装成完整答案。
-    if (!sawDone && !sawFinish && ![...choices.values()].every((state) => state.finish)) {
-      throw new ZenStreamError("Incomplete response from upstream")
-    }
+    // 与流式共用同一判定，避免同输入在两种模式下结论相反。
+    assertCompleted({
+      sawDone,
+      sawFinish,
+      choiceIndexes: new Set(choices.keys()),
+      finishedIndexes: new Set([...choices.entries()].filter(([, state]) => state.finish).map(([index]) => index)),
+    })
 
     const result = {
       id: id || ctx.requestId,

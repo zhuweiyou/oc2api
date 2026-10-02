@@ -519,6 +519,32 @@ test("流被截断时不伪装成正常完成，[DONE] 或 finish_reason 二者�
   }
 })
 
+test("两种响应模式对完成的判定一致", async () => {
+  // 回归：两模式曾各自判定，同一份输入可能一个判完成、一个判截断。
+  // 注意流式在首个字节之后无法再改 HTTP 状态码，所以只比较"是否判为失败"。
+  const streamFailed = (response) => /rate_limit_error/.test(response.text) || !response.text.includes("[DONE]")
+  const cases = {
+    正常完成: [[partial, finish, done], false],
+    "仅 finish": [[partial, finish], false],
+    "仅 DONE": [[partial, done], false],
+    截断: [[partial], true],
+    "仅 usage 无 choice": [[`data: ${JSON.stringify({ choices: [], usage: { total_tokens: 1 } })}\n\n`, done], true],
+    明确完成的空回答: [
+      [
+        `data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: "stop" }] })}\n\n`,
+        done,
+      ],
+      false,
+    ],
+  }
+  for (const [name, [chunks, shouldFail]] of Object.entries(cases)) {
+    const [full, stream] = await runBoth(chunks)
+    const jsonFailed = full.statusCode === 429
+    assert.equal(jsonFailed, shouldFail, `非流式判定不符：${name}`)
+    assert.equal(streamFailed(stream), shouldFail, `流式判定不符：${name}`)
+  }
+})
+
 test("finish_reason 即完成信号：上游不关连接也有界收尾", { timeout: 8000 }, async () => {
   // 回归：完成信号若只用于"判定是否报错"而不用于收尾，上游发完 finish_reason
   // 却不关连接时，非流式会白等整个空闲窗口，然后把一份完整回答丢成 429。
