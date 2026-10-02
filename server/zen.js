@@ -1,12 +1,9 @@
-// OpenCode Zen 上游客户端。
-//
-// 免费层（anonymous lane）的硬性门槛，均已对真实上游逐项验证：
-//   1. User-Agent 必须形如 opencode/<version>，其他 UA 一律 403；
+// OpenCode Zen 上游客户端。免费层的硬门槛（均对真实上游逐项验证过）：
+//   1. User-Agent 必须形如 opencode/<version>，其他一律 403；
 //   2. 必须带 x-opencode-session（ses_ + 26 位小写十六进制）；
-//   3. 请求体必须包含 bash / read 两个"门禁工具"，缺失即 403；
+//   3. 请求体必须含 bash / read 两个"门禁工具"，缺失即 403；
 //   4. stream 必须为 true，stream:false 一律 403。
-// 除上述之外上游就是标准 OpenAI 协议，因此本模块只做"补齐必要条件"，
-// 不重写业务字段（messages / tools / tool_choice / temperature 等原样透传）。
+// 除此之外上游就是标准 OpenAI 协议，本模块只补齐上述条件，业务字段原样透传。
 import { ocId } from "./shared.js"
 import { debugLog } from "./log.js"
 

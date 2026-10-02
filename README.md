@@ -24,6 +24,16 @@ OpenCode Free API 代理，使用一套 Express 业务逻辑，同时支持本�
 
 你可以 Fork 后部署多个 Vercel Project，以创建多个出口 IP 不同的项目，然后在 [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI/blob/main/README_CN.md#%E5%8A%9F%E8%83%BD%E7%89%B9%E6%80%A7)、[Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api/blob/main/README_CN.md)、[QuantumNous/new-api](https://github.com/QuantumNous/new-api/blob/main/README.zh_CN.md#-%E5%BF%AB%E9%80%9F%E5%BC%80%E5%A7%8B) 等工具中配置多个域名实现轮询，规避 IP 限制。
 
+## 请求流程
+
+```mermaid
+flowchart LR
+    A[客户端请求] --> B[鉴权]
+    B --> C[参数校验]
+    C --> D[伪装成 OpenCode 客户端<br/>转发上游]
+    D --> E[转换响应<br/>返回给客户端]
+```
+
 ## 本地运行
 
 要求 Node.js 24 或更高版本。
@@ -118,18 +128,3 @@ Authorization: Bearer <api-key>
 以上限制数据来源于接口 [https://models.opencode.ai/api.json](https://models.opencode.ai/api.json)（`opencode` key 下对应模型的 `limit` 字段），可自行查看核实，以实际使用为准。
 
 上游失败（限流、鉴权、超时等）统一以 `429` 返回，便于 CLIProxyAPI / sub2api / new-api 等账号池工具切换账号。
-
-## 架构
-
-按功能域拆分，各文件内聚一类职责：
-
-- `server/app.js`：Express app 组装——全局中间件 + 路由声明（`router.get` / `router.post`），以及 `startServer` 启动函数
-- `server/middleware.js`：CORS（[`cors`](https://www.npmjs.com/package/cors) 库）、URL 归一化、原始体缓冲、**路由级鉴权** `requireAuth`、404/错误兜底
-- `server/handler.js`：业务端点编排（health / ip / models / chat）与门面校验
-- `server/zen.js`：上游客户端——免费层伪装（UA / session / 门禁工具 / 强制流式）、连接超时、模型列表
-- `server/openai.js`：响应层——SSE 解析、字段归一、流式转发与非流式聚合、错误归一
-- `server/shared.js`：跨文件共用的响应/解析工具；`server/config.js`：版本/鉴权/调试/端口配置；`server/log.js`：调试日志
-- `server/index.js`：本地启动脚本（`npm start` / Docker CMD），只负责启动与优雅退出
-- `api/index.js`：Vercel 薄入口，导入同一个 `server/app.js`
-
-公开路由（`/`、`/health`、`/ip`）免鉴权；`/v1/models`、`/v1/chat/completions` 等受保护路由通过路由级中间件鉴权，未知路径直接返回 404。

@@ -1,23 +1,12 @@
-// OpenAI 兼容响应层。
+// OpenAI 兼容响应层：上游本就是 OpenAI 协议，这里只做最小必要改写
+// （思考字段归一为 reasoning_content、剥掉 cost/delta.name、失败归一为 429），
+// 不解析也不重组正文。上游只支持流式，非流式请求在这里把 SSE 聚合成 JSON。
 //
-// 上游除以下三点外就是标准 OpenAI 协议，所以这里只做"最小必要改写"，
-// 不解析、不重组正文内容：
-//   1. 思考字段归一：上游有的模型用 reasoning / reasoning_details，
-//      下游统一认 reasoning_content（reasoning_details 是同一内容的镜像，
-//      不会重复计入；reasoning_effort:"none" 时直接丢弃）；
-//   2. 清理上游私有扩展（cost、delta.name），并归一 usage:null；
-//   3. 错误归一：上游任何失败都以 429 返回，供下游账号池切换。
-// 上游只支持流式，所以非流式下游请求在这里把 SSE 聚合回一个 JSON 对象。
-//
-// 完成语义（对应上游真实行为，改动时请一并更新 tests/node/response.test.js）：
-//   - 完成信号是 [DONE] 或任一 finish_reason，收到后只再等 1 秒收取尾部 usage；
-//     上游常常给出完成信号却不关连接，不提前收尾会让每个请求白等空闲窗口；
+// 完成语义有几处反直觉，改动前先看 tests/node/response.test.js：
+//   - finish_reason 与 [DONE] 同为完成信号，要据此提前收尾，不能干等空闲窗口；
 //   - 完成信号之后的帧只吸收 usage，越界正文既不写入也不产生新 choice；
-//   - 上游明确完成的空回答（拒答、max_tokens 极小）算成功，与 opencode 官方一致；
-//     但连一个 choice 帧都没有、只回 usage 就结束属于上游异常，要报错；
-//   - 既无完成信号又缺 finish_reason 视为截断，不能补 [DONE] 伪装成正常完成；
-//   - 首个正文之前的帧先压住不写，这样上游随后报错时还能退回 JSON 429
-//     （账号池靠状态码切号，提前 flushHeaders 会让它看不到 429）。
+//   - "明确完成的空回答"算成功（对齐 opencode 官方），只回 usage 而无 choice 才算异常；
+//   - 首个正文之前的帧先压住不写，否则上游随后报错时无法退回 JSON 429。
 import { logUpstreamBody } from "./log.js"
 
 const SSE_HEADERS = {
@@ -133,11 +122,9 @@ function hasFinishReason(chunk) {
   return (chunk?.choices ?? []).some((choice) => typeof choice?.finish_reason === "string" && choice.finish_reason)
 }
 
-// 非流式聚合时，把流式会透传、但聚合器没有专门处理的 delta 字段带上，
-// 否则同一次上游调用在流式与非流式下结果不同（例如 legacy function_call、
-// refusal、vendor 扩展字段）。
-// 字符串按增量拼接，对象按字段递归合并 —— 上游会把 function_call 的
-// name 与 arguments 拆在不同帧里，直接覆盖会把先前到达的字段丢掉。
+// 非流式聚合必须带上流式会透传、但聚合器未专门处理的 delta 字段，否则同一份
+// 上游响应在两种模式下结果不同。字符串增量拼接、对象递归合并——上游会把
+// function_call 的 name 与 arguments 拆在不同帧，直接覆盖会丢掉先到的字段。
 function mergePassthrough(state, delta) {
   for (const [key, value] of Object.entries(delta)) {
     if (key === "role" || key === "content" || key === "reasoning_content" || key === "tool_calls") continue
@@ -171,9 +158,7 @@ export async function* readEvents(reader, ctx) {
   let eventType = ""
   let sawAny = false
   let lastEventAt = Date.now()
-  // 完成信号（[DONE] 或任一 finish_reason）之后只再等一小段：上游可能把 usage
-  // 排在后面。没有这个截止时间的话，上游明确结束后却不关连接，请求会一直挂到
-  // 空闲窗口——非流式那边甚至会白等两分钟后把一份完整回答扔掉。
+  // 完成信号之后只再等一小段收尾部 usage，否则上游不关连接时会挂到空闲窗口。
   let trailingUntil = 0
 
   const beginTrailer = () => {
@@ -280,7 +265,7 @@ function raceRead(reader, budgetMs) {
   return raced
 }
 
-// 上游错误体可能是 {error:{...}}、{error:"..."} 或 {type:"error"}，统一提取可读信息。
+// 统一提取上游各种错误体形态的可读信息。
 export function upstreamError(parsed, forced = false) {
   if (!parsed || typeof parsed !== "object") return null
   if (!forced && !parsed.error && parsed.type !== "error") return null
@@ -345,8 +330,8 @@ export async function respondStream(response, upstream, ctx) {
   let started = false
   let sawDone = false
   let sawFinish = false
-  // sawContent 只代表"出现过正文增量"（用于决定能否退回 JSON 错误），
-  // sawChoiceFrame 代表"出现过 choice 帧"（用于截断判定）——两者语义不同，不能混用。
+  // sawContent：是否出现过正文增量（决定能否退回 JSON 错误）；
+  // sawChoiceFrame：是否出现过 choice 帧（用于截断判定）。语义不同，不能混用。
   let sawContent = false
   let sawChoiceFrame = false
   // 首个正文之前压住的帧（role / 空 delta / 纯 usage），按序延迟写出。
@@ -390,13 +375,12 @@ export async function respondStream(response, upstream, ctx) {
       const normalized = normalizeChunk(completes ? usageOnly(chunk) : chunk, ctx.model, ctx.thinkingEnabled)
       if (!normalized) continue
       const hasChoices = Boolean(normalized.choices?.length)
-      // 既没有 choices 也没有 usage 的帧（上游结尾的 {choices:[],cost}）没有转发价值。
+      // 上游结尾的 {choices:[],cost} 之类空帧没有转发价值。
       if (!hasChoices && !normalized.usage) continue
       if (hasChoices) sawChoiceFrame = true
 
       if (!hasContent(normalized)) {
-        // 只有 role / 空 delta / 纯 usage 的帧先压住不写：它们对下游没有信息量，
-        // 却会提前 flushHeaders 把"上游随后报错"逼成 SSE 错误帧，让账号池看不到 429。
+        // 这些帧对下游没有信息量，提前写会 flushHeaders，让上游随后报错时退不回 429。
         pending.push(normalized)
         continue
       }
@@ -407,11 +391,9 @@ export async function respondStream(response, upstream, ctx) {
       if (client.closed) break
     }
     if (client.closed) return
-    // 截断：上游没给完成信号（[DONE] 或任一 finish_reason），却被读完了。
-    // 不能补 [DONE] 把半截回答伪装成正常完成。
+    // 无完成信号即截断，不能补 [DONE] 伪装成正常完成。
     if (!sawDone && !sawFinish) throw new ZenStreamError("Incomplete response from upstream")
-    // 上游明确完成但回答为空（拒答、max_tokens 极小）是成功，与 opencode 官方一致；
-    // 但连一个 choice 帧都没有、只有 usage 就结束，属于上游异常。
+    // 明确完成的空回答算成功，但只回 usage 而无 choice 属上游异常。
     if (!sawChoiceFrame && !sawContent) throw new ZenStreamError("Empty response from upstream")
     for (const buffered of pending.splice(0)) await send(buffered)
     await send("[DONE]")
@@ -447,8 +429,7 @@ export async function respondJson(response, upstream, ctx) {
         sawDone = true
         continue
       }
-      // 带 finish_reason 的这一帧本身要先按原样处理（它承载完成原因），
-      // 之后的越界帧才只吸收 usage。
+      // 本帧承载完成原因，要先按原样处理；之后的越界帧才只吸收 usage。
       const completes = sawDone || sawFinish
       if (hasFinishReason(chunk)) sawFinish = true
       const normalized = normalizeChunk(completes ? usageOnly(chunk) : chunk, ctx.model, ctx.thinkingEnabled)
@@ -483,9 +464,7 @@ export async function respondJson(response, upstream, ctx) {
     if (client.closed) return
     // 只有 usage、连一个 choice 帧都没有：这是上游异常，不是"空回答"。
     if (!choices.size) throw new ZenStreamError("Empty response from upstream")
-    // 截断判定：上游没有给出完成信号（[DONE] 或任一 finish_reason）时，
-    // 只要有任何 choice 缺 finish_reason 就说明流被打断，不能补成正常完成
-    // （下面的 ?? "stop" 会把半截回答伪装成完整答案）。
+    // 仍缺 finish_reason = 流被打断，不能走到下面的 ?? "stop" 伪装成完整答案。
     if (!sawDone && !sawFinish && ![...choices.values()].every((state) => state.finish)) {
       throw new ZenStreamError("Incomplete response from upstream")
     }
