@@ -191,13 +191,17 @@ test("带工具调用却标成 stop 时归一为 tool_calls（对齐 opencode �
   assert.equal(truncated.body.choices[0].finish_reason, "length")
 })
 
-test("无 index 的并行工具调用不能被合并（上游真实形态）", async () => {
-  // 回归：上游把并行调用各放一帧且常常不带 index，按 index ?? 0 归并会把
-  // 两个不同调用揉成一个、参数字符串首尾相接（实测把 Tokyo/Osaka 合成
-  // '{"city":"Tokyo"}{"city":"Osaka"}'）。main 原本是正确的，重写时退化。
+test("无 index 的工具调用：新调用要分开、参数续传要合并", async () => {
+  // 上游的两种无 index 形态必须区分开（三方对照 main 验证过）：
+  //   - 各自带新 id：是两个不同调用，不能合并；
+  //   - 只有 arguments：是上一个调用的参数续传，必须并入同一调用，
+  //     否则会拆成两个 JSON 非法的调用（main 与修复前都有这个缺陷）。
   const call = (id, argumentsText) =>
     `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ id, type: "function", function: { name: "get_weather", arguments: argumentsText } }] } }] })}\n\n`
+  const continuation = (argumentsText) =>
+    `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ function: { arguments: argumentsText } }] } }] })}\n\n`
 
+  // 两个不同调用（各自带 id）不能被合并
   const [full] = await runBoth([call("call_A", '{"city":"Tokyo"}'), call("call_B", '{"city":"Osaka"}'), finish, done])
   const calls = full.body.choices[0].message.tool_calls
   assert.equal(calls.length, 2, "两个并行调用必须各自保留")
@@ -205,16 +209,26 @@ test("无 index 的并行工具调用不能被合并（上游真实形态）", a
   assert.deepEqual(JSON.parse(calls[1].function.arguments), { city: "Osaka" })
   assert.notEqual(calls[0].id, calls[1].id)
 
-  // 同一调用的参数续传（无 index）仍要合并成一个
-  const [continued] = await runBoth([
-    call("call_X", '{"ci'),
-    `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ function: { arguments: 'ty":"SF"}' } }] } }] })}\n\n`,
+  // 参数续传（无 id 无 name）要并入同一个调用，且参数拼成合法 JSON
+  const [continued] = await runBoth([call("call_X", '{"ci'), continuation('ty":"SF"}'), finish, done])
+  const single = continued.body.choices[0].message.tool_calls
+  assert.equal(single.length, 1, "续传帧不能另起一个调用")
+  assert.deepEqual(JSON.parse(single[0].function.arguments), { city: "SF" })
+  assert.equal(single[0].function.name, "get_weather")
+
+  // 两个并行调用各自续传：仍应是 2 个，且参数都完整
+  const [parallel] = await runBoth([
+    call("call_A", '{"city":"Tok'),
+    continuation('yo"}'),
+    call("call_B", '{"city":"Osa'),
+    continuation('ka"}'),
     finish,
     done,
   ])
-  const single = continued.body.choices[0].message.tool_calls
-  assert.equal(single.length, 1)
-  assert.deepEqual(JSON.parse(single[0].function.arguments), { city: "SF" })
+  const merged = parallel.body.choices[0].message.tool_calls
+  assert.equal(merged.length, 2)
+  assert.deepEqual(JSON.parse(merged[0].function.arguments), { city: "Tokyo" })
+  assert.deepEqual(JSON.parse(merged[1].function.arguments), { city: "Osaka" })
 })
 
 test("多个并行工具调用按 index 独立累积，互不串味", async () => {
