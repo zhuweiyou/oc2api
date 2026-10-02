@@ -40,7 +40,7 @@ flowchart TD
 
 部署完成后会得到一个 `https://<项目名>.vercel.app` 的域名。
 
-你可以 Fork 后部署多个 Vercel Project，以创建多个出口 IP 不同的项目，然后在 [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)、[Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api)、[QuantumNous/new-api](https://github.com/QuantumNous/new-api) 等聚合网关中配置多个域名实现轮询，既规避 IP 限制，也把并发分摊到多个实例：
+你可以 Fork 后部署多个 Vercel Project，在 [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)、[Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api)、[QuantumNous/new-api](https://github.com/QuantumNous/new-api) 等聚合网关中配置多个域名，实现轮询、负载分摊。多个项目不保证出口 IP 不同，需通过各实例的 `/ip` 核对；独立出口取决于实际部署。
 
 ## 本地运行
 
@@ -79,13 +79,13 @@ docker compose up -d --build
 npm test
 ```
 
-真实联调测试会向 `big-pickle` 发送两次请求：一次不带 tools 的非流式 `hi`，以及一次带 tools 的流式连续对话，并分别验证本地与 Vercel 入口（共 4 次请求）：
+真实联调包含 9 个用例：非流式回答、流式多轮对话、禁用工具、实际工具调用、工具结果回填，以及三个并行工具调用。全部首轮成功时至少发送 10 次 `big-pickle` 请求，工具自主选择的有限重试会增加请求数。Vercel 用例通过本地 HTTP 服务加载其入口，不等于远程 Vercel 部署验收：
 
 ```bash
 npm run test:live
 ```
 
-真实测试可能受到上游限流影响；限流时测试会输出原因并跳过，不影响离线测试。
+离线运行时联调用例跳过；显式启用联调后，HTTP 错误、超时、协议错误和未能实际调用工具均视为失败，不能用 skip 冒充通过。每个用例总预算为 120 秒，单次请求最多 90 秒；工具选择最多尝试三次，但仍受用例总预算约束。真实上游限流也会使联调失败，不影响离线测试。
 
 ## 代码检查
 
@@ -135,4 +135,11 @@ Authorization: Bearer <api-key>
 
 以上限制数据来源于接口 [https://models.opencode.ai/api.json](https://models.opencode.ai/api.json)（`opencode` key 下对应模型的 `limit` 字段），可自行查看核实，以实际使用为准。
 
-上游失败（限流、鉴权、超时等）统一以 `429` 返回，便于 CLIProxyAPI / sub2api / new-api 等账号池工具切换账号。
+聊天上游返回 HTTP 错误或流解析失败时，在下游响应头尚未发送前归一为 `429`，便于账号池切换；流式头已发送后只能返回 SSE 错误事件，且不补 `[DONE]`。建连网络失败、建连超时及模型列表错误仍沿用原有的 `502` / `504` 分类。
+
+### 响应与超时边界
+
+- 正文原样保留，包括字面的 `<think>` / `<thinking>` 标签和普通 `thinking` 词句，不再猜测正文中的思考标记。思考字段归一为 `reasoning_content`；`reasoning_effort: "none"` 仅隐藏专用思考字段。兼容 `reasoningEffort` 别名。
+- 上游建连最多 60 秒；响应头后的首段数据最多等 30 秒，其后的网络读取空闲窗口为 120 秒，不计入下游背压暂停时间。
+- 所有已知 choice 完成后，继续读取 usage 到 EOF 或完成起累计 120 秒的尾段截止（下游背压暂停除外，usage 到达不重置总预算）；真正 `[DONE]` 之后最多再等 1 秒补尾部 usage。已完成响应遇到尾段超时仍成功收尾。
+- 免费上游不保证支持 `n > 1`；多 choice 解析有防御覆盖，不代表上游一定会返回请求的 choice 数量。
