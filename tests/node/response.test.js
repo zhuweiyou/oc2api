@@ -166,6 +166,31 @@ test("工具调用可跨帧累积并还原成完整参数", async () => {
   assert.equal(streamCalls[0].id, "call_1")
 })
 
+test("带工具调用却标成 stop 时归一为 tool_calls（对齐 opencode 官方）", async () => {
+  // 实测 big-pickle 约 40% 的情况下把带工具调用的响应标成 finish_reason:"stop"，
+  // 不归一的话下游会当作"回答结束"而不去执行工具。
+  const call = (argumentsText) =>
+    `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "get_weather", arguments: argumentsText } }] } }] })}\n\n`
+
+  const [full, stream] = await runBoth([call("{}"), finish, done])
+  assert.equal(full.body.choices[0].finish_reason, "tool_calls")
+  const streamFinish = payloads(stream.text)
+    .flatMap((chunk) => chunk.choices)
+    .map((choice) => choice.finish_reason)
+    .filter(Boolean)
+  assert.deepEqual(streamFinish, ["tool_calls"])
+
+  // 纯文本不受影响；length 等其它原因也不改写
+  const [textFull] = await runBoth([partial, finish, done])
+  assert.equal(textFull.body.choices[0].finish_reason, "stop")
+  const [truncated] = await runBoth([
+    call("{}"),
+    `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "length" }] })}\n\n`,
+    done,
+  ])
+  assert.equal(truncated.body.choices[0].finish_reason, "length")
+})
+
 test("多个并行工具调用按 index 独立累积，互不串味", async () => {
   const raw = [
     'data: {"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"get_weather","arguments":"{\\"city\\":"}},{"index":1,"id":"call_b","type":"function","function":{"name":"get_time","arguments":"{\\"zone\\":"}}]}}]}\n\n',
@@ -406,6 +431,36 @@ test("只有 role 的帧之后上游报错时仍能退回 JSON 429", async () =>
     assert.equal(response.statusCode, 429)
     assert.match(response.body.error.message, /blew up/)
   }
+})
+
+test("上游异常刷屏无内容帧时有界放行，不会无界攒内存", async () => {
+  // 回归：早前版本把首个正文之前的所有无内容帧都压进数组，上游持续刷这种帧时
+  // 内存无界增长（实测 20 万帧约 70MB），而且一帧都发不出去。
+  const encoder = new TextEncoder()
+  const total = 5000
+  let sent = 0
+  const response = new ResponseStub()
+  const upstreamResponse = new Response(
+    new ReadableStream({
+      pull(controller) {
+        if (sent > total) return // 永不 close：模拟上游空转
+        const frame =
+          sent === 0
+            ? { choices: [{ index: 0, delta: { role: "assistant" } }] }
+            : { choices: [{ index: 0, delta: {} }] }
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(frame)}\n\n`))
+        sent++
+      },
+    }),
+  )
+  const work = respondStream(response, upstreamResponse, ctx)
+  await new Promise((resolve) => setTimeout(resolve, 200))
+  // 关键断言：超过上限后必须开始放行，不能一直攒着
+  assert.ok(response.text.length > 0, "超过上限后应开始转发，而不是无限缓冲")
+  assert.ok(sent > 0)
+  response.destroyed = true
+  response.emit("close")
+  await work.catch(() => {})
 })
 
 test("非流式聚合保留 legacy function_call 等未知 delta 字段", async () => {

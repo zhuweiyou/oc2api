@@ -6,7 +6,8 @@
 //   - finish_reason 与 [DONE] 同为完成信号，要据此提前收尾，不能干等空闲窗口；
 //   - 完成信号之后的帧只吸收 usage，越界正文既不写入也不产生新 choice；
 //   - "明确完成的空回答"算成功（对齐 opencode 官方），只回 usage 而无 choice 才算异常；
-//   - 首个正文之前的帧先压住不写，否则上游随后报错时无法退回 JSON 429。
+//   - 首个正文之前只压住少量无内容帧（保留退回 JSON 429 的能力），上限恒定，
+//     上游异常刷屏时直接放行而不是无界攒内存。
 import { logUpstreamBody } from "./log.js"
 
 const SSE_HEADERS = {
@@ -20,6 +21,9 @@ const FIRST_EVENT_TIMEOUT_MS = 30 * 1000
 const BODY_IDLE_TIMEOUT_MS = 120 * 1000
 // [DONE] 之后仍读一小段：上游可能把 usage 排在它后面。
 const TRAILING_USAGE_TIMEOUT_MS = 1000
+// 首个正文之前允许压住的无内容帧数上限：正常流量只需 1~2 帧（role + 可能的首个空帧），
+// 这个上限只是为了让"上游异常刷屏"时内存保持 O(1)。
+const MAX_PENDING_FRAMES = 8
 
 class ZenStreamError extends Error {
   constructor(message) {
@@ -120,6 +124,20 @@ function usageOnly(chunk) {
 /** 帧里是否带任何 choice 的 finish_reason —— 它与 [DONE] 同样是完成信号。 */
 function hasFinishReason(chunk) {
   return (chunk?.choices ?? []).some((choice) => typeof choice?.finish_reason === "string" && choice.finish_reason)
+}
+
+// 流式侧就地改写 finish_reason：工具调用帧先到，finish 帧后到，所以到 finish 帧时
+// 已经知道本响应是否带工具调用。
+function rewriteFinishReason(chunk, sawToolCalls) {
+  for (const choice of chunk.choices ?? []) {
+    if (choice.finish_reason) choice.finish_reason = normalizeFinish(choice.finish_reason, sawToolCalls ? 1 : 0)
+  }
+}
+
+// 上游约 40% 的情况下把「带工具调用」的响应标成 finish_reason:"stop"（实测 big-pickle）。
+// opencode 官方对此会归一为 tool-calls，下游据此才会去执行工具而不是当作回答结束。
+function normalizeFinish(reason, toolCallCount) {
+  return reason === "stop" && toolCallCount > 0 ? "tool_calls" : reason
 }
 
 // 非流式聚合必须带上流式会透传、但聚合器未专门处理的 delta 字段，否则同一份
@@ -330,11 +348,13 @@ export async function respondStream(response, upstream, ctx) {
   let started = false
   let sawDone = false
   let sawFinish = false
-  // sawContent：是否出现过正文增量（决定能否退回 JSON 错误）；
-  // sawChoiceFrame：是否出现过 choice 帧（用于截断判定）。语义不同，不能混用。
+  // sawContent：是否出现过正文增量；sawChoiceFrame：是否出现过 choice 帧（截断判定用）。
   let sawContent = false
   let sawChoiceFrame = false
-  // 首个正文之前压住的帧（role / 空 delta / 纯 usage），按序延迟写出。
+  let sawToolCalls = false
+  // 首个正文之前先压住少量无内容帧（role / 空 delta / 纯 usage），这样上游随后报错
+  // 还能退回 JSON 429。上限保证内存恒定 O(1)：正常流量下只有 1~2 帧，
+  // 一旦上游异常刷屏就直接放行，不再为"保留 429"而无界攒内存。
   const pending = []
 
   // 首个有效事件之前不提交 SSE 头，这样还能退回普通 JSON 错误。
@@ -378,13 +398,22 @@ export async function respondStream(response, upstream, ctx) {
       // 上游结尾的 {choices:[],cost} 之类空帧没有转发价值。
       if (!hasChoices && !normalized.usage) continue
       if (hasChoices) sawChoiceFrame = true
+      // 工具调用帧总在 finish 帧之前到达，所以这里能判断出该不该改写 finish_reason。
+      if (normalized.choices?.some((choice) => choice.delta?.tool_calls?.length)) sawToolCalls = true
+      rewriteFinishReason(normalized, sawToolCalls)
 
       if (!hasContent(normalized)) {
-        // 这些帧对下游没有信息量，提前写会 flushHeaders，让上游随后报错时退不回 429。
-        pending.push(normalized)
+        // 无内容帧：还没开始输出就先压住（保留退回 JSON 429 的能力），
+        // 超过上限说明上游在异常刷屏，直接放行避免无界攒内存。
+        if (!sawContent && pending.length < MAX_PENDING_FRAMES) {
+          pending.push(normalized)
+          continue
+        }
+        await send(normalized)
+        if (client.closed) break
         continue
       }
-      // 首个正文到达：先把压住的帧按序放出去，再写正文。
+      // 首个正文到达：先把压住的帧按序放出，再写正文。
       sawContent = true
       for (const buffered of pending.splice(0)) await send(buffered)
       await send(normalized)
@@ -394,6 +423,7 @@ export async function respondStream(response, upstream, ctx) {
     // 无完成信号即截断，不能补 [DONE] 伪装成正常完成。
     if (!sawDone && !sawFinish) throw new ZenStreamError("Incomplete response from upstream")
     // 明确完成的空回答算成功，但只回 usage 而无 choice 属上游异常。
+    // pending 里只有无内容帧，不算有效输出。
     if (!sawChoiceFrame && !sawContent) throw new ZenStreamError("Empty response from upstream")
     for (const buffered of pending.splice(0)) await send(buffered)
     await send("[DONE]")
@@ -490,7 +520,7 @@ export async function respondJson(response, upstream, ctx) {
           }
           // 流式会把未知字段原样透传，非流式也必须带上，否则两种模式结果不同。
           Object.assign(message, state.extra)
-          return { index, message, finish_reason: state.finish ?? "stop" }
+          return { index, message, finish_reason: normalizeFinish(state.finish ?? "stop", state.calls.size) }
         }),
     }
     if (usage) result.usage = usage
