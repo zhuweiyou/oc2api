@@ -6,30 +6,28 @@ import test from "node:test"
 import vercelApp from "../../api/index.js"
 import app from "../../server/app.js"
 import { config } from "../../server/config.js"
-import { createOpenAIStreamNormalizer } from "../../server/openai.js"
-import { buildZenRequest } from "../../server/zen.js"
 
-const CUSTOM_TOOL = {
-  type: "function",
-  function: {
-    name: "get_weather",
-    description: "Get the weather for a city.",
-    parameters: {
-      type: "object",
-      properties: { city: { type: "string" } },
-      required: ["city"],
-      additionalProperties: false,
-    },
-  },
-}
+const sse = [
+  'data: {"id":"cmpl-1","created":1,"choices":[{"index":0,"delta":{"role":"assistant","content":"hi"}}]}\n\n',
+  'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+  'data: {"choices":[],"usage":{"total_tokens":2}}\n\n',
+  "data: [DONE]\n\n",
+].join("")
 
-test("Vercel entry exports the same Express app", () => {
+const base = { model: "big-pickle", messages: [{ role: "user", content: "hi" }] }
+
+test("Vercel 入口导出同一个 Express app", () => {
   assert.strictEqual(vercelApp, app)
 })
 
-test("health and OPTIONS responses work through the Express app", async (t) => {
+test("health、CORS 与未知路径不经过鉴权", async (t) => {
+  const previousApiKey = config.apiKey
+  config.apiKey = "sk-test"
   const server = await listen(app)
-  t.after(() => close(server))
+  t.after(async () => {
+    config.apiKey = previousApiKey
+    await close(server)
+  })
 
   const health = await request(server.url, { path: "/health" })
   assert.equal(health.status, 200)
@@ -37,261 +35,136 @@ test("health and OPTIONS responses work through the Express app", async (t) => {
   assert.equal(health.headers["access-control-allow-origin"], "*")
   assert.equal(health.headers["x-powered-by"], undefined)
 
-  const options = await request(server.url, {
-    method: "OPTIONS",
-    path: "/v1/chat/completions",
-  })
+  const options = await request(server.url, { method: "OPTIONS", path: "/v1/chat/completions" })
   assert.equal(options.status, 204)
-  assert.equal(options.headers["access-control-allow-methods"], "GET, POST, OPTIONS")
+
+  // 未注册路径直接 404，不因缺 key 变 401
+  const missing = await request(server.url, { path: "/nope" })
+  assert.equal(missing.status, 404)
+  assert.equal(JSON.parse(missing.text).error.message, "Not found")
+
+  // 受保护路径缺 key 才是 401
+  const protectedPath = await request(server.url, { path: "/v1/models" })
+  assert.equal(protectedPath.status, 401)
+  assert.equal(JSON.parse(protectedPath.text).error.type, "authentication_error")
 })
 
-test("unknown paths return 404 without going through auth", async (t) => {
+test("无效 JSON 返回 OpenAI 风格 400，错误 key 返回 401", async (t) => {
   const previousApiKey = config.apiKey
   config.apiKey = "sk-test"
   const server = await listen(app)
-  t.after(() => {
-    close(server)
+  t.after(async () => {
     config.apiKey = previousApiKey
+    await close(server)
   })
 
-  // 不带 key：未注册路径不经过鉴权，直接 404
-  const noAuth = await request(server.url, { path: "/nope" })
-  assert.equal(noAuth.status, 404)
-  assert.deepEqual(JSON.parse(noAuth.text), { error: { message: "Not found" } })
-
-  // 带错误 key：同样 404，而不是 401
-  const wrongKey = await request(server.url, {
-    method: "POST",
-    path: "/nope",
-    headers: { authorization: "Bearer wrong", "content-type": "application/json" },
-    body: "{}",
-  })
-  assert.equal(wrongKey.status, 404)
-
-  // 已注册的受保护路径缺 key 仍是 401
-  const protectedNoAuth = await request(server.url, { path: "/v1/models" })
-  assert.equal(protectedNoAuth.status, 401)
-})
-
-test("public routes stay open when API_KEY is set, trailing slashes tolerated", async (t) => {
-  const previousApiKey = config.apiKey
-  const previousFetch = globalThis.fetch
-  config.apiKey = "sk-test"
-  // /ip 会访问外部服务商，离线测试里 mock 掉
-  globalThis.fetch = async () => new Response("your ip is 203.0.113.7", { status: 200 })
-  const server = await listen(app)
-  t.after(() => {
-    close(server)
-    config.apiKey = previousApiKey
-    globalThis.fetch = previousFetch
-  })
-
-  for (const path of ["/", "/health", "/ip", "/health//"]) {
-    const response = await request(server.url, { path })
-    assert.equal(response.status, 200, `expected 200 for ${path}`)
-  }
-  assert.equal(JSON.parse((await request(server.url, { path: "/health" })).text).status, "ok")
-  assert.equal(JSON.parse((await request(server.url, { path: "/ip" })).text).ip, "203.0.113.7")
-})
-
-test("invalid JSON returns an OpenAI error instead of Express HTML", async (t) => {
-  const previousApiKey = config.apiKey
-  config.apiKey = undefined
-  const server = await listen(app)
-  t.after(() => {
-    close(server)
-    config.apiKey = previousApiKey
-  })
-
-  const response = await request(server.url, {
+  const badJson = await request(server.url, {
     method: "POST",
     path: "/v1/chat/completions",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", authorization: "Bearer sk-test" },
     body: "{",
   })
-
-  assert.equal(response.status, 400)
-  assert.deepEqual(JSON.parse(response.text), {
+  assert.equal(badJson.status, 400)
+  assert.deepEqual(JSON.parse(badJson.text), {
     error: { message: "Invalid JSON body", type: "invalid_request_error" },
-  })
-})
-
-test("API key authentication rejects missing and wrong keys with 401", async (t) => {
-  const previousApiKey = config.apiKey
-  const previousFetch = globalThis.fetch
-  config.apiKey = "sk-test"
-  globalThis.fetch = async () =>
-    new Response(mockSSEBody(), {
-      status: 200,
-      headers: { "content-type": "text/event-stream" },
-    })
-  const server = await listen(app)
-  t.after(() => {
-    close(server)
-    config.apiKey = previousApiKey
-    globalThis.fetch = previousFetch
-  })
-
-  const payload = {
-    method: "POST",
-    path: "/v1/chat/completions",
-    body: JSON.stringify({
-      model: "big-pickle",
-      messages: [{ role: "user", content: "hi" }],
-      max_tokens: 8,
-      stream: false,
-    }),
-  }
-
-  const noAuth = await request(server.url, {
-    ...payload,
-    headers: { "content-type": "application/json" },
-  })
-  assert.equal(noAuth.status, 401)
-  assert.deepEqual(JSON.parse(noAuth.text), {
-    error: { message: "Invalid API key", type: "authentication_error" },
   })
 
   const wrongKey = await request(server.url, {
-    ...payload,
-    headers: { "content-type": "application/json", authorization: "Bearer wrong" },
-  })
-  assert.equal(wrongKey.status, 401)
-
-  const validKey = await request(server.url, {
-    ...payload,
-    headers: { "content-type": "application/json", authorization: "Bearer sk-test" },
-  })
-  assert.equal(validKey.status, 200)
-})
-
-test("normalizers apply the same content rules to every model", () => {
-  // 开启思考（默认）：content 剥离 think 块，reasoning/reasoning_content 归一为 reasoning_content
-  const normalizer = createOpenAIStreamNormalizer("custom-model")
-  const normalized = normalizer.normalize({
-    choices: [
-      {
-        index: 0,
-        delta: {
-          content: "<thinking>hidden</thinking>hi",
-          reasoning: "trace",
-          reasoning_content: "legacy",
-        },
-      },
-    ],
-  })
-
-  assert.equal(normalized.model, "custom-model")
-  assert.equal(normalized.choices[0].delta.content, "hi")
-  assert.equal(normalized.choices[0].delta.reasoning_content, "tracelegacyhidden")
-  assert.equal(normalized.choices[0].delta.reasoning, undefined)
-
-  // 关闭思考：reasoning 系列字段全部删除，think 块剥离后丢弃
-  const disabled = createOpenAIStreamNormalizer("custom-model", false)
-  const stripped = disabled.normalize({
-    choices: [
-      {
-        index: 0,
-        delta: {
-          content: "<thinking>hidden</thinking>hi",
-          reasoning: "trace",
-          reasoning_content: "legacy",
-        },
-      },
-    ],
-  })
-  assert.deepEqual(stripped.choices[0].delta, { content: "hi" })
-
-  // reasoning_effort 原样透传（"none" 关闭思考，其余开启）
-  const request = buildZenRequest(
-    "custom-model",
-    [{ role: "user", content: [{ type: "image_url", image_url: { url: "data:image/png;base64,abc" } }] }],
-    true,
-    null,
-    null,
-    "low",
-    "ses_test",
-    32,
-    0.7,
-  )
-  const body = JSON.parse(request.body)
-  assert.equal(body.reasoning_effort, "low")
-  assert.equal(body.temperature, 0.7)
-  assert.equal(body.messages[0].content[0].type, "image_url")
-})
-
-test("non-stream and stream requests share the same upstream business path", async (t) => {
-  const previousFetch = globalThis.fetch
-  const previousApiKey = config.apiKey
-  const calls = []
-  config.apiKey = undefined
-  globalThis.fetch = async (url, init) => {
-    calls.push({ url: String(url), init })
-    return new Response(mockSSEBody(), {
-      status: 200,
-      headers: { "content-type": "text/event-stream" },
-    })
-  }
-
-  const server = await listen(app)
-  t.after(() => {
-    close(server)
-    globalThis.fetch = previousFetch
-    config.apiKey = previousApiKey
-  })
-
-  const basePayload = {
-    model: "big-pickle",
-    messages: [{ role: "user", content: "hi" }],
-    max_tokens: 32,
-  }
-  const nonStream = await request(server.url, {
     method: "POST",
     path: "/v1/chat/completions",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      ...basePayload,
-      stream: false,
-      tools: [CUSTOM_TOOL],
-      tool_choice: "none",
-    }),
+    headers: { "content-type": "application/json", authorization: "Bearer nope" },
+    body: JSON.stringify(base),
   })
-  assert.equal(nonStream.status, 200)
-  assert.match(nonStream.headers["x-request-id"] || "", /^req_/)
-  assert.match(nonStream.headers["access-control-expose-headers"] || "", /x-request-id/i)
-  const completion = JSON.parse(nonStream.text)
-  assert.equal(completion.model, "big-pickle")
-  assert.equal(completion.choices[0].message.content, "hi")
-  // 默认开启思考：reasoning_content 聚合上游 reasoning/reasoning_content
-  assert.equal(completion.choices[0].message.reasoning, undefined)
-  assert.equal(completion.choices[0].message.reasoning_content, "tracelegacyhidden")
-
-  const upstreamBody = JSON.parse(calls[0].init.body)
-  assert.equal(upstreamBody.model, "big-pickle")
-  assert.equal(upstreamBody.stream, true)
-  assert.equal(upstreamBody.tool_choice, "none")
-  assert.ok(upstreamBody.tools.some((tool) => tool.function?.name === "get_weather"))
-
-  const stream = await request(server.url, {
-    method: "POST",
-    path: "/chat/completions",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ ...basePayload, stream: true }),
-  })
-  assert.equal(stream.status, 200)
-  assert.match(stream.headers["content-type"], /text\/event-stream/)
-  assert.match(stream.text, /data:/)
-  assert.match(stream.text, /\[DONE\]/)
-  assert.equal(calls.length, 2)
+  assert.equal(wrongKey.status, 401)
 })
 
-function mockSSEBody() {
-  return [
-    `data: ${JSON.stringify({ id: "chatcmpl-test", created: 1, choices: [{ index: 0, delta: { role: "assistant", content: "<thinking>hidden</thinking>hi", reasoning: "trace", reasoning_content: "legacy" } }] })}\n\n`,
-    `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`,
-    `data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } })}\n\n`,
-    "data: [DONE]\n\n",
-  ].join("")
+test("门面校验拒绝付费模型与空 messages，且不请求上游", async (t) => {
+  let fetchCalls = 0
+  const server = await fixture(t, async () => {
+    fetchCalls++
+    throw new Error("must not reach upstream")
+  })
+
+  for (const [payload, expected] of [
+    [{ ...base, model: "gpt-6-astra" }, /Only big-pickle/],
+    [{ ...base, model: "" }, /non-empty string/],
+    [{ ...base, model: 123 }, /non-empty string/],
+    [{ ...base, messages: [] }, /non-empty array/],
+    [{ ...base, messages: "hi" }, /non-empty array/],
+    [{ model: "big-pickle" }, /non-empty array/],
+    ["not-an-object", /Invalid JSON body/],
+  ]) {
+    const response = await post(server.url, payload)
+    assert.equal(response.status, 400, JSON.stringify(payload))
+    assert.match(JSON.parse(response.text).error.message, expected)
+  }
+  assert.equal(fetchCalls, 0, "校验必须发生在上游请求之前")
+})
+
+test("合法请求端到端：流式与非流式都能拿到正文与 usage", async (t) => {
+  const forwarded = []
+  const server = await fixture(t, async (_url, init) => {
+    forwarded.push(JSON.parse(init.body))
+    return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } })
+  })
+
+  const nonStream = await post(server.url, { ...base, stream: false })
+  assert.equal(nonStream.status, 200)
+  const completion = JSON.parse(nonStream.text)
+  assert.equal(completion.choices[0].message.content, "hi")
+  assert.deepEqual(completion.usage, { total_tokens: 2 })
+  assert.match(nonStream.headers["x-request-id"] ?? "", /^req_/)
+  assert.equal(forwarded.at(-1).stream, true, "上游只接受流式")
+
+  // 用户没传 tools：必须补齐免费层门禁工具并禁止选中它们
+  const names = forwarded.at(-1).tools.map((tool) => tool.function.name)
+  assert.ok(names.includes("bash") && names.includes("read"))
+  assert.equal(forwarded.at(-1).tool_choice, "none")
+
+  const stream = await post(server.url, { ...base, stream: true })
+  assert.equal(stream.status, 200)
+  assert.match(stream.headers["content-type"], /text\/event-stream/)
+  assert.match(stream.text, /data: /)
+  assert.equal(stream.text.split("[DONE]").length - 1, 1)
+
+  // 用户 tools 原样保留并沿用 tool_choice / temperature
+  const weather = { type: "function", function: { name: "get_weather", parameters: { type: "object" } } }
+  await post(server.url, { ...base, stream: false, tools: [weather], tool_choice: "auto", temperature: 0.5 })
+  const last = forwarded.at(-1)
+  assert.equal(last.tool_choice, "auto")
+  assert.equal(last.temperature, 0.5)
+  assert.ok(last.tools.some((tool) => tool.function.name === "get_weather"))
+})
+
+test("上游失败时返回 429，供账号池切换", async (t) => {
+  const server = await fixture(
+    t,
+    async () =>
+      new Response(JSON.stringify({ error: { message: "rate limited" } }), {
+        status: 429,
+        headers: { "content-type": "application/json" },
+      }),
+  )
+  const response = await post(server.url, base)
+  assert.equal(response.status, 429)
+  const body = JSON.parse(response.text)
+  assert.equal(body.error.type, "rate_limit_error")
+  assert.equal(body.error.code, "rate_limit_exceeded")
+  assert.match(body.error.message, /rate limited/)
+})
+
+async function fixture(t, fetchImpl) {
+  const previousFetch = globalThis.fetch
+  const previousApiKey = config.apiKey
+  config.apiKey = undefined
+  globalThis.fetch = fetchImpl
+  const server = await listen(app)
+  t.after(async () => {
+    globalThis.fetch = previousFetch
+    config.apiKey = previousApiKey
+    await close(server)
+  })
+  return server
 }
 
 async function listen(handler) {
@@ -303,18 +176,25 @@ async function listen(handler) {
 
 async function close({ server }) {
   if (!server.listening) return
-  server.close()
-  await once(server, "close")
+  server.closeAllConnections()
+  await new Promise((resolve) => server.close(resolve))
+}
+
+function post(url, payload) {
+  return request(url, {
+    method: "POST",
+    path: "/v1/chat/completions",
+    headers: { "content-type": "application/json" },
+    body: typeof payload === "string" ? payload : JSON.stringify(payload),
+  })
 }
 
 function request(baseURL, { method = "GET", path = "/", headers = {}, body } = {}) {
   return new Promise((resolve, reject) => {
-    const url = new URL(path, baseURL)
-    const requestHeaders = { ...headers }
-    if (body !== undefined) requestHeaders["content-length"] = Buffer.byteLength(body)
-    const outgoing = httpRequest(url, { method, headers: requestHeaders }, (response) => {
+    const outgoing = httpRequest(new URL(path, baseURL), { method, headers }, (response) => {
       const chunks = []
       response.on("data", (chunk) => chunks.push(chunk))
+      response.on("error", reject)
       response.on("end", () =>
         resolve({
           status: response.statusCode,

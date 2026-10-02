@@ -1,9 +1,9 @@
 // 业务端点编排：health、ip、模型列表、chat completions。
 import { config } from "./config.js"
-import { ocId, openAIErrorResponse, sendJson, upstreamErrorResponse } from "./shared.js"
+import { ocId, sendJson, upstreamErrorResponse } from "./shared.js"
 import { debugLog, logZenRequest } from "./log.js"
-import { buildZenRequest, fetchZen, getAvailableModels, getSession } from "./zen.js"
-import { openAIFullStreamResponse, openAIStreamResponse } from "./openai.js"
+import { buildUpstreamRequest, fetchUpstream, getSession, isAllowedModelId, listModels } from "./zen.js"
+import { respondJson, respondStream } from "./openai.js"
 
 export function health(_request, response) {
   sendJson(response, {
@@ -59,10 +59,7 @@ function isValidIPv4(ip) {
 
 export async function models(_request, response) {
   try {
-    return sendJson(response, {
-      object: "list",
-      data: await getAvailableModels(),
-    })
+    return sendJson(response, { object: "list", data: await listModels() })
   } catch (error) {
     debugLog("[MODEL LIST ERROR]", { message: error?.message || String(error) })
     return upstreamErrorResponse(response, error)
@@ -73,58 +70,72 @@ export async function chat(request, response) {
   const requestId = ocId("req")
   const input = readBodyJson(request, response)
   if (input === undefined) return
-  if (!input || typeof input !== "object" || Array.isArray(input)) {
-    return openAIErrorResponse(response, "Invalid JSON body", "invalid_request_error", 400)
+  if (!isRecord(input)) return errorResponse(response, "Invalid JSON body", 400)
+
+  // 只做必要的门面校验：其余字段原样交给上游，避免误拒合法请求。
+  if (typeof input.model !== "string" || !input.model.trim()) {
+    return errorResponse(response, "model must be a non-empty string", 400)
+  }
+  if (!isAllowedModelId(input.model)) {
+    return errorResponse(response, "Only big-pickle and models ending in -free are allowed", 400)
+  }
+  if (!Array.isArray(input.messages) || !input.messages.length) {
+    return errorResponse(response, "messages must be a non-empty array", 400)
   }
 
-  const { model, messages, stream, tools, tool_choice, max_tokens, max_completion_tokens, temperature } = input
+  const stream = input.stream === true
+  // reasoning_effort 缺省视为开启思考；只有显式 "none" 才丢弃思考内容。
   const reasoningEffort = input.reasoning_effort ?? input.reasoningEffort
   const thinkingEnabled = reasoningEffort !== "none"
-  const maxTokens = max_tokens ?? max_completion_tokens
 
-  const sessionId = getSession(request.auth.user)
   debugLog("[OAI]", {
     at: new Date().toISOString(),
     user: request.auth.user,
-    model,
+    model: input.model,
     mode: stream ? "stream" : "sync",
-    reasoningEffort,
-    thinkingEnabled,
-    messages: messages?.length || 0,
+    messages: input.messages.length,
   })
 
-  // Zen 免费层要求 OpenCode 风格的流式请求；客户端是否 stream 由响应层决定。
-  const zenReq = buildZenRequest(
-    model,
-    messages,
-    true,
-    tools,
-    tool_choice,
-    reasoningEffort,
-    sessionId,
-    maxTokens,
-    temperature,
-  )
-  logZenRequest(requestId, "openai", model, stream, request.auth.user, zenReq, messages?.length || 0)
+  const sessionId = getSession(request.auth.user)
+  const upstreamRequest = buildUpstreamRequest(input, sessionId)
+  logZenRequest(requestId, "openai", input.model, stream, request.auth.user, upstreamRequest, input.messages.length)
 
   let upstream
   try {
-    upstream = await fetchZen(zenReq, requestId, model, stream)
+    upstream = await fetchUpstream(upstreamRequest, { requestId, model: input.model })
   } catch (error) {
-    debugLog("[ZEN FETCH ERROR]", { requestId, model, stream: !!stream, message: error?.message || String(error) })
+    debugLog("[ZEN FETCH ERROR]", {
+      requestId,
+      model: input.model,
+      stream,
+      message: error?.message || String(error),
+    })
     return upstreamErrorResponse(response, error)
   }
 
-  if (stream) return openAIStreamResponse(response, upstream, requestId, model, thinkingEnabled)
-  return openAIFullStreamResponse(response, upstream, requestId, model, thinkingEnabled)
+  const ctx = { requestId, model: input.model, thinkingEnabled, status: upstream.status }
+  if (stream) return respondStream(response, upstream, ctx)
+  return respondJson(response, upstream, ctx)
 }
 
-// rawBody 中间件已缓冲原始流；无大小限制，无效 JSON 返回 OpenAI 风格 400。
+function errorResponse(response, message, status) {
+  return sendJson(
+    response,
+    { error: { message, type: status === 400 ? "invalid_request_error" : "server_error" } },
+    status,
+  )
+}
+
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+}
+
+// rawBody 中间件已缓冲原始流；无效 JSON 返回 OpenAI 风格 400。
 function readBodyJson(request, response) {
   try {
     return JSON.parse(String(request.rawBody ?? ""))
   } catch {
-    openAIErrorResponse(response, "Invalid JSON body", "invalid_request_error", 400)
+    errorResponse(response, "Invalid JSON body", 400)
     return undefined
   }
 }

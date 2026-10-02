@@ -1,202 +1,165 @@
-// OpenCode Zen 上游客户端：URL、超时、User-Agent、请求构造、模型列表与会话。
-import { ocId, safeJsonParse } from "./shared.js"
-import { debugLog, logZenResponse } from "./log.js"
+// OpenCode Zen 上游客户端。
+//
+// 免费层（anonymous lane）的硬性门槛，均已对真实上游逐项验证：
+//   1. User-Agent 必须形如 opencode/<version>，其他 UA 一律 403；
+//   2. 必须带 x-opencode-session（ses_ + 26 位小写十六进制）；
+//   3. 请求体必须包含 bash / read 两个"门禁工具"，缺失即 403；
+//   4. stream 必须为 true，stream:false 一律 403。
+// 除上述之外上游就是标准 OpenAI 协议，因此本模块只做"补齐必要条件"，
+// 不重写业务字段（messages / tools / tool_choice / temperature 等原样透传）。
+import { ocId } from "./shared.js"
+import { debugLog } from "./log.js"
 
-const OC_VERSION = "1.18.31"
 const ZEN_BASE_URL = "https://opencode.ai"
-const ZEN_URL = `${ZEN_BASE_URL}/zen/v1/chat/completions`
+const ZEN_CHAT_URL = `${ZEN_BASE_URL}/zen/v1/chat/completions`
 const ZEN_MODELS_URL = `${ZEN_BASE_URL}/zen/v1/models`
-const FETCH_TIMEOUT_MS = 5 * 60 * 1000
 
-const userSessions = new Map()
-let cachedModels = null
+// 上游通过 UA 判断请求是否来自 OpenCode 客户端；版本号对判定无影响（已验证）。
+const ZEN_USER_AGENT = "opencode/1.18.31"
 
-function zenUserAgent() {
-  return `opencode/${OC_VERSION} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13`
-}
+// 建立连接与模型列表的超时。注意：响应头之后的读取由 openai.js 的看门狗负责。
+const CONNECT_TIMEOUT_MS = 60 * 1000
 
-const zenCompatibilityToolDescription =
-  "Compatibility marker only. Do not call or select this function. Use tools explicitly supplied by the user instead."
+// 免费层门禁要求的工具名。只放必需的 bash / read（已验证最小集）。
+const GATE_TOOL_NAMES = ["bash", "read"]
 
-function zenCompatibilityTools() {
-  const names = ["bash", "edit", "glob", "grep", "read"]
-  return names.map((name) => ({
+const GATE_TOOL_DESCRIPTION =
+  "Reserved for the host runtime; do not call or select this function. Use tools explicitly supplied by the user instead."
+
+export function gateTool(name) {
+  return {
     type: "function",
     function: {
       name,
-      description: zenCompatibilityToolDescription,
-      parameters: {
-        type: "object",
-        properties: {},
-      },
+      description: GATE_TOOL_DESCRIPTION,
+      parameters: { type: "object", properties: {} },
     },
-  }))
+  }
 }
 
-function toolFunctionName(tool) {
-  return tool?.function?.name || ""
-}
-
-function appendZenCompatibilityTools(tools) {
-  const result = Array.isArray(tools) ? [...tools] : []
-  const seen = new Set(result.map(toolFunctionName).filter(Boolean))
-  for (const tool of zenCompatibilityTools()) {
-    const name = toolFunctionName(tool)
-    if (seen.has(name)) continue
-    result.push(tool)
-    seen.add(name)
+// 用户已经自带同名工具时保留用户定义，只补缺失的门禁工具。
+function withGateTools(tools) {
+  const result = Array.isArray(tools) ? tools.filter((tool) => tool && typeof tool === "object") : []
+  const present = new Set(result.map((tool) => tool?.function?.name).filter((name) => typeof name === "string"))
+  for (const name of GATE_TOOL_NAMES) {
+    if (present.has(name)) continue
+    result.push(gateTool(name))
+    present.add(name)
   }
   return result
 }
 
-export function buildZenRequest(
-  model,
-  messages,
-  stream,
-  tools,
-  toolChoice,
-  reasoningEffort,
-  sessionId,
-  maxTokens,
-  temperature,
-) {
-  const hadUserTools = Array.isArray(tools) && tools.length > 0
-  const reqBody = {
-    model,
-    messages,
-    max_tokens: maxTokens ?? 32000,
-    stream: !!stream,
+export function isAllowedModelId(id) {
+  return typeof id === "string" && (id === "big-pickle" || id.endsWith("-free"))
+}
+
+// 上游只接受流式；下游是否流式由响应层决定，与这里无关。
+export function buildUpstreamRequest(payload, sessionId) {
+  const body = {
+    ...payload,
+    tools: withGateTools(payload.tools),
+    stream: true,
     stream_options: { include_usage: true },
-    tools: appendZenCompatibilityTools(tools),
-  }
-  // 没有用户工具时禁止任何工具选择，避免模型选中兼容标记工具。
-  if (!hadUserTools) reqBody.tool_choice = "none"
-  else if (toolChoice != null) reqBody.tool_choice = toolChoice
-
-  // OpenAI 兼容：reasoning_effort 原样透传（"none" 关闭思考，low/medium/high 等开启），
-  // 不发明自定义字段，也不擅自改写取值。
-  if (reasoningEffort != null && reasoningEffort !== "") {
-    reqBody.reasoning_effort = reasoningEffort
   }
 
-  if (temperature != null && temperature !== "") {
-    reqBody.temperature = temperature
-  }
+  // 没有任何用户工具时禁止模型选中门禁工具；有用户工具时沿用下游的选择。
+  const hasUserTools = Array.isArray(payload.tools) && payload.tools.length > 0
+  if (!hasUserTools) body.tool_choice = "none"
+  else if (payload.tool_choice != null) body.tool_choice = payload.tool_choice
+  else delete body.tool_choice
+
+  if (body.max_tokens == null && body.max_completion_tokens == null) body.max_tokens = 32000
 
   return {
-    body: JSON.stringify(reqBody),
+    body: JSON.stringify(body),
     headers: {
       Accept: "text/event-stream",
       "Content-Type": "application/json",
       Authorization: "Bearer public",
-      "User-Agent": zenUserAgent(),
+      "User-Agent": ZEN_USER_AGENT,
       "x-opencode-client": "desktop",
-      "x-opencode-project": "global",
       "x-opencode-request": ocId("msg"),
       "x-opencode-session": sessionId,
     },
-    messageCount: messages?.length || 0,
   }
 }
 
-export async function fetchZen(zenReq, requestId, model, stream) {
+// 只在建立连接阶段计时；响应头一到就交给调用方，避免把长回答误杀。
+export async function fetchUpstream(request, ctx) {
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort("timeout"), FETCH_TIMEOUT_MS)
+  const timer = setTimeout(() => controller.abort("timeout"), CONNECT_TIMEOUT_MS)
+  const started = Date.now()
 
   try {
-    const started = Date.now()
-    const response = await fetch(ZEN_URL, {
+    const response = await fetch(ZEN_CHAT_URL, {
       method: "POST",
-      headers: zenReq.headers,
-      body: zenReq.body,
+      headers: request.headers,
+      body: request.body,
       signal: controller.signal,
     })
-    logZenResponse({
-      requestId,
-      model,
-      stream: !!stream,
+    debugLog("[ZEN RES]", {
+      requestId: ctx.requestId,
+      model: ctx.model,
       status: response.status,
-      ok: response.ok,
       ms: Date.now() - started,
     })
     return response
   } catch (error) {
-    if (error?.name === "AbortError" || error === "timeout") {
-      throw new Error("timeout", { cause: error })
-    }
+    if (error?.name === "AbortError" || error === "timeout") throw new Error("timeout", { cause: error })
     throw error
   } finally {
-    clearTimeout(timeout)
+    clearTimeout(timer)
   }
 }
 
-export async function getAvailableModels() {
-  if (cachedModels) return cachedModels
-  cachedModels = await fetchZenModels()
-  return cachedModels
-}
+let cachedModels = null
 
-async function fetchZenModels() {
+export async function listModels() {
+  if (cachedModels) return cachedModels
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort("timeout"), FETCH_TIMEOUT_MS)
+  const timer = setTimeout(() => controller.abort("timeout"), CONNECT_TIMEOUT_MS)
 
   try {
-    const started = Date.now()
     const response = await fetch(ZEN_MODELS_URL, {
       method: "GET",
       headers: {
         Accept: "application/json",
         Authorization: "Bearer public",
-        "User-Agent": zenUserAgent(),
+        "User-Agent": ZEN_USER_AGENT,
       },
       signal: controller.signal,
     })
-    const raw = await response.text()
-    const parsed = safeJsonParse(raw)
-
+    const parsed = await response.json().catch(() => null)
     if (!response.ok) throw new Error(`Model list returned HTTP ${response.status}`)
     if (!Array.isArray(parsed?.data)) throw new Error("Invalid model list response")
 
     const models = parsed.data.filter((item) => isAllowedModelId(item?.id))
-
     if (!models.length) throw new Error("No allowed models returned from upstream")
 
-    debugLog("[MODEL LIST]", {
-      status: response.status,
-      ms: Date.now() - started,
-      total: parsed.data.length,
-      allowed: models.length,
-    })
+    cachedModels = models
     return models
   } catch (error) {
-    if (error?.name === "AbortError" || error === "timeout") {
-      throw new Error("timeout", { cause: error })
-    }
+    if (error?.name === "AbortError" || error === "timeout") throw new Error("timeout", { cause: error })
     throw error
   } finally {
-    clearTimeout(timeout)
+    clearTimeout(timer)
   }
 }
 
-function isAllowedModelId(id) {
-  return typeof id === "string" && (id === "big-pickle" || id.endsWith("-free"))
-}
-
-// Zen 免费层要求 session ID 为 ses_ + 26 位小写十六进制
-function zenSessionID() {
-  const bytes = new Uint8Array(13)
-  globalThis.crypto.getRandomValues(bytes)
-  return "ses_" + [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("")
-}
+// 上游按 x-opencode-session 归并会话；同一使用者复用同一个 session 直到过期。
+const SESSION_TTL_MS = 30 * 60 * 1000
+const userSessions = new Map()
 
 export function getSession(user) {
   const now = Date.now()
   const existing = userSessions.get(user)
-  if (!existing || now - existing.ts > 30 * 60 * 1000) {
-    const next = { id: zenSessionID(), ts: now }
-    userSessions.set(user, next)
-    return next.id
+  if (existing && now - existing.at < SESSION_TTL_MS) {
+    existing.at = now
+    return existing.id
   }
-  existing.ts = now
-  return existing.id
+  const bytes = new Uint8Array(13)
+  crypto.getRandomValues(bytes)
+  const id = "ses_" + [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("")
+  userSessions.set(user, { id, at: now })
+  return id
 }
