@@ -72,6 +72,12 @@ export function buildUpstreamRequest(payload, sessionId) {
   else if (payload.tool_choice != null) body.tool_choice = payload.tool_choice
   else delete body.tool_choice
 
+  // 兼容既有 camelCase 别名；上游和官方 SDK 使用 snake_case，不能只影响本地过滤。
+  const reasoningEffort = payload.reasoning_effort ?? payload.reasoningEffort
+  delete body.reasoningEffort
+  if (reasoningEffort != null && reasoningEffort !== "") body.reasoning_effort = reasoningEffort
+  else delete body.reasoning_effort
+
   if (body.max_tokens == null && body.max_completion_tokens == null) body.max_tokens = 32000
 
   return {
@@ -133,7 +139,10 @@ export async function listModels() {
       },
       signal: controller.signal,
     })
-    const parsed = await response.json().catch(() => null)
+    const parsed = await response.json().catch((error) => {
+      if (error instanceof SyntaxError) return null
+      throw error
+    })
     if (!response.ok) throw new Error(`Model list returned HTTP ${response.status}`)
     if (!Array.isArray(parsed?.data)) throw new Error("Invalid model list response")
 
