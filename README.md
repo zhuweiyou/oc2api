@@ -5,7 +5,7 @@
 OpenCode Free API 代理，使用一套 Express 业务逻辑，同时支持本地运行、Docker 和 Vercel 部署，并支持 SSE 流式响应。
 
 ```mermaid
-flowchart LR
+flowchart TD
     client["客户端<br/>Claude Code / Codex / DSH 等"]
     gateway["聚合网关<br/>CLIProxyAPI / SUB2API / NEWAPI"]
     a["oc2api 实例 A<br/>出口 IP 1"]
