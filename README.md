@@ -4,6 +4,24 @@
 
 OpenCode Free API 代理，使用一套 Express 业务逻辑，同时支持本地运行、Docker 和 Vercel 部署，并支持 SSE 流式响应。
 
+```mermaid
+flowchart LR
+    client["客户端<br/>Claude Code / Codex / DSH 等"]
+    gateway["聚合网关<br/>CLIProxyAPI / SUB2API / NEWAPI"]
+    a["oc2api 实例 A<br/>出口 IP 1"]
+    b["oc2api 实例 B<br/>出口 IP 2"]
+    c["oc2api 实例 C<br/>出口 IP 3"]
+    zen["OpenCode Zen<br/>免费模型"]
+
+    client --> gateway
+    gateway -->|轮询 / 负载| a
+    gateway -->|轮询 / 负载| b
+    gateway -->|轮询 / 负载| c
+    a --> zen
+    b --> zen
+    c --> zen
+```
+
 ## Vercel 部署
 
 ### 一键部署
@@ -22,17 +40,7 @@ OpenCode Free API 代理，使用一套 Express 业务逻辑，同时支持本�
 
 部署完成后会得到一个 `https://<项目名>.vercel.app` 的域名。
 
-你可以 Fork 后部署多个 Vercel Project，以创建多个出口 IP 不同的项目，然后在 [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI/blob/main/README_CN.md#%E5%8A%9F%E8%83%BD%E7%89%B9%E6%80%A7)、[Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api/blob/main/README_CN.md)、[QuantumNous/new-api](https://github.com/QuantumNous/new-api/blob/main/README.zh_CN.md#-%E5%BF%AB%E9%80%9F%E5%BC%80%E5%A7%8B) 等工具中配置多个域名实现轮询，规避 IP 限制。
-
-## 请求流程
-
-```mermaid
-flowchart LR
-    A[客户端请求] --> B[鉴权]
-    B --> C[参数校验]
-    C --> D[伪装成 OpenCode 客户端<br/>转发上游]
-    D --> E[转换响应<br/>返回给客户端]
-```
+你可以 Fork 后部署多个 Vercel Project，以创建多个出口 IP 不同的项目，然后在 [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)、[Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api)、[QuantumNous/new-api](https://github.com/QuantumNous/new-api) 等聚合网关中配置多个域名实现轮询，既规避 IP 限制，也把并发分摊到多个实例：
 
 ## 本地运行
 
