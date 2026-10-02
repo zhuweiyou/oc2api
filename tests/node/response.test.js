@@ -191,6 +191,42 @@ test("带工具调用却标成 stop 时归一为 tool_calls（对齐 opencode �
   assert.equal(truncated.body.choices[0].finish_reason, "length")
 })
 
+test("多 choice 时 finish_reason 按 choice 独立归一", async () => {
+  // 回归：归一若用全局"本响应是否带工具"判断，choice0 的工具调用会把
+  // choice1（纯文本）的 stop 也错误改写成 tool_calls。
+  const chunks = [
+    `data: ${JSON.stringify({
+      choices: [
+        {
+          index: 0,
+          delta: { tool_calls: [{ index: 0, id: "cA", type: "function", function: { name: "f", arguments: "{}" } }] },
+        },
+        { index: 1, delta: { content: "纯文本回答" } },
+      ],
+    })}\n\n`,
+    `data: ${JSON.stringify({
+      choices: [
+        { index: 0, delta: {}, finish_reason: "stop" },
+        { index: 1, delta: {}, finish_reason: "stop" },
+      ],
+    })}\n\n`,
+    done,
+  ]
+  const [full, stream] = await runBoth(chunks)
+  assert.deepEqual(
+    full.body.choices.map((c) => c.finish_reason),
+    ["tool_calls", "stop"],
+  )
+  const streamFinish = payloads(stream.text)
+    .flatMap((chunk) => chunk.choices)
+    .filter((choice) => choice.finish_reason)
+    .map((choice) => ({ index: choice.index, finish: choice.finish_reason }))
+  assert.deepEqual(streamFinish, [
+    { index: 0, finish: "tool_calls" },
+    { index: 1, finish: "stop" },
+  ])
+})
+
 test("无 index 的工具调用：新调用要分开、参数续传要合并", async () => {
   // 上游的两种无 index 形态必须区分开（三方对照 main 验证过）：
   //   - 各自带新 id：是两个不同调用，不能合并；

@@ -126,11 +126,13 @@ function hasFinishReason(chunk) {
   return (chunk?.choices ?? []).some((choice) => typeof choice?.finish_reason === "string" && choice.finish_reason)
 }
 
-// 流式侧就地改写 finish_reason：工具调用帧先到，finish 帧后到，所以到 finish 帧时
-// 已经知道本响应是否带工具调用。
-function rewriteFinishReason(chunk, sawToolCalls) {
+// 流式侧就地改写 finish_reason：必须按 choice 追踪工具调用，否则 n>1 时
+// 某个带工具的 choice 会把纯文本 choice 的 stop 一起改写成 tool_calls。
+function rewriteFinishReason(chunk, toolCallChoiceIndexes) {
   for (const choice of chunk.choices ?? []) {
-    if (choice.finish_reason) choice.finish_reason = normalizeFinish(choice.finish_reason, sawToolCalls ? 1 : 0)
+    if (!choice.finish_reason) continue
+    const index = Number.isInteger(choice.index) ? choice.index : 0
+    choice.finish_reason = normalizeFinish(choice.finish_reason, toolCallChoiceIndexes.has(index) ? 1 : 0)
   }
 }
 
@@ -351,7 +353,8 @@ export async function respondStream(response, upstream, ctx) {
   // sawContent：是否出现过正文增量；sawChoiceFrame：是否出现过 choice 帧（截断判定用）。
   let sawContent = false
   let sawChoiceFrame = false
-  let sawToolCalls = false
+  // 出现过工具调用的 choice index 集合：finish_reason 归一只应作用于这些 choice。
+  const toolCallChoiceIndexes = new Set()
   // 首个正文之前先压住少量无内容帧（role / 空 delta / 纯 usage），这样上游随后报错
   // 还能退回 JSON 429。上限保证内存恒定 O(1)：正常流量下只有 1~2 帧，
   // 一旦上游异常刷屏就直接放行，不再为"保留 429"而无界攒内存。
@@ -399,8 +402,13 @@ export async function respondStream(response, upstream, ctx) {
       if (!hasChoices && !normalized.usage) continue
       if (hasChoices) sawChoiceFrame = true
       // 工具调用帧总在 finish 帧之前到达，所以这里能判断出该不该改写 finish_reason。
-      if (normalized.choices?.some((choice) => choice.delta?.tool_calls?.length)) sawToolCalls = true
-      rewriteFinishReason(normalized, sawToolCalls)
+      // 按 choice 追踪：n>1 时某个 choice 带工具，不代表其它 choice 也带。
+      for (const choice of normalized.choices ?? []) {
+        if (choice.delta?.tool_calls?.length) {
+          toolCallChoiceIndexes.add(Number.isInteger(choice.index) ? choice.index : 0)
+        }
+      }
+      rewriteFinishReason(normalized, toolCallChoiceIndexes)
 
       if (!hasContent(normalized)) {
         // 无内容帧：还没开始输出就先压住（保留退回 JSON 429 的能力），
