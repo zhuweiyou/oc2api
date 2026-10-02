@@ -191,6 +191,32 @@ test("带工具调用却标成 stop 时归一为 tool_calls（对齐 opencode �
   assert.equal(truncated.body.choices[0].finish_reason, "length")
 })
 
+test("无 index 的并行工具调用不能被合并（上游真实形态）", async () => {
+  // 回归：上游把并行调用各放一帧且常常不带 index，按 index ?? 0 归并会把
+  // 两个不同调用揉成一个、参数字符串首尾相接（实测把 Tokyo/Osaka 合成
+  // '{"city":"Tokyo"}{"city":"Osaka"}'）。main 原本是正确的，重写时退化。
+  const call = (id, argumentsText) =>
+    `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ id, type: "function", function: { name: "get_weather", arguments: argumentsText } }] } }] })}\n\n`
+
+  const [full] = await runBoth([call("call_A", '{"city":"Tokyo"}'), call("call_B", '{"city":"Osaka"}'), finish, done])
+  const calls = full.body.choices[0].message.tool_calls
+  assert.equal(calls.length, 2, "两个并行调用必须各自保留")
+  assert.deepEqual(JSON.parse(calls[0].function.arguments), { city: "Tokyo" })
+  assert.deepEqual(JSON.parse(calls[1].function.arguments), { city: "Osaka" })
+  assert.notEqual(calls[0].id, calls[1].id)
+
+  // 同一调用的参数续传（无 index）仍要合并成一个
+  const [continued] = await runBoth([
+    call("call_X", '{"ci'),
+    `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ function: { arguments: 'ty":"SF"}' } }] } }] })}\n\n`,
+    finish,
+    done,
+  ])
+  const single = continued.body.choices[0].message.tool_calls
+  assert.equal(single.length, 1)
+  assert.deepEqual(JSON.parse(single[0].function.arguments), { city: "SF" })
+})
+
 test("多个并行工具调用按 index 独立累积，互不串味", async () => {
   const raw = [
     'data: {"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"get_weather","arguments":"{\\"city\\":"}},{"index":1,"id":"call_b","type":"function","function":{"name":"get_time","arguments":"{\\"zone\\":"}}]}}]}\n\n',

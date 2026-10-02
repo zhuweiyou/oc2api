@@ -439,6 +439,25 @@ export async function respondStream(response, upstream, ctx) {
   }
 }
 
+// 找到该 tool_call 增量应并入的槽位（新建或续传）。
+// 上游的并行调用各占一帧且常常不带 index，所以不能只按 index 归并：
+//   - 带 index：按 index 归档；
+//   - 不带 index 但带新 id / 新函数名：说明是另一个调用，新建槽位；
+//   - 不带 index 且只有 arguments（参数续传）：并入当前最后一个调用。
+function toolCallTarget(state, call) {
+  if (Number.isInteger(call.index)) {
+    if (!state.calls.has(call.index)) state.calls.set(call.index, { id: "", name: "", arguments: "" })
+    return state.calls.get(call.index)
+  }
+  const startsNew =
+    (typeof call.id === "string" && call.id) || (typeof call.function?.name === "string" && call.function.name)
+  const last = [...state.calls.values()].at(-1)
+  if (!startsNew && last) return last
+  const slot = state.calls.size
+  state.calls.set(slot, { id: "", name: "", arguments: "" })
+  return state.calls.get(slot)
+}
+
 export async function respondJson(response, upstream, ctx) {
   if (!upstream.ok) return sendJson(response, rateLimitError(await readErrorBody(upstream, ctx)), 429)
   if (!upstream.body) return sendJson(response, rateLimitError("Empty response from upstream"), 429)
@@ -481,9 +500,9 @@ export async function respondJson(response, upstream, ctx) {
         // 非流式必须把流式会透传的东西也带上，否则同一次上游调用在两种模式下结果不同。
         mergePassthrough(state, delta)
         for (const call of delta.tool_calls ?? []) {
-          const callIndex = Number.isInteger(call.index) ? call.index : state.calls.size
-          if (!state.calls.has(callIndex)) state.calls.set(callIndex, { id: "", name: "", arguments: "" })
-          const target = state.calls.get(callIndex)
+          // 上游把并行调用放在各自独立的帧里，且常常不带 index。
+          // 此时只有"参数续传"才该并入上一个调用；带新 id / 新函数名说明是另一个调用。
+          const target = toolCallTarget(state, call)
           if (typeof call.id === "string" && call.id) target.id = call.id
           if (typeof call.function?.name === "string" && call.function.name) target.name = call.function.name
           if (typeof call.function?.arguments === "string") target.arguments += call.function.arguments
