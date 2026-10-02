@@ -42,6 +42,23 @@ test("业务字段原样透传，只有门禁相关字段被补齐", () => {
   assert.equal(body.model, "mimo-v2.6-flash-free")
 })
 
+test("危险键名不转发给上游，同时不影响正常字段", () => {
+  // JSON.parse 会把 "__proto__"/"constructor" 当普通自有属性，展开后会原样进 body。
+  // 实测不会污染本地原型，但这类字段没有任何透传价值，一律剥掉。
+  const payload = JSON.parse(
+    '{"model":"big-pickle","messages":[],"temperature":0.5,' +
+      '"__proto__":{"polluted":"yes"},"constructor":{"x":1},"prototype":{"y":2}}',
+  )
+  const raw = buildUpstreamRequest(payload, "ses_x").body
+  for (const key of ["__proto__", "constructor", "prototype"]) {
+    assert.ok(!raw.includes(`"${key}"`), `${key} 不应出现在上游 body 里`)
+  }
+  const body = JSON.parse(raw)
+  assert.equal(body.temperature, 0.5, "正常字段必须保留")
+  assert.equal(body.model, "big-pickle")
+  assert.equal(Object.prototype.polluted, undefined, "本地原型不能被污染")
+})
+
 test("用户自带工具时保留用户定义，并沿用用户的 tool_choice", () => {
   const weather = { type: "function", function: { name: "get_weather", parameters: { type: "object" } } }
   const body = JSON.parse(

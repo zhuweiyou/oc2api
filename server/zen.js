@@ -23,6 +23,9 @@ const CONNECT_TIMEOUT_MS = 60 * 1000
 // 免费层门禁要求的工具名。只放必需的 bash / read（已验证最小集）。
 const GATE_TOOL_NAMES = ["bash", "read"]
 
+// 这些键名在 JS 里有特殊含义，用户塞进请求体没有任何意义，一律不转发给上游。
+const DANGEROUS_KEYS = ["__proto__", "constructor", "prototype"]
+
 const GATE_TOOL_DESCRIPTION =
   "Reserved for the host runtime; do not call or select this function. Use tools explicitly supplied by the user instead."
 
@@ -61,6 +64,10 @@ export function buildUpstreamRequest(payload, sessionId) {
     stream: true,
     stream_options: { include_usage: true },
   }
+
+  // 危险键名不转发：JSON.parse 会把 "__proto__"/"constructor" 当普通自有属性，
+  // 展开后原样带到上游 body 里（实测不污染本地原型，但没有任何透传价值）。
+  for (const key of DANGEROUS_KEYS) delete body[key]
 
   // 没有任何用户工具时禁止模型选中门禁工具；有用户工具时沿用下游的选择。
   const hasUserTools = Array.isArray(payload.tools) && payload.tools.length > 0
