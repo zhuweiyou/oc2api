@@ -113,7 +113,7 @@ export async function chat(request, response) {
     return upstreamErrorResponse(response, error)
   }
 
-  const ctx = { requestId, model: input.model, thinkingEnabled, status: upstream.status }
+  const ctx = { requestId, model: input.model, thinkingEnabled, status: upstream.status, choiceCount: input.n }
   if (stream) return respondStream(response, upstream, ctx)
   return respondJson(response, upstream, ctx)
 }

@@ -37,15 +37,19 @@ class ResponseStub extends EventEmitter {
     return this
   }
   setHeader(key, value) {
+    assert.ok(!this.headersSent, "不能在响应头已发送后再次设置 header")
     this.headers[key.toLowerCase()] = value
   }
-  flushHeaders() {}
+  flushHeaders() {
+    this.headersSent = true
+  }
   json(body) {
     this.body = body
     this.headersSent = true
     this.writableEnded = true
   }
   write(text) {
+    this.headersSent = true
     this.text += text
     return true
   }
@@ -98,7 +102,7 @@ test("非流式聚合与流式转发得到相同的正文与思考", async () =>
 
 test("上游私有扩展不向下游泄漏，usage:null 被归一", async () => {
   const raw = [
-    'data: {"id":"c","choices":[{"index":0,"delta":{"role":"assistant","content":"hi","name":"Space Bunny"},"usage":null}],"cost":"0"}\n\n',
+    'data: {"id":"c","choices":[{"index":0,"delta":{"role":"assistant","content":"hi","name":"Space Bunny","cost":"0"}}],"usage":null,"cost":"0"}\n\n',
     finish,
     done,
   ].join("")
@@ -108,6 +112,7 @@ test("上游私有扩展不向下游泄漏，usage:null 被归一", async () => 
   assert.equal(full.body.cost, undefined)
   for (const chunk of payloads(stream.text)) {
     assert.equal(chunk.cost, undefined)
+    assert.notEqual(chunk.usage, null)
     for (const choice of chunk.choices) {
       assert.equal(choice.delta?.name, undefined)
       assert.equal(choice.delta?.cost, undefined)
@@ -545,9 +550,9 @@ test("两种响应模式对完成的判定一致", async () => {
   }
 })
 
-test("finish_reason 即完成信号：上游不关连接也有界收尾", { timeout: 8000 }, async () => {
-  // 回归：完成信号若只用于"判定是否报错"而不用于收尾，上游发完 finish_reason
-  // 却不关连接时，非流式会白等整个空闲窗口，然后把一份完整回答丢成 429。
+test("finish_reason 即完成信号：上游不关连接也在空闲窗口内成功收尾", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1 })
+  // finish 已完整，但仍允许迟到 usage；空闲窗口耗尽也应成功，而不是把完整回答丢成 429。
   const encoder = new TextEncoder()
   const raw = [
     `data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: "assistant", content: "hi" } }] })}\n\n`,
@@ -566,9 +571,10 @@ test("finish_reason 即完成信号：上游不关连接也有界收尾", { time
         },
       }),
     )
-    const started = Date.now()
-    await handler(response, upstreamResponse, ctx)
-    assert.ok(Date.now() - started < 5000, `${handler.name} 应在完成信号后立即收尾`)
+    const work = handler(response, upstreamResponse, ctx)
+    await new Promise((resolve) => setImmediate(resolve))
+    t.mock.timers.tick(120_000)
+    await work
     assert.equal(response.statusCode, 200)
     expected(response)
   }
@@ -709,26 +715,422 @@ test("下游提前断开时取消上游读取，不继续写", async () => {
   }
 })
 
-test("上游建连后静默时按空闲窗口失败，而不是永久挂起", { timeout: 5000 }, async () => {
-  // 用一个短窗口验证机制本身：注入极小的首帧窗口后必须快速失败。
-  const silent = new Response(
-    new ReadableStream({
-      start() {
-        /* 永远不发数据，也不关闭 */
-      },
-    }),
-  )
-  const reader = silent.body.getReader()
-  const started = Date.now()
-  const iterate = async () => {
-    for await (const _ of readEvents(reader, ctx)) void _
+test("上游首帧静默与正文停滞分别按真实超时窗口失败", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1 })
+  for (const [head, window] of [
+    ["", 30_000],
+    [partial, 120_000],
+  ]) {
+    const reader = new Response(
+      new ReadableStream({
+        start(controller) {
+          if (head) controller.enqueue(new TextEncoder().encode(head))
+        },
+      }),
+    ).body.getReader()
+    const work = (async () => {
+      for await (const _ of readEvents(reader, ctx)) void _
+    })()
+    const failure = assert.rejects(work, /idle timeout/)
+    await new Promise((resolve) => setImmediate(resolve))
+    t.mock.timers.tick(window)
+    await failure
+    await reader.cancel()
   }
-  // 真实窗口是 30s，这里只断言"不会立刻返回成功"，避免测试耗时过长。
-  const raced = await Promise.race([
-    iterate().then(() => "done"),
-    new Promise((resolve) => setTimeout(() => resolve("still-waiting"), 300)),
+})
+
+test("空 reasoning 不能遮住有效 reasoning_content", async () => {
+  const raw = 'data: {"choices":[{"index":0,"delta":{"reasoning":"","reasoning_content":"kept","content":"hi"}}]}\n\n'
+  const [full, stream] = await runBoth([raw, finish, done])
+  assert.equal(full.body.choices[0].message.reasoning_content, "kept")
+  assert.equal(
+    payloads(stream.text)
+      .flatMap((c) => c.choices)
+      .map((c) => c.delta?.reasoning_content ?? "")
+      .join(""),
+    "kept",
+  )
+})
+
+test("超过无内容帧缓冲上限后仍保持顺序，不让旧 usage 覆盖新 usage", async () => {
+  const chunks = Array.from(
+    { length: 12 },
+    (_, sequence) =>
+      `data: ${JSON.stringify({ sequence, choices: [{ index: 0, delta: sequence === 0 ? { role: "assistant" } : {} }], usage: { total_tokens: sequence } })}\n\n`,
+  )
+  const [full, stream] = await runBoth([...chunks, finish, done])
+  assert.deepEqual(
+    payloads(stream.text)
+      .filter((c) => c.sequence != null)
+      .map((c) => c.sequence),
+    Array.from({ length: 12 }, (_, i) => i),
+  )
+  assert.equal(full.body.usage.total_tokens, 11)
+  assert.equal(
+    payloads(stream.text)
+      .filter((c) => c.usage)
+      .at(-1).usage.total_tokens,
+    11,
+  )
+})
+
+test("非数组 choices 与无效 tool_call 项不再抛 TypeError，保留有效增量", async () => {
+  const calls = [{ index: 0, id: "c", type: "function", function: { name: "f", arguments: "{}" } }]
+  const [full, stream] = await runBoth([
+    'data: {"choices":{}}\n\n',
+    'data: {"choices":[{"index":0,"delta":{"tool_calls":{}}}]}\n\n',
+    `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: "hi", tool_calls: [null, ...calls] } }] })}\n\n`,
+    finish,
+    done,
   ])
-  assert.equal(raced, "still-waiting")
-  assert.ok(Date.now() - started >= 300)
-  await reader.cancel().catch(() => {})
+  assert.equal(full.statusCode, 200)
+  assert.equal(full.body.choices[0].message.content, "hi")
+  assert.equal(full.body.choices[0].message.tool_calls.length, 1)
+  assert.equal(full.body.choices[0].message.tool_calls[0].id, "c")
+  assert.equal(stream.statusCode, 200)
+  assert.ok(stream.text.includes("[DONE]"))
+})
+
+test("多 choice 中仅一个 finish 不能掩盖其余 choice 截断", async () => {
+  const head = `data: ${JSON.stringify({
+    choices: [
+      { index: 0, delta: { content: "a" } },
+      { index: 1, delta: { content: "b" } },
+    ],
+  })}\n\n`
+  const [full, stream] = await runBoth([head, finish])
+  assert.equal(full.statusCode, 429)
+  assert.match(full.body.error.message, /Incomplete/)
+  assert.ok(!stream.text.includes("[DONE]"))
+  assert.match(stream.text, /Incomplete/)
+})
+
+test("单 choice finish 后新 index 不能生成幽灵 choice，即使没有 DONE", async () => {
+  const ghost = 'data: {"choices":[{"index":5,"delta":{"content":"ghost"}}],"usage":{"total_tokens":9}}\n\n'
+  const [full, stream] = await runBoth([partial, finish, ghost])
+  assert.equal(full.body.choices.length, 1)
+  assert.equal(full.body.choices[0].message.content, "hi")
+  assert.equal(full.body.usage.total_tokens, 9)
+  assert.ok(!stream.text.includes("ghost") && !stream.text.includes('"index":5'))
+})
+
+test("多 choice 后收尾延迟超过一秒仍完整读取", { timeout: 8000 }, async () => {
+  const head =
+    `data: ${JSON.stringify({
+      choices: [
+        { index: 0, delta: { content: "a" } },
+        { index: 1, delta: { content: "b" } },
+      ],
+    })}\n\n` + finish
+  for (const handler of [respondJson, respondStream]) {
+    let timer
+    const response = new ResponseStub()
+    const source = new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(head))
+          timer = setTimeout(() => {
+            controller.enqueue(
+              new TextEncoder().encode(
+                'data: {"choices":[{"index":1,"delta":{"content":"c"},"finish_reason":"length"}]}\n\n' + done,
+              ),
+            )
+            controller.close()
+          }, 1100)
+        },
+        cancel() {
+          clearTimeout(timer)
+        },
+      }),
+    )
+    await handler(response, source, ctx)
+    if (handler === respondJson) {
+      assert.equal(response.body.choices[1].message.content, "bc")
+      assert.equal(response.body.choices[1].finish_reason, "length")
+    } else {
+      const second = payloads(response.text)
+        .flatMap((c) => c.choices)
+        .filter((c) => c.index === 1)
+      assert.equal(second.map((c) => c.delta?.content ?? "").join(""), "bc")
+      assert.equal(second.at(-1).finish_reason, "length")
+    }
+  }
+})
+
+test("背压暂停消费不计入上游空闲超时，也不丢已排队尾部 usage", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1 })
+  for (const [blockedFrame, stall] of [
+    [partial, 121_000],
+    [finish, 1100],
+  ]) {
+    const response = new ResponseStub()
+    const originalWrite = response.write.bind(response)
+    let blocked = false
+    response.write = (text) => {
+      originalWrite(text)
+      if (!blocked && text.includes(blockedFrame === partial ? '"content"' : '"finish_reason"')) {
+        blocked = true
+        return false
+      }
+      return true
+    }
+    const work = respondStream(
+      response,
+      upstream([partial, finish, `data: {"choices":[],"usage":${JSON.stringify(usage)}}\n\n`, done]),
+      ctx,
+    )
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(response.listenerCount("drain"), 1, "尚未 drain 时应停止消费上游")
+    t.mock.timers.tick(stall)
+    response.emit("drain")
+    await work
+    assert.ok(!response.text.includes("rate_limit_error"))
+    assert.deepEqual(payloads(response.text).find((c) => c.usage)?.usage, usage)
+    assert.ok(response.text.includes("[DONE]"))
+    assert.equal(response.listenerCount("drain"), 0)
+  }
+})
+
+test("正文保持原样：不误删普通 thinking 词句或字面 think 标签", async () => {
+  for (const content of ["I am thinking about the response", "<think>literal</think> text"]) {
+    const [full, stream] = await runBoth([
+      `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content } }] })}\n\n`,
+      finish,
+      done,
+    ])
+    assert.equal(full.body.choices[0].message.content, content)
+    assert.equal(
+      payloads(stream.text)
+        .flatMap((c) => c.choices)
+        .map((c) => c.delta?.content ?? "")
+        .join(""),
+      content,
+    )
+  }
+})
+
+test("HTTP 200 原始 JSON 错误立即识别，不必等待 SSE 空闲窗口或 EOF", async () => {
+  for (const handler of [respondJson, respondStream]) {
+    let cancelled = false
+    const response = new ResponseStub()
+    const source = new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"error":{"message":"raw limit","type":"FreeUsageLimitError"}}'))
+        },
+        cancel() {
+          cancelled = true
+        },
+      }),
+    )
+    await handler(response, source, ctx)
+    assert.equal(response.statusCode, 429)
+    assert.match(response.body.error.message, /raw limit/)
+    assert.ok(cancelled)
+  }
+})
+
+test("原始 JSON 错误跨网络块切开 UTF-8 字符时，诊断文本不损坏", async () => {
+  const bytes = new TextEncoder().encode('{"error":{"message":"你好，限制"}}')
+  for (let split = 1; split < bytes.length; split++) {
+    for (const response of await runBoth([bytes.subarray(0, split), bytes.subarray(split)])) {
+      assert.equal(response.statusCode, 429)
+      assert.equal(response.body.error.message, "你好，限制 (free model rate limit)", `split=${split}`)
+    }
+  }
+})
+
+test("碎片化原始 JSON 错误有界解析，不逐字节重复 JSON.parse", async (t) => {
+  const raw = JSON.stringify({ error: { message: "fragmented limit" }, padding: "x".repeat(20_000) })
+  const parse = JSON.parse
+  let parses = 0
+  t.mock.method(JSON, "parse", (...args) => {
+    parses++
+    return parse(...args)
+  })
+  for (const handler of [respondJson, respondStream]) {
+    parses = 0
+    const response = new ResponseStub()
+    await handler(response, upstream([...new TextEncoder().encode(raw)].map((byte) => Uint8Array.of(byte))), ctx)
+    assert.equal(response.statusCode, 429)
+    assert.match(response.body.error.message, /fragmented limit/)
+    assert.ok(parses <= 2, `原始 JSON 错误只应解析首段与最终正文，实际 ${parses} 次`)
+  }
+})
+
+test("残缺原始 JSON 错误最多读取一秒，超大错误正文受字节上限保护", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1 })
+  for (const handler of [respondJson, respondStream]) {
+    let cancelled = false
+    const response = new ResponseStub()
+    const source = new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"error":'))
+        },
+        cancel() {
+          cancelled = true
+        },
+      }),
+    )
+    const work = handler(response, source, ctx)
+    await new Promise((resolve) => setImmediate(resolve))
+    t.mock.timers.tick(1000)
+    await work
+    assert.equal(response.statusCode, 429)
+    assert.ok(cancelled)
+    const big = new ResponseStub()
+    await handler(big, upstream(['{"error":{"message":"' + "x".repeat(70_000) + '"}}']), ctx)
+    assert.equal(big.statusCode, 429)
+    assert.ok(big.body.error.message.length < 100, "错误正文过大时应返回有界诊断，不回显无限长 message")
+  }
+})
+
+test("无 index 首帧后出现 index 的续传必须绑定原调用，不能拆成两份", async () => {
+  const frame = (tool_calls) => `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls } }] })}\n\n`
+  for (const includeIds of [false, true]) {
+    const head = frame([
+      { id: "A", type: "function", function: { name: "weather", arguments: '{"city":' } },
+      { id: "B", type: "function", function: { name: "weather", arguments: '{"city":' } },
+    ])
+    const tail = frame([
+      { index: 1, ...(includeIds ? { id: "B" } : {}), function: { arguments: '"Osaka"}' } },
+      { index: 0, ...(includeIds ? { id: "A" } : {}), function: { arguments: '"Tokyo"}' } },
+    ])
+    const [full] = await runBoth([head, tail, finish, done])
+    const calls = full.body.choices[0].message.tool_calls
+    assert.equal(calls.length, 2)
+    assert.deepEqual(
+      calls.map((call) => call.id),
+      ["A", "B"],
+    )
+    assert.deepEqual(
+      calls.map((call) => JSON.parse(call.function.arguments).city),
+      ["Tokyo", "Osaka"],
+    )
+  }
+  const [lateName] = await runBoth([
+    frame([{ id: "A", type: "function", function: { name: "wea", arguments: '{"city":' } }]),
+    frame([{ index: 0, function: { name: "weather", arguments: '"Tokyo"}' } }]),
+    finish,
+    done,
+  ])
+  const calls = lateName.body.choices[0].message.tool_calls
+  assert.equal(calls.length, 1, "无 id 的 indexed 续传可补全 name，不应该因为 name 不同又拆调用")
+  assert.equal(calls[0].function.name, "weather")
+  assert.deepEqual(JSON.parse(calls[0].function.arguments), { city: "Tokyo" })
+})
+
+test("真实 index 与自动槽位同号但 id 不同时，不能把新调用并入旧调用", async () => {
+  const frame = (tool_calls) => `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls } }] })}\n\n`
+  const [full] = await runBoth([
+    frame([{ id: "A", type: "function", function: { name: "a", arguments: "{}" } }]),
+    frame([{ index: 0, id: "B", type: "function", function: { name: "b", arguments: "{}" } }]),
+    finish,
+    done,
+  ])
+  assert.deepEqual(
+    full.body.choices[0].message.tool_calls.map((call) => call.id),
+    ["A", "B"],
+  )
+})
+
+test("无 index 的重复 id 续传应按 id 归并，不能被当作新调用", async () => {
+  for (const indexedFirst of [false, true]) {
+    const calls = [
+      {
+        ...(indexedFirst ? { index: 0 } : {}),
+        id: "A",
+        type: "function",
+        function: { name: "weather", arguments: '{"city":' },
+      },
+      { id: "B", type: "function", function: { name: "weather", arguments: '{"city":"Osaka"}' } },
+    ]
+    const head = `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: calls } }] })}\n\n`
+    const tail = `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ id: "A", function: { arguments: '"Tokyo"}' } }] } }] })}\n\n`
+    const [full] = await runBoth([head, tail, finish, done])
+    const result = full.body.choices[0].message.tool_calls
+    assert.equal(result.length, 2)
+    assert.deepEqual(
+      result.map((call) => call.id),
+      ["A", "B"],
+    )
+    assert.deepEqual(
+      result.map((call) => JSON.parse(call.function.arguments).city),
+      ["Tokyo", "Osaka"],
+    )
+  }
+})
+
+test("标准 indexed 工具调用按 index 还原顺序，而非首帧到达顺序", async () => {
+  const frame = `data: ${JSON.stringify({
+    choices: [
+      {
+        index: 0,
+        delta: {
+          tool_calls: [
+            { index: 1, id: "B", type: "function", function: { name: "b", arguments: "{}" } },
+            { index: 0, id: "A", type: "function", function: { name: "a", arguments: "{}" } },
+          ],
+        },
+      },
+    ],
+  })}\n\n`
+  const [full] = await runBoth([frame, finish, done])
+  assert.deepEqual(
+    full.body.choices[0].message.tool_calls.map((c) => c.id),
+    ["A", "B"],
+  )
+})
+
+test("finish 到 DONE 之前的迟到 usage 不受一秒窗口截断", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1 })
+  for (const handler of [respondJson, respondStream]) {
+    let controller
+    const source = new Response(
+      new ReadableStream({
+        start(c) {
+          controller = c
+          c.enqueue(new TextEncoder().encode(partial + finish))
+        },
+      }),
+    )
+    const response = new ResponseStub()
+    const work = handler(response, source, ctx)
+    await new Promise((resolve) => setImmediate(resolve))
+    t.mock.timers.tick(1500)
+    controller.enqueue(new TextEncoder().encode(`data: {"choices":[],"usage":${JSON.stringify(usage)}}\n\n` + done))
+    controller.close()
+    await work
+    if (handler === respondJson) assert.deepEqual(response.body.usage, usage)
+    else assert.deepEqual(payloads(response.text).find((c) => c.usage)?.usage, usage)
+  }
+})
+
+test("n 提供期望 choice 数时，后出现的 choice 不会被首个 finish 当成越界", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1 })
+  for (const handler of [respondJson, respondStream]) {
+    let controller
+    const source = new Response(
+      new ReadableStream({
+        start(c) {
+          controller = c
+          c.enqueue(new TextEncoder().encode(partial + finish))
+        },
+      }),
+    )
+    const response = new ResponseStub()
+    const work = handler(response, source, { ...ctx, choiceCount: 2 })
+    await new Promise((resolve) => setImmediate(resolve))
+    t.mock.timers.tick(1500)
+    controller.enqueue(
+      new TextEncoder().encode(
+        'data: {"choices":[{"index":1,"delta":{"content":"second"},"finish_reason":"stop"}]}\n\n' + done,
+      ),
+    )
+    controller.close()
+    await work
+    if (handler === respondJson) assert.equal(response.body.choices[1].message.content, "second")
+    else assert.ok(response.text.includes("second"))
+  }
 })

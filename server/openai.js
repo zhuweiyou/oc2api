@@ -3,7 +3,7 @@
 // 不解析也不重组正文。上游只支持流式，非流式请求在这里把 SSE 聚合成 JSON。
 //
 // 完成语义有几处反直觉，改动前先看 tests/node/response.test.js：
-//   - finish_reason 与 [DONE] 同为完成信号，要据此提前收尾，不能干等空闲窗口；
+//   - 所有 choice 的 finish_reason 或 [DONE] 表示完成；finish 后仍读 usage，空闲超时也算成功；
 //   - 完成信号之后的帧只吸收 usage，越界正文既不写入也不产生新 choice；
 //   - "明确完成的空回答"算成功（对齐 opencode 官方），只回 usage 而无 choice 才算异常；
 //   - 首个正文之前只压住少量无内容帧（保留退回 JSON 429 的能力），上限恒定，
@@ -62,8 +62,12 @@ function safeParse(text) {
 // ---- 正文改写：只动字段名与私有扩展，不重新组装文本 ----
 
 function normalizeDelta(delta, thinkingEnabled) {
-  if (!delta || typeof delta !== "object") return delta
+  if (!isPlainObject(delta)) return {}
   const next = { ...delta }
+  if (next.tool_calls != null) {
+    if (Array.isArray(next.tool_calls)) next.tool_calls = next.tool_calls.filter(isPlainObject)
+    else delete next.tool_calls
+  }
 
   // 上游私有扩展：下游 schema 里没有，原样透传会让严格客户端报错。
   delete next.name
@@ -71,7 +75,7 @@ function normalizeDelta(delta, thinkingEnabled) {
 
   // 思考字段归一：reasoning 优先，reasoning_details 只是同一内容的镜像（实测一致）。
   let reasoning = ""
-  if (typeof delta.reasoning === "string") reasoning = delta.reasoning
+  if (typeof delta.reasoning === "string" && delta.reasoning) reasoning = delta.reasoning
   else if (typeof delta.reasoning_content === "string") reasoning = delta.reasoning_content
   delete next.reasoning
   delete next.reasoning_content
@@ -98,7 +102,7 @@ function normalizeChunk(chunk, model, thinkingEnabled) {
         return normalized
       })
       .filter(Boolean)
-  }
+  } else next.choices = []
   return next
 }
 
@@ -112,11 +116,6 @@ function hasContent(chunk) {
 }
 
 // ---- SSE 解析：按事件切分，正确处理跨网络块与多字节字符 ----
-
-/** 帧里是否带任何 choice 的 finish_reason —— 它与 [DONE] 同样是完成信号。 */
-function hasFinishReason(chunk) {
-  return (chunk?.choices ?? []).some((choice) => typeof choice?.finish_reason === "string" && choice.finish_reason)
-}
 
 // 流式侧就地改写 finish_reason：必须按 choice 追踪工具调用，否则 n>1 时
 // 某个带工具的 choice 会把纯文本 choice 的 stop 一起改写成 tool_calls。
@@ -169,12 +168,18 @@ export async function* readEvents(reader, ctx) {
   let data = []
   let eventType = ""
   let sawAny = false
-  let lastEventAt = Date.now()
-  // 完成信号之后只再等一小段收尾部 usage，否则上游不关连接时会挂到空闲窗口。
+  let formatDecided = false
+  const choiceIndexes = new Set()
+  const finishedIndexes = new Set()
+  const expectedChoices = Number.isInteger(ctx.choiceCount) && ctx.choiceCount > 0 ? ctx.choiceCount : 1
+  // 所有 choice 完成之后才开始尾段，不能让一个 choice 先结束就截断其余 choice。
   let trailingUntil = 0
 
-  const beginTrailer = () => {
-    if (!trailingUntil) trailingUntil = Date.now() + TRAILING_USAGE_TIMEOUT_MS
+  const beginTrailer = (done = false) => {
+    // finish 后 usage / [DONE] 仍可能延迟到达，不能用 1s 抢跑丢掉统计。
+    // 真正 [DONE] 后才缩短窗口；重复完成信号不延长总预算。
+    const deadline = Date.now() + (done ? TRAILING_USAGE_TIMEOUT_MS : BODY_IDLE_TIMEOUT_MS)
+    trailingUntil = trailingUntil ? Math.min(trailingUntil, deadline) : deadline
   }
 
   const takeEvent = () => {
@@ -202,27 +207,46 @@ export async function* readEvents(reader, ctx) {
     // [DONE] 和它后面的帧，用循环开始时的快照会漏判。
     const trailing = trailingUntil > 0
     if (event.payload === "[DONE]") {
-      beginTrailer()
+      beginTrailer(true)
       return null
     }
     const parsed = safeParse(event.payload)
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       // 尾段已经拿到过完成信号，回答是完整的：尾部残缺/垃圾不足以推翻它。
-      if (trailing) return null
+      if (trailing) return undefined
       throw new ZenStreamError("Invalid SSE payload from upstream")
     }
     const failure = upstreamError(parsed, event.type === "error")
     if (failure) {
-      if (trailing) return null // 迟到的错误事件同理，不能毁掉已完成的回答
+      if (trailing) return undefined // 忽略不等于 [DONE]，不能伪造完成信号
       logUpstreamBody(ctx.requestId, ctx.model, ctx.status, event.payload, failure)
       throw new ZenStreamError(failure.message)
     }
-    if (hasFinishReason(parsed)) beginTrailer()
+    if (trailing) return parsed.usage ? { ...parsed, choices: [] } : undefined
+    for (const choice of Array.isArray(parsed.choices) ? parsed.choices : []) {
+      if (!isPlainObject(choice)) continue
+      const index = Number.isInteger(choice.index) ? choice.index : 0
+      choiceIndexes.add(index)
+      if (typeof choice.finish_reason === "string" && choice.finish_reason) finishedIndexes.add(index)
+    }
+    if (choiceIndexes.size >= expectedChoices && [...choiceIndexes].every((index) => finishedIndexes.has(index))) {
+      beginTrailer()
+    }
     return parsed
   }
 
+  function* emit(event) {
+    const chunk = parse(event)
+    if (chunk === undefined) return
+    const pausedAt = Date.now()
+    yield chunk // 只有真正的 [DONE] 才产生 null
+    // 消费者因下游背压暂停期间，不消耗上游读取的尾段预算。
+    if (trailingUntil) trailingUntil += Math.max(0, Date.now() - pausedAt)
+  }
+
   while (true) {
-    let budget = (sawAny ? BODY_IDLE_TIMEOUT_MS : FIRST_EVENT_TIMEOUT_MS) - (Date.now() - lastEventAt)
+    // 空闲窗口只约束 reader.read() 等网络的时间，不含 yield 后等待下游 drain。
+    let budget = sawAny ? BODY_IDLE_TIMEOUT_MS : FIRST_EVENT_TIMEOUT_MS
     // 完成信号之后改用尾段预算：它是一个"总共还能等多久"的截止时间，
     // 等满即视为流正常结束（上游常常发完就不再说话，这不是错误）。
     const trailing = trailingUntil > 0
@@ -237,26 +261,31 @@ export async function* readEvents(reader, ctx) {
       throw new ZenStreamError(error?.message || "Failed to read upstream stream")
     }
     const text = result.done ? decoder.decode() : decoder.decode(result.value, { stream: true })
-    lastEventAt = Date.now()
     if (!result.done) sawAny = true
     buffer += text
+    if (!formatDecided && buffer.trimStart()) {
+      formatDecided = true
+      // 免费层也可能用 HTTP 200 + 原始 JSON 报错；不能等整个 SSE 空闲窗口才识别。
+      if (buffer.trimStart().startsWith("{")) {
+        throw new ZenStreamError(await readError(reader, ctx, ctx.status, buffer, decoder))
+      }
+    }
 
     const lines = buffer.split("\n")
     buffer = lines.pop() ?? ""
     for (const line of lines) {
       const event = readLine(line)
       if (!event) continue
-      const chunk = parse(event)
-      yield chunk ?? null // null 代表完成信号（[DONE] 或 finish_reason 之后的尾段）
+      yield* emit(event)
     }
 
     if (result.done) {
       if (buffer) {
         const event = readLine(buffer)
-        if (event) yield parse(event) ?? null
+        if (event) yield* emit(event)
       }
       const event = takeEvent()
-      if (event) yield parse(event) ?? null
+      if (event) yield* emit(event)
       return
     }
   }
@@ -311,24 +340,32 @@ function watchClose(response, reader) {
 
 // 上游错误响应的正文只用于诊断，必须有界读取，否则上游不结束时请求会挂着。
 async function readErrorBody(upstream, ctx) {
-  const fallback = `Upstream returned HTTP ${upstream.status}`
-  if (!upstream.body) return fallback
-  const reader = upstream.body.getReader()
-  const decoder = new TextDecoder()
-  let text = ""
-  let read = 0
+  if (!upstream.body) return `Upstream returned HTTP ${upstream.status}`
+  return readError(upstream.body.getReader(), ctx, upstream.status)
+}
+
+async function readError(reader, ctx, status, initialText = "", decoder = new TextDecoder()) {
+  // 原始 JSON 检测移交时复用解码器，保留首网络块末尾挂起的 UTF-8 半字符。
+  const initialBytes = new TextEncoder().encode(initialText)
+  let text =
+    initialBytes.byteLength <= 64 * 1024 ? initialText : new TextDecoder().decode(initialBytes.subarray(0, 64 * 1024))
+  let read = Math.min(initialBytes.byteLength, 64 * 1024)
+  // 只解析首段和最终正文两次，不对每个网络块反复 JSON.parse（避免 O(n²)）。
+  const initialError = upstreamError(safeParse(text))
   const deadline = Date.now() + 1000
-  while (read < 64 * 1024) {
+  while (!initialError && read < 64 * 1024) {
     const budget = deadline - Date.now()
     if (budget <= 0) break
     const step = await raceRead(reader, budget).catch(() => ({ done: true }))
     if (step.done) break
-    text += decoder.decode(step.value, { stream: true })
-    read += step.value.byteLength
+    const bytes = step.value.subarray(0, 64 * 1024 - read)
+    text += decoder.decode(bytes, { stream: true })
+    read += bytes.byteLength
   }
+  text += decoder.decode()
   await reader.cancel().catch(() => {})
-  logUpstreamBody(ctx.requestId, ctx.model, upstream.status, text, null)
-  return upstreamError(safeParse(text), true)?.message || fallback
+  logUpstreamBody(ctx.requestId, ctx.model, status, text, initialError)
+  return initialError?.message || upstreamError(safeParse(text), true)?.message || `Upstream returned HTTP ${status}`
 }
 
 // ---- 对外两种响应模式 ----
@@ -337,10 +374,10 @@ async function readErrorBody(upstream, ctx) {
 //   - 一个 choice 都没有（只回了 usage）→ 上游异常；
 //   - 有 choice 但没收到完成信号、且仍有 choice 缺 finish_reason → 截断；
 //   - 其余（[DONE] 或所有 choice 都 finish）→ 正常完成。
-function assertCompleted({ sawDone, sawFinish, choiceIndexes, finishedIndexes }) {
+function assertCompleted({ sawDone, choiceIndexes, finishedIndexes }) {
   if (!choiceIndexes.size) throw new ZenStreamError("Empty response from upstream")
   const allFinished = [...choiceIndexes].every((index) => finishedIndexes.has(index))
-  if (!sawDone && !sawFinish && !allFinished) {
+  if (!sawDone && !allFinished) {
     throw new ZenStreamError("Incomplete response from upstream")
   }
 }
@@ -353,9 +390,6 @@ export async function respondStream(response, upstream, ctx) {
   const client = watchClose(response, reader)
   let started = false
   let sawDone = false
-  let sawFinish = false
-  // sawContent：是否出现过正文增量（正文之前的帧允许短暂压住）。
-  let sawContent = false
   // 出现过的 choice index、已收尾的 choice index：完成判定必须按 choice 而非全局，
   // 否则某个 choice 先 finish 会把其它 choice 后续的 finish 帧一并吞掉。
   const sawChoiceIndexes = new Set()
@@ -400,7 +434,6 @@ export async function respondStream(response, upstream, ctx) {
       }
       // 完成判定按 choice：n>1 时各 choice 可能分别在不同帧收尾，
       // 用全局布尔会把后收尾的 choice 整个吞掉。
-      if (hasFinishReason(chunk)) sawFinish = true
       const normalized = normalizeChunk(chunk, ctx.model, ctx.thinkingEnabled)
       if (!normalized) continue
       // 已收尾的 choice（含 [DONE] 之后的所有 choice）不再接收正文：
@@ -424,19 +457,11 @@ export async function respondStream(response, upstream, ctx) {
       }
       rewriteFinishReason(usable, toolCallChoiceIndexes)
 
-      if (!hasContent(usable)) {
-        // 无内容帧：还没开始输出就先压住（保留退回 JSON 429 的能力），
-        // 超过上限说明上游在异常刷屏，直接放行避免无界攒内存。
-        if (!sawContent && pending.length < MAX_PENDING_FRAMES) {
-          pending.push(usable)
-          continue
-        }
-        await send(usable)
-        if (client.closed) break
+      if (!hasContent(usable) && !started && pending.length < MAX_PENDING_FRAMES) {
+        pending.push(usable)
         continue
       }
-      // 首个正文到达：先把压住的帧按序放出，再写正文。
-      sawContent = true
+      // 首个正文或达到上限：先按序排空旧帧，再写新帧；一旦输出不再重新缓冲。
       for (const buffered of pending.splice(0)) await send(buffered)
       await send(usable)
       if (client.closed) break
@@ -444,7 +469,7 @@ export async function respondStream(response, upstream, ctx) {
     if (client.closed) return
     // 与流式共用同一判定：无完成信号即截断，不能补 [DONE] 伪装成正常完成；
     // 但"明确完成的空回答"算成功（对齐 opencode 官方）。
-    assertCompleted({ sawDone, sawFinish, choiceIndexes: sawChoiceIndexes, finishedIndexes: finishedChoiceIndexes })
+    assertCompleted({ sawDone, choiceIndexes: sawChoiceIndexes, finishedIndexes: finishedChoiceIndexes })
     for (const buffered of pending.splice(0)) await send(buffered)
     await send("[DONE]")
   } catch (error) {
@@ -461,32 +486,63 @@ export async function respondStream(response, upstream, ctx) {
 
 // 找到该 tool_call 增量应并入的槽位（新建或续传）。
 // 上游的并行调用常常不带 index（实测 10 轮里 12/36 帧如此），所以不能只按 index 归并：
-//   - 带 index：按 index 归档；
-//   - 不带 index 但带新 id / 新函数名：说明是另一个调用，新建槽位；
+//   - 带 index：按 index 归档；无 index 的首帧通过 id / 隐式序号绑定并迁移槽位；
+//   - 不带 index 但 id 已出现：按 id 归并，允许其它调用插入其间；
+//   - 不带 index 且带新 id / 函数名：新建槽位；
 //   - 不带 index 且只有 arguments（参数续传）：并入当前正在累积的调用。
 // 自动槽位用 "auto:N" 这类字符串键，避免与上游真正的数字 index 撞键。
 function toolCallTarget(state, call) {
+  const identified = state.callsById.get(call.id)
   if (Number.isInteger(call.index)) {
     let target = state.calls.get(call.index)
+    if (!target && identified && typeof identified.slot === "string") target = identified
     if (!target) {
-      target = newToolCall(state)
-      state.calls.set(call.index, target)
+      // 无 index 首帧的创建序号对应 main 的隐式槽位；后来带 index 的续传可绑定它。
+      // 真正的新 id 不能撞掉旧自动槽位；无 id 时按 index 续传，name 可晚到或补全。
+      const candidate = state.unindexedCalls.get(call.index)
+      const id = typeof call.id === "string" ? call.id : ""
+      if (candidate && (!id || !candidate.id)) target = candidate
     }
+    if (!target) target = newToolCall(state)
+    if (target.slot !== call.index) bindCallIndex(state, target, call.index)
     state.currentCall = target
     return target
+  }
+  if (identified) {
+    state.currentCall = identified
+    return identified
   }
   const startsNew =
     (typeof call.id === "string" && call.id) || (typeof call.function?.name === "string" && call.function.name)
   if (!startsNew && state.currentCall) return state.currentCall
   const target = newToolCall(state)
-  state.calls.set(`auto:${state.autoKeys++}`, target)
+  target.slot = `auto:${state.autoKeys++}`
+  state.calls.set(target.slot, target)
+  state.unindexedCalls.set(target.order, target)
   state.currentCall = target
   return target
 }
 
+function bindCallIndex(state, target, index) {
+  if (typeof target.slot === "string") {
+    state.calls.delete(target.slot)
+    state.unindexedCalls.delete(target.order)
+  }
+  target.slot = index
+  state.calls.set(index, target)
+}
+
 function newToolCall(state) {
   // order 记录创建顺序，输出时据此排序（键可能是数字 index，也可能是 auto:N 字符串）。
-  return { id: "", name: "", arguments: "", order: state.nextOrder++ }
+  return { id: "", name: "", arguments: "", order: state.nextOrder++, slot: null }
+}
+
+function orderedToolCalls(state) {
+  const entries = [...state.calls.entries()]
+  // 标准 indexed 流按 index 还原顺序（与 main 一致）；混合无 index 流才保留到达顺序。
+  if (entries.every(([index]) => Number.isInteger(index))) entries.sort(([a], [b]) => a - b)
+  else entries.sort(([, a], [, b]) => a.order - b.order)
+  return entries.map(([, call]) => call)
 }
 
 function newCallState() {
@@ -495,6 +551,8 @@ function newCallState() {
     content: "",
     reasoning: "",
     calls: new Map(),
+    callsById: new Map(),
+    unindexedCalls: new Map(),
     extra: {},
     currentCall: null,
     nextOrder: 0,
@@ -513,7 +571,6 @@ export async function respondJson(response, upstream, ctx) {
   let created
   let usage
   let sawDone = false
-  let sawFinish = false
 
   try {
     for await (const chunk of readEvents(reader, ctx)) {
@@ -524,7 +581,6 @@ export async function respondJson(response, upstream, ctx) {
       }
       // 完成信号之后只吸收 usage；判定按 choice，避免某个 choice 先收尾
       // 就把其它 choice 后续的 finish_reason 丢掉（会被下面的 ?? "stop" 掩盖）。
-      if (hasFinishReason(chunk)) sawFinish = true
       const normalized = normalizeChunk(chunk, ctx.model, ctx.thinkingEnabled)
       if (!normalized) continue
 
@@ -546,7 +602,10 @@ export async function respondJson(response, upstream, ctx) {
         mergePassthrough(state, delta)
         for (const call of delta.tool_calls ?? []) {
           const target = toolCallTarget(state, call)
-          if (typeof call.id === "string" && call.id) target.id = call.id
+          if (typeof call.id === "string" && call.id) {
+            target.id = call.id
+            state.callsById.set(call.id, target)
+          }
           if (typeof call.function?.name === "string" && call.function.name) target.name = call.function.name
           if (typeof call.function?.arguments === "string") target.arguments += call.function.arguments
         }
@@ -557,7 +616,6 @@ export async function respondJson(response, upstream, ctx) {
     // 与流式共用同一判定，避免同输入在两种模式下结论相反。
     assertCompleted({
       sawDone,
-      sawFinish,
       choiceIndexes: new Set(choices.keys()),
       finishedIndexes: new Set([...choices.entries()].filter(([, state]) => state.finish).map(([index]) => index)),
     })
@@ -573,13 +631,11 @@ export async function respondJson(response, upstream, ctx) {
           const message = { role: state.role, content: state.content || null }
           if (state.reasoning) message.reasoning_content = state.reasoning
           if (state.calls.size) {
-            message.tool_calls = [...state.calls.values()]
-              .sort((a, b) => a.order - b.order)
-              .map((call) => ({
-                id: call.id,
-                type: "function",
-                function: { name: call.name, arguments: call.arguments },
-              }))
+            message.tool_calls = orderedToolCalls(state).map((call) => ({
+              id: call.id,
+              type: "function",
+              function: { name: call.name, arguments: call.arguments },
+            }))
           }
           // 流式会把未知字段原样透传，非流式也必须带上，否则两种模式结果不同。
           Object.assign(message, state.extra)
