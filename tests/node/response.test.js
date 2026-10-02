@@ -228,13 +228,27 @@ test("响应头提交之后的错误以 SSE 事件结束，且不补 [DONE]", as
   assert.equal(stream.writableEnded, true)
 })
 
-test("只有 usage 没有正文时按失败处理，两种模式一致", async () => {
+test("上游只回 usage、连 choice 都没有时判失败，两种模式一致", async () => {
+  // 这是上游异常（正常至少会有一个 choice 帧），与"上游明确完成的空回答"不同。
   const onlyUsage = [`data: {"choices":[],"usage":${JSON.stringify(usage)}}\n\n`, done]
   const [full, stream] = await runBoth(onlyUsage)
   assert.equal(full.statusCode, 429)
   assert.match(full.body.error.message, /Empty/)
   assert.equal(stream.statusCode, 429)
   assert.match(stream.body.error.message, /Empty/)
+})
+
+test("上游明确完成的空回答按成功处理（对齐 opencode 官方语义）", async () => {
+  // role + finish_reason:"stop" + [DONE]：模型合法地没有输出内容（拒答、max_tokens 极小）。
+  // opencode 网关对 choices:[] 就是原样透传，不视为错误。
+  const empty = 'data: {"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":"stop"}]}\n\n' + done
+  const [full, stream] = await runBoth([empty])
+  assert.equal(full.statusCode, 200)
+  assert.equal(full.body.choices[0].message.content, null)
+  assert.equal(full.body.choices[0].finish_reason, "stop")
+  assert.equal(stream.statusCode, 200)
+  assert.equal(stream.text.split("[DONE]").length - 1, 1)
+  assert.ok(!stream.text.includes("rate_limit_error"))
 })
 
 test("[DONE] 之后的 usage 仍补齐，越界正文不写入", async () => {
@@ -325,6 +339,90 @@ test("流被截断时不伪装成正常完成，[DONE] 或 finish_reason 二者�
     assert.equal(full.body.choices[0].message.content, "hi")
     assert.equal(stream.text.split("[DONE]").length - 1, 1)
   }
+})
+
+test("finish_reason 即完成信号：上游不关连接也有界收尾", { timeout: 8000 }, async () => {
+  // 回归：完成信号若只用于"判定是否报错"而不用于收尾，上游发完 finish_reason
+  // 却不关连接时，非流式会白等整个空闲窗口，然后把一份完整回答丢成 429。
+  const encoder = new TextEncoder()
+  const raw = [
+    `data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: "assistant", content: "hi" } }] })}\n\n`,
+    'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+  ].join("")
+  for (const [handler, expected] of [
+    [respondJson, (response) => assert.equal(response.body.choices[0].message.content, "hi")],
+    [respondStream, (response) => assert.ok(response.text.includes("hi"))],
+  ]) {
+    const response = new ResponseStub()
+    const upstreamResponse = new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode(raw))
+          // 故意不 close()
+        },
+      }),
+    )
+    const started = Date.now()
+    await handler(response, upstreamResponse, ctx)
+    assert.ok(Date.now() - started < 5000, `${handler.name} 应在完成信号后立即收尾`)
+    assert.equal(response.statusCode, 200)
+    expected(response)
+  }
+})
+
+test("[DONE] 之后夹带 usage 的越界 choice 不会污染结果，也不产生幽灵 choice", async () => {
+  const head = [partial, finish, done].join("")
+  for (const [trailer, describe] of [
+    [`data: {"choices":[{"index":0,"delta":{"content":"LEAK"}}],"usage":${JSON.stringify(usage)}}\n\n`, "同帧夹带正文"],
+    [`data: {"choices":[{"index":5,"delta":{"content":"ghost"}}],"usage":${JSON.stringify(usage)}}\n\n`, "越界 index"],
+  ]) {
+    const [full, stream] = await runBoth([head + trailer])
+    assert.equal(full.body.choices.length, 1, describe)
+    assert.equal(full.body.choices[0].message.content, "hi", describe)
+    assert.ok(!stream.text.includes("LEAK") && !stream.text.includes("ghost"), describe)
+    assert.deepEqual(full.body.usage, usage, describe)
+  }
+})
+
+test("[DONE] 之后的迟到错误或残缺帧不会毁掉已完成的回答", async () => {
+  for (const trailer of [
+    'data: {"choices":[],"usage":{"total_to',
+    `data: ${JSON.stringify({ error: { message: "late" } })}\n\n`,
+  ]) {
+    const [full] = await runBoth([[partial, finish, done].join("") + trailer])
+    assert.equal(full.statusCode, 200)
+    assert.equal(full.body.choices[0].message.content, "hi")
+  }
+})
+
+test("只有 role 的帧之后上游报错时仍能退回 JSON 429", async () => {
+  // 早期版本会先 flushHeaders，导致账号池在流式路径上看不到 429。
+  const chunks = [
+    'data: {"choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n',
+    `data: ${JSON.stringify({ error: { message: "upstream blew up" } })}\n\n`,
+    done,
+  ]
+  for (const response of await runBoth(chunks)) {
+    assert.equal(response.statusCode, 429)
+    assert.match(response.body.error.message, /blew up/)
+  }
+})
+
+test("非流式聚合保留 legacy function_call 等未知 delta 字段", async () => {
+  // 流式是纯透传，非流式若是白名单重组，同一份输入在两种模式下结果就不同。
+  const chunks = [
+    `data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: "assistant", function_call: { name: "get_weather", arguments: '{"ci' } } }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ index: 0, delta: { function_call: { arguments: 'ty":"SF"}' }, refusal: "no" } }] })}\n\n`,
+    finish,
+    done,
+  ]
+  const [full, stream] = await runBoth(chunks)
+  const message = full.body.choices[0].message
+  // name 与 arguments 分属不同帧：合并时不能把先到的 name 覆盖掉。
+  assert.equal(message.function_call.name, "get_weather")
+  assert.equal(message.function_call.arguments, '{"city":"SF"}')
+  assert.equal(message.refusal, "no")
+  assert.match(stream.text, /function_call/)
 })
 
 test("上游发完 [DONE] 不关连接时仍有界收尾，且 usage 不丢", { timeout: 8000 }, async () => {

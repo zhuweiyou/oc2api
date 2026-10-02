@@ -117,28 +117,7 @@ Authorization: Bearer <api-key>
 
 以上限制数据来源于接口 [https://models.opencode.ai/api.json](https://models.opencode.ai/api.json)（`opencode` key 下对应模型的 `limit` 字段），可自行查看核实，以实际使用为准。
 
-## 请求与响应处理
-
-上游 OpenCode Zen 免费层本身就是 OpenAI 协议，因此代理只做"最小必要改写"，不解析、不重组正文内容。
-
-免费层的硬性门槛（均已对真实上游逐项验证），由 `server/zen.js` 自动补齐：
-
-- `User-Agent` 必须形如 `opencode/<version>`，其他 UA 一律 `403`
-- 必须带 `x-opencode-session`（`ses_` + 26 位小写十六进制）
-- 请求体必须包含 `bash` / `read` 两个门禁工具，缺失即 `403`
-- `stream` 必须为 `true`，`stream:false` 一律 `403`
-
-除上述之外，`messages`、`tools`、`tool_choice`、`temperature`、`top_p`、`stop`、`max_tokens`、`response_format` 等业务字段全部原样透传；用户已自带同名工具时保留用户定义，不覆盖。没有用户工具时自动设 `tool_choice: "none"`，避免模型选中门禁工具。
-
-响应侧只做三件事：
-
-- 思考字段归一：上游部分模型用 `reasoning` / `reasoning_details`，统一成下游认的 `reasoning_content`；`reasoning_effort: "none"` 时丢弃思考内容。`reasoning_details` 是同一内容的镜像，不会重复计入
-- 清理上游私有扩展（`cost`、`delta.name`）并归一 `usage: null`，避免严格客户端报错
-- 错误归一：上游任何失败都以 `429` 返回，供下游账号池（CLIProxyAPI / sub2api / new-api）切换账号
-
-由于上游只接受流式，非流式下游请求会把 SSE 聚合回一个 JSON 对象。流式响应在首个有效事件前不提交 SSE 头，因此仍能退回普通 JSON 错误；已开始输出后改为发送 OpenAI 错误对象并结束，不追加 `[DONE]`。
-
-`[DONE]` 只是完成信号：上游排在它之后的 `usage` 仍会补齐，但越界正文不会写进已结束的响应，尾部读取有 1 秒上限。响应头之后的读取另有首帧 30 秒 / 空闲 120 秒的看门狗，上游建连后彻底静默时不会永久挂住。
+上游失败（限流、鉴权、超时等）统一以 `429` 返回，便于 CLIProxyAPI / sub2api / new-api 等账号池工具切换账号。
 
 ## 架构
 
