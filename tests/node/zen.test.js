@@ -112,10 +112,54 @@ test("session 符合上游格式且同一使用者复用直到过期", () => {
   assert.notEqual(getSession("user-b"), first)
 })
 
-test("门禁工具定义稳定且不可被模型当成真实工具", () => {
+test("门禁工具定义带有禁止调用提示（不把描述当成强制保证）", () => {
   const tool = gateTool("bash")
   assert.equal(tool.type, "function")
   assert.equal(tool.function.name, "bash")
   assert.deepEqual(tool.function.parameters, { type: "object", properties: {} })
   assert.match(tool.function.description, /do not call/i)
+})
+
+test("reasoningEffort 别名恢复上游 snake_case，snake_case 优先", () => {
+  for (const [input, expected] of [
+    [{ reasoningEffort: "none" }, "none"],
+    [{ reasoningEffort: "high" }, "high"],
+    [{ reasoning_effort: "low", reasoningEffort: "high" }, "low"],
+    [{ reasoning_effort: null, reasoningEffort: "medium" }, "medium"],
+    [{ reasoning_effort: "" }, undefined],
+    [{}, undefined],
+  ]) {
+    const body = JSON.parse(buildUpstreamRequest({ model: "big-pickle", messages: [], ...input }, "ses_x").body)
+    assert.equal(body.reasoning_effort, expected)
+    assert.equal(body.reasoningEffort, undefined)
+  }
+})
+
+test("session 滑动过期：活跃时复用，空闲满 30 分钟换新", (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1 })
+  const first = getSession("expiry-test")
+  t.mock.timers.tick(29 * 60 * 1000)
+  assert.equal(getSession("expiry-test"), first)
+  t.mock.timers.tick(29 * 60 * 1000)
+  assert.equal(getSession("expiry-test"), first, "按空闲时间而不是创建时间过期")
+  t.mock.timers.tick(30 * 60 * 1000)
+  assert.notEqual(getSession("expiry-test"), first)
+})
+
+test("buildUpstreamRequest 不修改用户工具、消息或参数原对象", () => {
+  const weather = Object.freeze({
+    type: "function",
+    function: Object.freeze({ name: "weather", parameters: { type: "object" } }),
+  })
+  const payload = Object.freeze({
+    model: "big-pickle",
+    tools: Object.freeze([weather]),
+    messages: Object.freeze([{ role: "user", content: "hi" }]),
+    max_tokens: 0,
+  })
+  const body = JSON.parse(buildUpstreamRequest(payload, "ses_x").body)
+  assert.equal(payload.tools.length, 1)
+  assert.equal(body.tools.length, 3)
+  assert.equal(body.max_tokens, 0)
+  assert.deepEqual(body.messages, payload.messages)
 })
