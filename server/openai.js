@@ -440,22 +440,46 @@ export async function respondStream(response, upstream, ctx) {
 }
 
 // 找到该 tool_call 增量应并入的槽位（新建或续传）。
-// 上游的并行调用各占一帧且常常不带 index，所以不能只按 index 归并：
+// 上游的并行调用常常不带 index（实测 10 轮里 12/36 帧如此），所以不能只按 index 归并：
 //   - 带 index：按 index 归档；
 //   - 不带 index 但带新 id / 新函数名：说明是另一个调用，新建槽位；
-//   - 不带 index 且只有 arguments（参数续传）：并入当前最后一个调用。
+//   - 不带 index 且只有 arguments（参数续传）：并入当前正在累积的调用。
+// 自动槽位用 "auto:N" 这类字符串键，避免与上游真正的数字 index 撞键。
 function toolCallTarget(state, call) {
   if (Number.isInteger(call.index)) {
-    if (!state.calls.has(call.index)) state.calls.set(call.index, { id: "", name: "", arguments: "" })
-    return state.calls.get(call.index)
+    let target = state.calls.get(call.index)
+    if (!target) {
+      target = newToolCall(state)
+      state.calls.set(call.index, target)
+    }
+    state.currentCall = target
+    return target
   }
   const startsNew =
     (typeof call.id === "string" && call.id) || (typeof call.function?.name === "string" && call.function.name)
-  const last = [...state.calls.values()].at(-1)
-  if (!startsNew && last) return last
-  const slot = state.calls.size
-  state.calls.set(slot, { id: "", name: "", arguments: "" })
-  return state.calls.get(slot)
+  if (!startsNew && state.currentCall) return state.currentCall
+  const target = newToolCall(state)
+  state.calls.set(`auto:${state.autoKeys++}`, target)
+  state.currentCall = target
+  return target
+}
+
+function newToolCall(state) {
+  // order 记录创建顺序，输出时据此排序（键可能是数字 index，也可能是 auto:N 字符串）。
+  return { id: "", name: "", arguments: "", order: state.nextOrder++ }
+}
+
+function newCallState() {
+  return {
+    role: "assistant",
+    content: "",
+    reasoning: "",
+    calls: new Map(),
+    extra: {},
+    currentCall: null,
+    nextOrder: 0,
+    autoKeys: 0,
+  }
 }
 
 export async function respondJson(response, upstream, ctx) {
@@ -490,8 +514,7 @@ export async function respondJson(response, upstream, ctx) {
 
       for (const choice of normalized.choices ?? []) {
         const index = Number.isInteger(choice.index) ? choice.index : 0
-        if (!choices.has(index))
-          choices.set(index, { role: "assistant", content: "", reasoning: "", calls: new Map(), extra: {} })
+        if (!choices.has(index)) choices.set(index, newCallState())
         const state = choices.get(index)
         const delta = choice.delta ?? {}
         if (typeof delta.role === "string" && delta.role) state.role = delta.role
@@ -500,8 +523,6 @@ export async function respondJson(response, upstream, ctx) {
         // 非流式必须把流式会透传的东西也带上，否则同一次上游调用在两种模式下结果不同。
         mergePassthrough(state, delta)
         for (const call of delta.tool_calls ?? []) {
-          // 上游把并行调用放在各自独立的帧里，且常常不带 index。
-          // 此时只有"参数续传"才该并入上一个调用；带新 id / 新函数名说明是另一个调用。
           const target = toolCallTarget(state, call)
           if (typeof call.id === "string" && call.id) target.id = call.id
           if (typeof call.function?.name === "string" && call.function.name) target.name = call.function.name
@@ -529,9 +550,9 @@ export async function respondJson(response, upstream, ctx) {
           const message = { role: state.role, content: state.content || null }
           if (state.reasoning) message.reasoning_content = state.reasoning
           if (state.calls.size) {
-            message.tool_calls = [...state.calls.entries()]
-              .sort(([a], [b]) => a - b)
-              .map(([, call]) => ({
+            message.tool_calls = [...state.calls.values()]
+              .sort((a, b) => a.order - b.order)
+              .map((call) => ({
                 id: call.id,
                 type: "function",
                 function: { name: call.name, arguments: call.arguments },

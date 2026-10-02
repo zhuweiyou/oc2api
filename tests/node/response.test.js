@@ -231,6 +231,37 @@ test("无 index 的工具调用：新调用要分开、参数续传要合并", a
   assert.deepEqual(JSON.parse(merged[1].function.arguments), { city: "Osaka" })
 })
 
+test("带 index 与不带 index 的调用混用时不能串味", async () => {
+  // 回归：自动槽位若用 calls.size 当键，index 0/1 占位后新调用会写到键 2，
+  // 之后再来的 index:2 就会与它撞键、两个调用被揉在一起。
+  const indexed = (index, id, name, argumentsText) =>
+    `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index, id, type: "function", function: { name, arguments: argumentsText } }] } }] })}\n\n`
+  const auto = (id, name, argumentsText) =>
+    `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ id, type: "function", function: { name, arguments: argumentsText } }] } }] })}\n\n`
+
+  const [full] = await runBoth([
+    indexed(0, "c0", "f", "{}"),
+    indexed(1, "c1", "f", "{}"),
+    auto("cNew", "g", '{"x":1}'),
+    indexed(2, "c2", "h", '{"y":2}'),
+    finish,
+    done,
+  ])
+  const calls = full.body.choices[0].message.tool_calls
+  assert.equal(calls.length, 4, "四个调用必须各自独立")
+  assert.deepEqual(
+    calls.map((c) => c.id),
+    ["c0", "c1", "cNew", "c2"],
+    "输出顺序应保持上游到达顺序",
+  )
+  assert.deepEqual(
+    calls.map((c) => c.function.name),
+    ["f", "f", "g", "h"],
+  )
+  assert.deepEqual(JSON.parse(calls[2].function.arguments), { x: 1 })
+  assert.deepEqual(JSON.parse(calls[3].function.arguments), { y: 2 })
+})
+
 test("多个并行工具调用按 index 独立累积，互不串味", async () => {
   const raw = [
     'data: {"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"get_weather","arguments":"{\\"city\\":"}},{"index":1,"id":"call_b","type":"function","function":{"name":"get_time","arguments":"{\\"zone\\":"}}]}}]}\n\n',
