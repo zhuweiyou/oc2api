@@ -227,6 +227,52 @@ test("多 choice 时 finish_reason 按 choice 独立归一", async () => {
   ])
 })
 
+test("多 choice 分别在不同帧 finish 时，后收尾的 choice 不能被吞掉", async () => {
+  // 回归：完成判定若用全局布尔（sawDone/sawFinish），某个 choice 先 finish 后
+  // 整帧都会被当成"越界"，后面 choice 的 finish_reason 直接丢失——流式整帧消失、
+  // 非流式被下面的 ?? "stop" 掩盖成 stop。
+  const chunks = [
+    `data: ${JSON.stringify({
+      choices: [
+        { index: 0, delta: { content: "a" } },
+        { index: 1, delta: { content: "b" } },
+      ],
+    })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ index: 1, delta: {}, finish_reason: "length" }] })}\n\n`,
+  ]
+  const [full, stream] = await runBoth(chunks)
+  assert.deepEqual(
+    full.body.choices.map((c) => ({ index: c.index, finish: c.finish_reason, content: c.message.content })),
+    [
+      { index: 0, finish: "stop", content: "a" },
+      { index: 1, finish: "length", content: "b" },
+    ],
+  )
+  const streamFinish = payloads(stream.text)
+    .flatMap((chunk) => chunk.choices)
+    .filter((choice) => choice.finish_reason)
+    .map((choice) => ({ index: choice.index, finish: choice.finish_reason }))
+  assert.deepEqual(streamFinish, [
+    { index: 0, finish: "stop" },
+    { index: 1, finish: "length" },
+  ])
+})
+
+test("越界帧按 choice 过滤：不污染已收尾的 choice，也不丢 usage", async () => {
+  // 与上一条相对：已收尾 choice 的后续内容必须丢弃，但同帧的 usage 仍要保留，
+  // 且新 index 不能凭空造出幽灵 choice。
+  const tail = (choices) => `data: ${JSON.stringify({ choices, usage: { total_tokens: 9 } })}\n\n`
+  for (const choices of [[{ index: 0, delta: { content: "LEAK" } }], [{ index: 5, delta: { content: "ghost" } }]]) {
+    const [full, stream] = await runBoth([partial, finish, done, tail(choices)])
+    assert.equal(full.body.choices.length, 1, JSON.stringify(choices))
+    assert.equal(full.body.choices[0].message.content, "hi")
+    assert.deepEqual(full.body.usage, { total_tokens: 9 })
+    assert.ok(!stream.text.includes("LEAK") && !stream.text.includes("ghost"))
+    assert.ok(!stream.text.includes('"index":5'))
+  }
+})
+
 test("无 index 的工具调用：新调用要分开、参数续传要合并", async () => {
   // 上游的两种无 index 形态必须区分开（三方对照 main 验证过）：
   //   - 各自带新 id：是两个不同调用，不能合并；

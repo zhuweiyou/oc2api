@@ -111,14 +111,6 @@ function hasContent(chunk) {
   })
 }
 
-// 完成信号之后的帧只保留 usage：正文不能再写进已经结束的响应，
-// 但上游常把 usage 与空 choices 合并在一帧里，所以要按字段剥离而不是整帧丢弃。
-function usageOnly(chunk) {
-  if (!chunk || typeof chunk !== "object") return null
-  if (chunk.usage == null) return null
-  return { ...chunk, choices: [] }
-}
-
 // ---- SSE 解析：按事件切分，正确处理跨网络块与多字节字符 ----
 
 /** 帧里是否带任何 choice 的 finish_reason —— 它与 [DONE] 同样是完成信号。 */
@@ -353,6 +345,10 @@ export async function respondStream(response, upstream, ctx) {
   // sawContent：是否出现过正文增量；sawChoiceFrame：是否出现过 choice 帧（截断判定用）。
   let sawContent = false
   let sawChoiceFrame = false
+  // 出现过的 choice index、已收尾的 choice index：完成判定必须按 choice 而非全局，
+  // 否则某个 choice 先 finish 会把其它 choice 后续的 finish 帧一并吞掉。
+  const sawChoiceIndexes = new Set()
+  const finishedChoiceIndexes = new Set()
   // 出现过工具调用的 choice index 集合：finish_reason 归一只应作用于这些 choice。
   const toolCallChoiceIndexes = new Set()
   // 首个正文之前先压住少量无内容帧（role / 空 delta / 纯 usage），这样上游随后报错
@@ -391,40 +387,48 @@ export async function respondStream(response, upstream, ctx) {
         sawDone = true
         continue
       }
-      // 带 finish_reason 的这一帧本身要先按原样转发（它承载完成原因），
-      // 之后的越界帧才只吸收 usage。
-      const completes = sawDone || sawFinish
+      // 完成判定按 choice：n>1 时各 choice 可能分别在不同帧收尾，
+      // 用全局布尔会把后收尾的 choice 整个吞掉。
       if (hasFinishReason(chunk)) sawFinish = true
-      const normalized = normalizeChunk(completes ? usageOnly(chunk) : chunk, ctx.model, ctx.thinkingEnabled)
+      const normalized = normalizeChunk(chunk, ctx.model, ctx.thinkingEnabled)
       if (!normalized) continue
-      const hasChoices = Boolean(normalized.choices?.length)
-      // 上游结尾的 {choices:[],cost} 之类空帧没有转发价值。
-      if (!hasChoices && !normalized.usage) continue
+      // 已收尾的 choice（含 [DONE] 之后的所有 choice）不再接收正文：
+      // 上游补发的越界内容不能写进已结束的响应。
+      const usableChoices = (normalized.choices ?? []).filter((choice) => {
+        const index = Number.isInteger(choice.index) ? choice.index : 0
+        return !sawDone && !finishedChoiceIndexes.has(index)
+      })
+      const usable = { ...normalized, choices: usableChoices }
+      const hasChoices = usableChoices.length > 0
+      // 上游结尾的 {choices:[],cost} 之类空帧没有转发价值；
+      // 但带 usage 的帧即使没有可用 choice 也要转（补齐统计）。
+      if (!hasChoices && !usable.usage) continue
       if (hasChoices) sawChoiceFrame = true
-      // 工具调用帧总在 finish 帧之前到达，所以这里能判断出该不该改写 finish_reason。
-      // 按 choice 追踪：n>1 时某个 choice 带工具，不代表其它 choice 也带。
-      for (const choice of normalized.choices ?? []) {
-        if (choice.delta?.tool_calls?.length) {
-          toolCallChoiceIndexes.add(Number.isInteger(choice.index) ? choice.index : 0)
-        }
+      for (const choice of usableChoices) {
+        const index = Number.isInteger(choice.index) ? choice.index : 0
+        sawChoiceIndexes.add(index)
+        // 工具调用帧总在 finish 帧之前到达，所以这里能判断出该不该改写 finish_reason。
+        // 按 choice 追踪：n>1 时某个 choice 带工具，不代表其它 choice 也带。
+        if (choice.delta?.tool_calls?.length) toolCallChoiceIndexes.add(index)
+        if (choice.finish_reason) finishedChoiceIndexes.add(index)
       }
-      rewriteFinishReason(normalized, toolCallChoiceIndexes)
+      rewriteFinishReason(usable, toolCallChoiceIndexes)
 
-      if (!hasContent(normalized)) {
+      if (!hasContent(usable)) {
         // 无内容帧：还没开始输出就先压住（保留退回 JSON 429 的能力），
         // 超过上限说明上游在异常刷屏，直接放行避免无界攒内存。
         if (!sawContent && pending.length < MAX_PENDING_FRAMES) {
-          pending.push(normalized)
+          pending.push(usable)
           continue
         }
-        await send(normalized)
+        await send(usable)
         if (client.closed) break
         continue
       }
       // 首个正文到达：先把压住的帧按序放出，再写正文。
       sawContent = true
       for (const buffered of pending.splice(0)) await send(buffered)
-      await send(normalized)
+      await send(usable)
       if (client.closed) break
     }
     if (client.closed) return
@@ -510,10 +514,10 @@ export async function respondJson(response, upstream, ctx) {
         sawDone = true
         continue
       }
-      // 本帧承载完成原因，要先按原样处理；之后的越界帧才只吸收 usage。
-      const completes = sawDone || sawFinish
+      // 完成信号之后只吸收 usage；判定按 choice，避免某个 choice 先收尾
+      // 就把其它 choice 后续的 finish_reason 丢掉（会被下面的 ?? "stop" 掩盖）。
       if (hasFinishReason(chunk)) sawFinish = true
-      const normalized = normalizeChunk(completes ? usageOnly(chunk) : chunk, ctx.model, ctx.thinkingEnabled)
+      const normalized = normalizeChunk(chunk, ctx.model, ctx.thinkingEnabled)
       if (!normalized) continue
 
       if (!id && typeof normalized.id === "string") id = normalized.id
@@ -522,6 +526,8 @@ export async function respondJson(response, upstream, ctx) {
 
       for (const choice of normalized.choices ?? []) {
         const index = Number.isInteger(choice.index) ? choice.index : 0
+        // 已收尾的 choice：后续越界帧（例如 [DONE] 之后补发的正文）不再并进结果。
+        if (sawDone || choices.get(index)?.finish) continue
         if (!choices.has(index)) choices.set(index, newCallState())
         const state = choices.get(index)
         const delta = choice.delta ?? {}
