@@ -8,3 +8,5 @@ oc2api
 *.log
 .DS_Store
 coverage/
+.vercel
+.env*
