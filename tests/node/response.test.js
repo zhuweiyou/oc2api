@@ -77,6 +77,36 @@ function payloads(text) {
     .map((line) => JSON.parse(line.slice(5).trim()))
 }
 
+// 模拟标准客户端：只按 choice/index 聚合，不替代理用 id 或“当前调用”兜底。
+function assertStreamToolCallsMatch(full, stream) {
+  const choices = new Map()
+  for (const chunk of payloads(stream.text)) {
+    for (const choice of chunk.choices) {
+      for (const part of choice.delta?.tool_calls ?? []) {
+        assert.ok(Number.isInteger(part.index) && part.index >= 0, "每个工具增量必须带非负整数 index")
+        if (!choices.has(choice.index)) choices.set(choice.index, new Map())
+        const calls = choices.get(choice.index)
+        if (!calls.has(part.index)) {
+          calls.set(part.index, { id: "", type: "function", function: { name: "", arguments: "" } })
+        }
+        const call = calls.get(part.index)
+        if (part.id) {
+          if (call.id) assert.equal(part.id, call.id, "同一 index 不能换成另一个调用的 id")
+          call.id = part.id
+        }
+        if (part.function?.name) call.function.name = part.function.name
+        if (part.function?.arguments) call.function.arguments += part.function.arguments
+      }
+    }
+  }
+  const byId = (a, b) => a.id.localeCompare(b.id)
+  for (const choice of full.body.choices) {
+    const actual = [...(choices.get(choice.index)?.values() ?? [])].sort(byId)
+    const expected = [...(choice.message.tool_calls ?? [])].sort(byId)
+    assert.deepEqual(actual, expected, "仅按 index 聚合的流式工具结果应与非流式一致")
+  }
+}
+
 test("非流式聚合与流式转发得到相同的正文与思考", async () => {
   const raw = [
     'data: {"id":"cmpl-1","created":7,"model":"big-pickle","choices":[{"index":0,"delta":{"role":"assistant","reasoning":"思考A"}}]}\n\n',
@@ -1105,6 +1135,182 @@ test("finish 到 DONE 之前的迟到 usage 不受一秒窗口截断", async (t)
     if (handler === respondJson) assert.deepEqual(response.body.usage, usage)
     else assert.deepEqual(payloads(response.text).find((c) => c.usage)?.usage, usage)
   }
+})
+
+test("流式工具 index：缺失、续传和混合调用按稳定 index 聚合", async (t) => {
+  const frame = (...tool_calls) => `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls } }] })}\n\n`
+  const head = (id, argumentsText, index) => ({
+    ...(index === undefined ? {} : { index }),
+    id,
+    type: "function",
+    function: { name: "weather", arguments: argumentsText },
+  })
+  const tail = (argumentsText, index, id) => ({
+    ...(index === undefined ? {} : { index }),
+    ...(id === undefined ? {} : { id }),
+    function: { arguments: argumentsText },
+  })
+  const scenarios = [
+    {
+      name: "同帧并行首片缺 index，重复 id 可交错续传",
+      chunks: [
+        frame(head("A", '{"city":'), head("B", '{"city":')),
+        frame(tail('"Osaka"}', undefined, "B"), tail('"Tokyo"}', undefined, "A")),
+      ],
+      indexes: [0, 1, 1, 0],
+    },
+    {
+      name: "只有 arguments 的无 index 续传沿用当前调用",
+      chunks: [frame(head("A", '{"city":')), frame(tail('"Tokyo"}'))],
+      indexes: [0, 0],
+    },
+    {
+      name: "无 index 首片后，只有 index 的续传绑定原调用",
+      chunks: [frame(head("A", '{"city":'), head("B", '{"city":')), frame(tail('"Osaka"}', 1), tail('"Tokyo"}', 0))],
+      indexes: [0, 1, 1, 0],
+    },
+    {
+      name: "后到的上游 index 只建立别名，不改变已发送的 index",
+      chunks: [frame(head("A", '{"city":'), head("B", "{}")), frame(tail('"To', 7, "A")), frame(tail('kyo"}', 7))],
+      indexes: [0, 1, 0, 0],
+    },
+    {
+      name: "真实 index 与已发送的自动 index 碰撞时独立分配",
+      chunks: [frame(head("A", "{}")), frame(head("B", "{}", 0)), frame(tail("", undefined, "A"), tail("", 0))],
+      indexes: [0, 1, 0, 1],
+    },
+    {
+      name: "indexed 和自动槽位混用，碰撞后的续传仍不串参数",
+      chunks: [
+        frame(head("c0", "{}", 0), head("c1", "{}", 1)),
+        frame(head("A", '{"city":')),
+        frame(head("B", '{"city":', 2)),
+        frame(tail('"Tokyo"}', undefined, "A"), tail('"Osaka"}', 2)),
+      ],
+      indexes: [0, 1, 2, 3, 2, 3],
+    },
+    {
+      name: "标准 indexed 流乱序到达也保留原 index",
+      chunks: [
+        frame(head("B", '{"city":', 3), head("A", '{"city":', 0)),
+        frame(tail('"Osaka"}', 3), tail('"Tokyo"}', 0)),
+      ],
+      indexes: [3, 0, 3, 0],
+    },
+    {
+      name: "名字晚到的 indexed 续传仍属于同一调用",
+      chunks: [
+        frame({ id: "A", type: "function", function: { arguments: '{"city":' } }),
+        frame({ index: 0, function: { name: "weather", arguments: '"Tokyo"}' } }),
+      ],
+      indexes: [0, 0],
+    },
+  ]
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const [full, stream] = await runBoth([...scenario.chunks, finish, done])
+      assertStreamToolCallsMatch(full, stream)
+      const calls = payloads(stream.text).flatMap((chunk) =>
+        chunk.choices.flatMap((choice) => choice.delta?.tool_calls ?? []),
+      )
+      assert.deepEqual(
+        calls.map((call) => call.index),
+        scenario.indexes,
+      )
+      const original = scenario.chunks.flatMap((chunk) =>
+        payloads(chunk).flatMap((event) => event.choices.flatMap((choice) => choice.delta.tool_calls)),
+      )
+      const withoutIndex = (call) => {
+        const copy = { ...call }
+        delete copy.index
+        return copy
+      }
+      assert.deepEqual(
+        calls.map(withoutIndex),
+        original.map(withoutIndex),
+        "只归一 index，不改写 id、函数名、参数片段或增量边界",
+      )
+    })
+  }
+})
+
+test("流式工具 index：不同 choice 和不同请求的映射互相隔离", async () => {
+  const chunks = [
+    `data: ${JSON.stringify({
+      choices: [
+        {
+          index: 1,
+          delta: { tool_calls: [{ id: "A", type: "function", function: { name: "weather", arguments: "{}" } }] },
+        },
+        {
+          index: 0,
+          delta: { tool_calls: [{ id: "A", type: "function", function: { name: "weather", arguments: '{"city":' } }] },
+        },
+      ],
+    })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ function: { arguments: '"Tokyo"}' } }] } }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [0, 1].map((index) => ({ index, delta: {}, finish_reason: "stop" })) })}\n\n`,
+    done,
+  ]
+  for (let request = 0; request < 2; request++) {
+    const [full, stream] = await runBoth(chunks, { ctx: { choiceCount: 2 } })
+    assertStreamToolCallsMatch(full, stream)
+    const calls = payloads(stream.text).flatMap((chunk) =>
+      chunk.choices.flatMap((choice) => choice.delta?.tool_calls ?? []),
+    )
+    assert.deepEqual(
+      calls.map((call) => call.index),
+      [0, 0, 0],
+    )
+  }
+})
+
+test("流式工具 index：首个参数片段立即发送，不等待调用结束", async () => {
+  const encoder = new TextEncoder()
+  let controller
+  const source = new Response(
+    new ReadableStream({
+      start(c) {
+        controller = c
+        c.enqueue(
+          encoder.encode(
+            'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"id":"A","type":"function","function":{"name":"weather","arguments":"{\\"city\\":"}}]}}]}\n\n',
+          ),
+        )
+      },
+    }),
+  )
+  const response = new ResponseStub()
+  let firstSent = false
+  const write = response.write.bind(response)
+  response.write = (text) => {
+    const result = write(text)
+    if (!firstSent) {
+      firstSent = true
+      const call = payloads(text)[0].choices[0].delta.tool_calls[0]
+      assert.equal(call.index, 0)
+      assert.equal(call.function.arguments, '{"city":')
+      controller.enqueue(
+        encoder.encode(
+          'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"\\"Tokyo\\"}"}}]}}]}\n\n' +
+            finish +
+            done,
+        ),
+      )
+      controller.close()
+    }
+    return result
+  }
+  await respondStream(response, source, ctx)
+  assert.ok(firstSent)
+  const calls = payloads(response.text).flatMap((chunk) =>
+    chunk.choices.flatMap((choice) => choice.delta?.tool_calls ?? []),
+  )
+  assert.deepEqual(
+    calls.map((call) => call.index),
+    [0, 0],
+  )
+  assert.equal(calls.map((call) => call.function.arguments).join(""), '{"city":"Tokyo"}')
 })
 
 test("n 提供期望 choice 数时，后出现的 choice 不会被首个 finish 当成越界", async (t) => {

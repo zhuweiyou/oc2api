@@ -396,6 +396,8 @@ export async function respondStream(response, upstream, ctx) {
   const finishedChoiceIndexes = new Set()
   // 出现过工具调用的 choice index 集合：finish_reason 归一只应作用于这些 choice。
   const toolCallChoiceIndexes = new Set()
+  // 每个 choice 独立维护上游调用身份与下游 index，映射只在本次请求内存在。
+  const streamToolCalls = new Map()
   // 首个正文之前先压住少量无内容帧（role / 空 delta / 纯 usage），这样上游随后报错
   // 还能退回 JSON 429。上限保证内存恒定 O(1)：正常流量下只有 1~2 帧，
   // 一旦上游异常刷屏就直接放行，不再为"保留 429"而无界攒内存。
@@ -452,7 +454,13 @@ export async function respondStream(response, upstream, ctx) {
         sawChoiceIndexes.add(index)
         // 工具调用帧总在 finish 帧之前到达，所以这里能判断出该不该改写 finish_reason。
         // 按 choice 追踪：n>1 时某个 choice 带工具，不代表其它 choice 也带。
-        if (choice.delta?.tool_calls?.length) toolCallChoiceIndexes.add(index)
+        if (choice.delta?.tool_calls?.length) {
+          toolCallChoiceIndexes.add(index)
+          if (!streamToolCalls.has(index)) {
+            streamToolCalls.set(index, { calls: newCallState(), indexes: new Set(), nextIndex: 0 })
+          }
+          choice.delta.tool_calls = normalizeStreamToolCalls(choice.delta.tool_calls, streamToolCalls.get(index))
+        }
         if (choice.finish_reason) finishedChoiceIndexes.add(index)
       }
       rewriteFinishReason(usable, toolCallChoiceIndexes)
@@ -482,6 +490,27 @@ export async function respondStream(response, upstream, ctx) {
     client.release()
     if (started && !client.closed && !response.destroyed && !response.writableEnded) response.end()
   }
+}
+
+// 复用非流式的调用身份判定，但不聚合参数：每个片段仍立即发送。
+// 下游 index 一旦发出就不能变；后到的真实 index 只用于定位同一个 target。
+// 标准 indexed 流保留原值；若它与已发出的自动 index 碰撞，则分配空闲值，
+// 后续片段始终沿用 target.streamIndex，不能把两个调用交给客户端并到一处。
+function normalizeStreamToolCalls(calls, state) {
+  return calls.map((call) => {
+    const target = toolCallTarget(state.calls, call)
+    if (typeof call.id === "string" && call.id) {
+      target.id = call.id
+      state.calls.callsById.set(call.id, target)
+    }
+    if (target.streamIndex === undefined) {
+      const canKeepIndex = Number.isSafeInteger(call.index) && call.index >= 0 && !state.indexes.has(call.index)
+      target.streamIndex = canKeepIndex ? call.index : state.nextIndex
+      state.indexes.add(target.streamIndex)
+      while (state.indexes.has(state.nextIndex)) state.nextIndex++
+    }
+    return { ...call, index: target.streamIndex }
+  })
 }
 
 // 找到该 tool_call 增量应并入的槽位（新建或续传）。

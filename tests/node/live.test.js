@@ -158,6 +158,19 @@ test("local streaming preserves three parallel tool calls", options, async () =>
   )
 })
 
+test("Vercel entry streaming preserves three parallel tool calls by stable index", options, async () => {
+  const cities = ["Tokyo", "Osaka", "Kyoto"]
+  const { chunks, calls } = await invokeToolWithRetry(vercelURL, cities)
+  assert.equal(calls.length, 3)
+  assert.equal(new Set(calls.map((call) => call.id)).size, 3)
+  assert.deepEqual(calls.map((call) => JSON.parse(call.arguments).city).sort(), [...cities].sort())
+  calls.forEach((call) => assert.equal(call.name, "get_weather"))
+  assert.equal(
+    chunks.flatMap((chunk) => chunk.choices).find((choice) => choice.finish_reason)?.finish_reason,
+    "tool_calls",
+  )
+})
+
 // auto 不保证每次调用工具，可有限重试；没有实际调用就失败，不能 skip 冒充验收。
 async function invokeToolWithRetry(baseURL, cities = ["Tokyo"]) {
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -183,28 +196,32 @@ async function invokeToolWithRetry(baseURL, cities = ["Tokyo"]) {
   assert.fail("三次均未拿到工具调用，工具联调没有验收成功")
 }
 
-// 用 id / index 识别调用，避免旧测试把所有无 index 调用揉到 index 0。
+// 模拟标准客户端，只按 choice/index 聚合；不能用 id 或“当前调用”兜底，
+// 否则真实上游缺 index 时，测试自己修复了协议，会把代理的缺陷掩盖掉。
 function collectToolCalls(chunks) {
   const calls = []
-  const byId = new Map()
-  const byIndex = new Map()
-  let current
-  for (const part of chunks.flatMap((chunk) => chunk.choices).flatMap((choice) => choice.delta?.tool_calls ?? [])) {
-    let call = Number.isInteger(part.index) ? byIndex.get(part.index) : undefined
-    call ??= part.id ? byId.get(part.id) : undefined
-    if (!call && !part.id && !part.function?.name) call = current
-    if (!call) {
-      call = { id: "", name: "", arguments: "" }
-      calls.push(call)
+  const byChoice = new Map()
+  for (const choice of chunks.flatMap((chunk) => chunk.choices)) {
+    for (const part of choice.delta?.tool_calls ?? []) {
+      assert.ok(Number.isInteger(choice.index) && choice.index >= 0, "工具调用必须带有效 choice index")
+      assert.ok(Number.isInteger(part.index) && part.index >= 0, "每个工具片段必须带非负整数 index")
+      if (!byChoice.has(choice.index)) byChoice.set(choice.index, { byIndex: new Map(), idIndexes: new Map() })
+      const { byIndex, idIndexes } = byChoice.get(choice.index)
+      if (!byIndex.has(part.index)) {
+        const call = { id: "", name: "", arguments: "" }
+        byIndex.set(part.index, call)
+        calls.push(call)
+      }
+      const call = byIndex.get(part.index)
+      if (part.id) {
+        if (call.id) assert.equal(part.id, call.id, "同一 index 不能混入另一个工具调用")
+        if (idIndexes.has(part.id)) assert.equal(part.index, idIndexes.get(part.id), "同一调用的 index 必须稳定")
+        call.id = part.id
+        idIndexes.set(part.id, part.index)
+      }
+      if (part.function?.name) call.name = part.function.name
+      if (part.function?.arguments) call.arguments += part.function.arguments
     }
-    if (Number.isInteger(part.index)) byIndex.set(part.index, call)
-    if (part.id) {
-      call.id = part.id
-      byId.set(part.id, call)
-    }
-    if (part.function?.name) call.name = part.function.name
-    if (part.function?.arguments) call.arguments += part.function.arguments
-    current = call
   }
   return calls
 }
