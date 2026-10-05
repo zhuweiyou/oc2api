@@ -7,15 +7,19 @@
 import { ocId } from "./shared.js"
 import { debugLog } from "./log.js"
 
-const ZEN_BASE_URL = "https://opencode.ai"
-const ZEN_CHAT_URL = `${ZEN_BASE_URL}/zen/v1/chat/completions`
-const ZEN_MODELS_URL = `${ZEN_BASE_URL}/zen/v1/models`
+// A local relay can recover rejected requests before the adapter sees them.
+const ZEN_API_BASE_URL = (process.env.ZEN_API_BASE_URL || "https://opencode.ai/zen/v1").replace(/\/+$/, "")
+const ZEN_CHAT_URL = `${ZEN_API_BASE_URL}/chat/completions`
+const ZEN_MODELS_URL = `${ZEN_API_BASE_URL}/models`
 
 // 上游通过 UA 判断请求是否来自 OpenCode 客户端；版本号对判定无影响（已验证）。
 const ZEN_USER_AGENT = "opencode/1.18.31"
 
 // 建立连接与模型列表的超时。注意：响应头之后的读取由 openai.js 的看门狗负责。
-const CONNECT_TIMEOUT_MS = 60 * 1000
+const CONNECT_TIMEOUT_MS = Number(process.env.ZEN_CONNECT_TIMEOUT_MS || 60 * 1000)
+if (!Number.isFinite(CONNECT_TIMEOUT_MS) || CONNECT_TIMEOUT_MS < 1 || CONNECT_TIMEOUT_MS > 600000) {
+  throw new Error("ZEN_CONNECT_TIMEOUT_MS must be between 1 and 600000 milliseconds")
+}
 
 // 免费层门禁要求的工具名。只放必需的 bash / read（已验证最小集）。
 const GATE_TOOL_NAMES = ["bash", "read"]

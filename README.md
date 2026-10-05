@@ -57,6 +57,16 @@ npm start
 API_KEY=your-key DEBUG=true PORT=8080 npm start
 ```
 
+可选的本地上游中继（例如 proxy-router）可以在 OC2API 转换响应前处理限流重试：
+
+```sh
+ZEN_API_BASE_URL=http://127.0.0.1:2082/v1 ZEN_CONNECT_TIMEOUT_MS=300000 npm start
+```
+
+`ZEN_API_BASE_URL` 默认是 `https://opencode.ai/zen/v1`，同时用于模型列表和聊天。
+`ZEN_CONNECT_TIMEOUT_MS` 默认是 60000 毫秒，允许 1–600000；中继重试时应设置为大于其恢复窗口。
+它只控制收到响应头之前的等待时间，后续流式读取仍使用已有的超时机制。
+
 健康检查：
 
 ```bash
