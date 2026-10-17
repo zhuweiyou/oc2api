@@ -167,6 +167,59 @@ test("同名 read 保留客户端 schema，别名不撞已有工具，历史与�
   assert.ok(!request.clientToolNames.includes("read"))
 })
 
+test("role:tool 消息一律不发 name：GLM 会 400，且该字段在 OpenAI 规范里可选", () => {
+  // 实测：glm-5.3-flash-free 直接回
+  //   `[unsupported_parameter] messages[2]: "name" is not supported by this endpoint`
+  // 而 deepseek-v4.1-flash-free 容忍它。因为 tool_call_id 已能定位工具结果，
+  // 所以统一剥掉 name，两种模型都能正常工作。
+  const glob = {
+    type: "function",
+    function: { name: "glob", parameters: { type: "object", properties: { pattern: { type: "string" } } } },
+  }
+  const payload = {
+    model: "glm-5.3-flash-free",
+    messages: [
+      { role: "user", content: "list files" },
+      {
+        role: "assistant",
+        tool_calls: [{ id: "c1", type: "function", function: { name: "glob", arguments: '{"pattern":"./"}' } }],
+      },
+      // 客户端回填工具结果时常带 name（Claude Code / DSH 等都这么发）
+      { role: "tool", tool_call_id: "c1", name: "glob", content: "a.js b.js" },
+      // 即使名字不在别名表里，也不能漏给上游
+      { role: "tool", tool_call_id: "c2", name: "unknown_tool", content: "x" },
+    ],
+    tools: [glob],
+  }
+  const snapshot = JSON.stringify(payload)
+  const body = JSON.parse(buildUpstreamRequest(payload, "ses_x").body)
+
+  for (const message of body.messages.filter((m) => m.role === "tool")) {
+    assert.ok(!("name" in message), "role:tool 消息不应带 name")
+    assert.ok(typeof message.tool_call_id === "string" && message.tool_call_id, "tool_call_id 必须保留")
+  }
+  // 历史里的工具调用本身仍要按别名改写，不受影响。
+  assert.equal(body.messages[1].tool_calls[0].function.name, "oc2api_glob")
+  assert.equal(JSON.stringify(payload), snapshot, "不能修改调用者的消息对象")
+})
+
+test("没有客户端工具时也剥掉 role:tool 的 name", () => {
+  // 归一化必须无条件执行：早期实现只在存在客户端工具时才改写消息，
+  // 导致纯文本回填（无 tools）场景下 name 照样漏给上游。
+  const payload = {
+    model: "glm-5.3-flash-free",
+    messages: [
+      { role: "user", content: "hi" },
+      { role: "tool", tool_call_id: "c1", name: "glob", content: "result" },
+    ],
+  }
+  const body = JSON.parse(buildUpstreamRequest(payload, "ses_x").body)
+  const toolMessage = body.messages.find((m) => m.role === "tool")
+  assert.ok(!("name" in toolMessage))
+  assert.equal(toolMessage.tool_call_id, "c1")
+  assert.equal(toolMessage.content, "result")
+})
+
 test("所有客户端工具包括 edit/write 都隔离，允许列表选择与长名字保持合法映射", () => {
   const longA = "a".repeat(64)
   const longB = "a".repeat(63) + "b"

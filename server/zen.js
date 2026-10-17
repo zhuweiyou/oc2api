@@ -115,6 +115,15 @@ function renameMessageTools(message, names) {
   }
   const legacyName = names.get(message?.function_call?.name)
   if (legacyName) next = { ...next, function_call: { ...message.function_call, name: legacyName } }
+  // 上游对历史消息 role:"tool" 上的 name 支持不一致：GLM 直接 400
+  // （`[unsupported_parameter] messages[n]: "name" is not supported`），DeepSeek 则容忍。
+  // 该字段在 OpenAI 规范里可选，靠 tool_call_id 已能定位工具结果，
+  // 所以一律不发 name：既避开 GLM 的 400，也不改变其它模型的行为。
+  if (message?.role === "tool" && next.name !== undefined) {
+    next = { ...next }
+    delete next.name
+  }
+  // 老式 role:"function" 消息的 name 是必填（标识被调用的函数），必须保留并改名。
   if (message?.role === "function" && names.has(message.name)) next = { ...next, name: names.get(message.name) }
   return next
 }
@@ -143,9 +152,9 @@ export function buildUpstreamRequest(payload, sessionId) {
   if (toolsDisabled || payload.tool_choice == null) delete body.tool_choice
   else body.tool_choice = renameToolChoice(payload.tool_choice, adapted.names)
 
-  if (adapted.names.size) {
-    body.messages = payload.messages.map((message) => renameMessageTools(message, adapted.names))
-  }
+  // 必须无条件走一遍消息改写：即使没有客户端工具（names 为空），
+  // role:"tool" 上的 name 也要剥掉，否则 GLM 会 400。
+  body.messages = payload.messages.map((message) => renameMessageTools(message, adapted.names))
 
   // 兼容既有 camelCase 别名；上游和官方 SDK 使用 snake_case，不能只影响本地过滤。
   const reasoningEffort = payload.reasoning_effort ?? payload.reasoningEffort
