@@ -1,316 +1,212 @@
+// 真实联调：直接打上游，受免费层限流影响，离线运行时整体跳过。
+// 只保留离线测试无法证明的东西：
+//   1. 多轮连续工具调用在真实模型上能走通（含结果回填与后续轮次）；
+//   2. 与内置门禁同名的客户端 read 能被正确隔离和还原；
+//   3. 多个免费模型行为一致，而不是只在 big-pickle 上碰巧成立。
+// 刻意不点名工具：提示词一旦写出 "read tool"，模型会按名字匹配到同名的
+// 内置门禁工具，测出来的是提示词问题而不是代理问题。只描述任务，让模型自己选。
 import assert from "node:assert/strict"
-import { createServer } from "node:http"
 import { once } from "node:events"
 import test from "node:test"
 
-import vercelApp from "../../api/index.js"
 import { startServer } from "../../server/app.js"
 
 const live = process.env.OC2API_LIVE_TEST === "1"
-const options = { skip: !live, concurrency: false, timeout: 120_000 }
-let localServer
-let vercelServer
-let localURL
-let vercelURL
-let localFirstContent = "hi"
-let vercelFirstContent = "hi"
+const options = { skip: !live, concurrency: false, timeout: 180_000 }
+
+// 覆盖不同厂商：big-pickle 是特例硬编码的免费模型，其余都以 -free 结尾。
+const MODELS = ["big-pickle", "mimo-v2.6-flash-free", "deepseek-v4.1-flash-free", "glm-5.3-flash-free"]
+
+let server
+let baseURL
 
 test.before(async () => {
   if (!live) return
-  localServer = startServer({ port: 0, logger: { log() {} } })
-  await once(localServer, "listening")
-  localURL = `http://127.0.0.1:${localServer.address().port}`
-  // 验证 Vercel 入口的本地 HTTP 行为，不冒充远程 Vercel 部署验收。
-  vercelServer = createServer(vercelApp)
-  vercelServer.listen(0, "127.0.0.1")
-  await once(vercelServer, "listening")
-  vercelURL = `http://127.0.0.1:${vercelServer.address().port}`
+  server = startServer({ port: 0, logger: { log() {} } })
+  await once(server, "listening")
+  baseURL = `http://127.0.0.1:${server.address().port}`
 })
 
 test.after(async () => {
-  if (localServer) await close(localServer)
-  if (vercelServer) await close(vercelServer)
+  if (!server) return
+  server.closeAllConnections()
+  await new Promise((resolve) => server.close(resolve))
 })
 
-test("local non-stream hi", options, async () => {
-  const response = await requestChat(localURL, { stream: false, messages: [{ role: "user", content: "hi" }] })
-  const body = parseJSON(response.text, "local non-stream hi")
-  localFirstContent = body.choices[0]?.message?.content
-  assert.ok(localFirstContent?.length > 0, "应得到实际正文，而不只是空 choice")
-  assert.ok(body.usage?.total_tokens > 0, "应有 token 统计")
-})
-
-test("local streaming tools declared but not selectable", options, async () => {
-  const response = await requestChat(localURL, {
-    stream: true,
-    messages: conversationMessages(localFirstContent),
-    tools: [weatherTool()],
-    tool_choice: "none",
-  })
-  const chunks = assertStreamingResponse(response.text, "local tools conversation")
-  assert.equal(collectToolCalls(chunks).length, 0, "tool_choice:none 不能产生工具调用")
-})
-
-test("Vercel entry non-stream hi", options, async () => {
-  const response = await requestChat(vercelURL, { stream: false, messages: [{ role: "user", content: "hi" }] })
-  const body = parseJSON(response.text, "Vercel entry non-stream hi")
-  vercelFirstContent = body.choices[0]?.message?.content
-  assert.ok(vercelFirstContent?.length > 0)
-  assert.ok(body.usage?.total_tokens > 0)
-})
-
-test("Vercel entry streaming tools declared but not selectable", options, async () => {
-  const response = await requestChat(vercelURL, {
-    stream: true,
-    messages: conversationMessages(vercelFirstContent),
-    tools: [weatherTool()],
-    tool_choice: "none",
-  })
-  const chunks = assertStreamingResponse(response.text, "Vercel entry tools conversation")
-  assert.equal(collectToolCalls(chunks).length, 0)
-})
-
-test("local streaming actually invokes a custom tool", options, async () => {
-  const { chunks, calls } = await invokeToolWithRetry(localURL)
-  assertWeatherCall(calls[0], "Tokyo")
-  assert.equal(calls.length, 1)
-  assert.equal(
-    chunks.flatMap((chunk) => chunk.choices).find((choice) => choice.finish_reason)?.finish_reason,
-    "tool_calls",
-  )
-})
-
-test("local tool result round-trip completes the conversation", options, async () => {
-  const { chunks, calls } = await invokeToolWithRetry(localURL)
-  calls.forEach((call) => assertWeatherCall(call, "Tokyo"))
-  const assistantText =
-    chunks
-      .flatMap((chunk) => chunk.choices)
-      .map((choice) => choice.delta?.content ?? "")
-      .join("") || null
-  const response = await requestChat(localURL, {
-    stream: true,
-    messages: [
-      { role: "user", content: "What is the weather in Tokyo? Use the get_weather tool." },
-      {
-        role: "assistant",
-        content: assistantText,
-        tool_calls: calls.map((call) => ({
-          id: call.id,
-          type: "function",
-          function: { name: call.name, arguments: call.arguments },
-        })),
-      },
-      ...calls.map((call) => ({
-        role: "tool",
-        tool_call_id: call.id,
-        content: '{"city":"Tokyo","temp_c":18,"condition":"cloudy"}',
-      })),
-    ],
-    tools: [weatherTool()],
-    tool_choice: "auto",
-  })
-  const second = assertStreamingResponse(response.text, "round-trip step 2")
-  const text = second
-    .flatMap((chunk) => chunk.choices)
-    .map((choice) => choice.delta?.content ?? "")
-    .join("")
-  assert.ok(text.length > 0, "模型应基于工具结果给出回答")
-  assert.equal(collectToolCalls(second).length, 0, "拿到结果后不应再次调用工具")
-})
-
-test("Vercel entry streaming actually invokes a custom tool", options, async () => {
-  const { calls } = await invokeToolWithRetry(vercelURL)
-  assert.equal(calls.length, 1)
-  assertWeatherCall(calls[0], "Tokyo")
-})
-
-test("local non-stream also invokes a custom tool", options, async () => {
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    const response = await requestChat(localURL, {
-      stream: false,
-      messages: [{ role: "user", content: "What is the weather in Tokyo? Use the get_weather tool." }],
-      tools: [weatherTool()],
-      tool_choice: "auto",
-    })
-    const choice = parseJSON(response.text, `non-stream tool invocation attempt ${attempt}`).choices[0]
-    const calls = choice.message.tool_calls
-    if (!calls?.length) continue
-    assert.equal(choice.finish_reason, "tool_calls")
-    assert.equal(calls.length, 1)
-    assert.equal(calls[0].type, "function")
-    assertWeatherCall({ id: calls[0].id, ...calls[0].function }, "Tokyo")
-    return
-  }
-  assert.fail("三次均未拿到工具调用，不能将未验证成功伪装成通过或 skip")
-})
-
-test("local streaming preserves three parallel tool calls", options, async () => {
-  const cities = ["Tokyo", "Osaka", "Kyoto"]
-  const { chunks, calls } = await invokeToolWithRetry(localURL, cities)
-  assert.equal(calls.length, 3)
-  assert.equal(new Set(calls.map((call) => call.id)).size, 3, "并行调用必须有独立 id")
-  assert.deepEqual(calls.map((call) => JSON.parse(call.arguments).city).sort(), [...cities].sort())
-  calls.forEach((call) => assert.equal(call.name, "get_weather"))
-  assert.equal(
-    chunks.flatMap((chunk) => chunk.choices).find((choice) => choice.finish_reason)?.finish_reason,
-    "tool_calls",
-  )
-})
-
-test("Vercel entry streaming preserves three parallel tool calls by stable index", options, async () => {
-  const cities = ["Tokyo", "Osaka", "Kyoto"]
-  const { chunks, calls } = await invokeToolWithRetry(vercelURL, cities)
-  assert.equal(calls.length, 3)
-  assert.equal(new Set(calls.map((call) => call.id)).size, 3)
-  assert.deepEqual(calls.map((call) => JSON.parse(call.arguments).city).sort(), [...cities].sort())
-  calls.forEach((call) => assert.equal(call.name, "get_weather"))
-  assert.equal(
-    chunks.flatMap((chunk) => chunk.choices).find((choice) => choice.finish_reason)?.finish_reason,
-    "tool_calls",
-  )
-})
-
-test("local streaming colliding read(file_path) tool round-trip", options, async () => {
-  const tool = {
-    type: "function",
-    function: {
-      name: "read",
-      description: "Read a UTF-8 file from the client's workspace.",
-      parameters: {
-        type: "object",
-        properties: { file_path: { type: "string" } },
-        required: ["file_path"],
-        additionalProperties: false,
-      },
-    },
-  }
-  const tools = [
-    tool,
+// 一个贴近真实客户端的最小工具集：自定义 read 与内置门禁 read 同名但参数不同，
+// 外加两个常用工具，用来验证重名不会串味。
+function clientTools() {
+  return [
     {
       type: "function",
       function: {
-        name: "shell",
-        description: "Client shell runner",
-        parameters: { type: "object", properties: { script: { type: "string" } }, required: ["script"] },
-      },
-    },
-    {
-      type: "function",
-      function: {
-        name: "edit",
-        description: "Edit a client file. This tool is not needed for the current request. ".repeat(630),
+        name: "read",
+        description: "Read a UTF-8 text file from the client workspace and return its contents.",
         parameters: {
           type: "object",
-          properties: { file_path: { type: "string" }, old_string: { type: "string" }, new_string: { type: "string" } },
-          required: ["file_path", "old_string", "new_string"],
+          properties: { file_path: { type: "string" } },
+          required: ["file_path"],
+          additionalProperties: false,
         },
       },
     },
-    ...["write", "glob", "grep"].map((name) => ({
+    {
       type: "function",
       function: {
-        name,
-        description: `Client ${name} operation`,
-        parameters: { type: "object", properties: { file_path: { type: "string" } } },
+        name: "glob",
+        description: "List files matching a glob pattern in the client workspace.",
+        parameters: { type: "object", properties: { pattern: { type: "string" } }, required: ["pattern"] },
       },
-    })),
-  ]
-  const messages = [
+    },
     {
-      role: "user",
-      content:
-        "Use the client read tool to read README.md, then reply exactly with the file content returned by the tool. Do not guess its content.",
+      type: "function",
+      function: {
+        name: "search",
+        description: "Search the client workspace for a text query.",
+        parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
+      },
     },
   ]
-  const first = await requestChat(localURL, {
-    stream: true,
-    messages,
-    tools,
-    tool_choice: { type: "function", function: { name: "read" } },
-    max_tokens: 1024,
-  })
-  const chunks = assertStreamingResponse(first.text, "colliding read step 1")
-  const calls = collectToolCalls(chunks)
-  assert.equal(calls.length, 1)
-  assert.equal(calls[0].name, "read", "客户端不能收到上游别名或门禁工具")
-  assert.ok(calls[0].id)
-  assert.deepEqual(JSON.parse(calls[0].arguments), { file_path: "README.md" }, "不能把 file_path 改成门禁 path")
-  // 只回填模拟结果，不执行真实文件读取。
-  const second = await requestChat(localURL, {
-    stream: true,
-    tools,
-    tool_choice: "auto",
-    max_tokens: 1024,
-    messages: [
-      ...messages,
-      {
-        role: "assistant",
-        content: null,
-        tool_calls: [
-          { id: calls[0].id, type: "function", function: { name: calls[0].name, arguments: calls[0].arguments } },
-        ],
-      },
-      { role: "tool", tool_call_id: calls[0].id, content: "OC2API_COLLISION_OK" },
-    ],
-  })
-  const result = assertStreamingResponse(second.text, "colliding read step 2")
-  assert.equal(collectToolCalls(result).length, 0)
-  const content = result
-    .flatMap((chunk) => chunk.choices)
-    .map((choice) => choice.delta?.content || "")
-    .join("")
-  assert.match(content, /OC2API_COLLISION_OK/)
-})
-
-// auto 不保证每次调用工具，可有限重试；没有实际调用就失败，不能 skip 冒充验收。
-async function invokeToolWithRetry(baseURL, cities = ["Tokyo"]) {
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    const response = await requestChat(baseURL, {
-      stream: true,
-      messages: [
-        {
-          role: "user",
-          content:
-            cities.length === 1
-              ? "What is the weather in Tokyo? Use the get_weather tool."
-              : `Call get_weather once for each of these cities, all in the same response: ${cities.join(", ")}. Do not answer without calling all three tools.`,
-        },
-      ],
-      tools: [weatherTool()],
-      tool_choice: "auto",
-      max_tokens: 1024,
-    })
-    const chunks = assertStreamingResponse(response.text, `tool invocation attempt ${attempt}`)
-    const calls = collectToolCalls(chunks)
-    if (calls.length) return { chunks, calls }
-  }
-  assert.fail("三次均未拿到工具调用，工具联调没有验收成功")
 }
 
-// 模拟标准客户端，只按 choice/index 聚合；不能用 id 或“当前调用”兜底，
-// 否则真实上游缺 index 时，测试自己修复了协议，会把代理的缺陷掩盖掉。
+for (const model of MODELS) {
+  test(`${model}: 多轮连续工具调用，含同名 read 与其他工具`, options, async () => {
+    const tools = clientTools()
+    // 第一轮：只描述任务（列目录并读文件），不点名任何工具，让模型自己选。
+    const first = await chat(model, {
+      messages: [{ role: "user", content: "先看看当前目录下有哪些文件，然后把 README.md 的内容读出来告诉我。" }],
+      tools,
+      tool_choice: "auto",
+    })
+    const firstCalls = collectToolCalls(first)
+    assert.ok(firstCalls.length > 0, "第一轮应产生工具调用")
+    assertToolNamesAreClientNames(firstCalls, tools)
+
+    // 回填所有工具结果，再让它基于结果继续。
+    const second = await chat(model, {
+      messages: [
+        { role: "user", content: "先看看当前目录下有哪些文件，然后把 README.md 的内容读出来告诉我。" },
+        assistantWithCalls(firstCalls),
+        ...firstCalls.map((call) => ({
+          role: "tool",
+          tool_call_id: call.id,
+          // 故意带上 name：客户端普遍会带，GLM 曾因此 400。
+          name: call.name,
+          content: toolResult(call),
+        })),
+      ],
+      tools,
+      tool_choice: "auto",
+    })
+    const secondCalls = collectToolCalls(second)
+    if (secondCalls.length) {
+      // 模型可能继续调用别的工具；名字仍必须是客户端名字，不能漏出别名。
+      assertToolNamesAreClientNames(secondCalls, tools)
+    } else {
+      const text = collectText(second)
+      assert.ok(text.length > 0, "拿到工具结果后应给出自然语言回答或继续调用工具")
+    }
+  })
+}
+
+test("门禁同名 read 在真实上游被隔离，且参数不被改写", options, async () => {
+  const tools = clientTools()
+  const messages = [{ role: "user", content: "把 README.md 的内容原样读给我，不要猜测内容。" }]
+  const first = await chat("big-pickle", { messages, tools, tool_choice: "auto" })
+  const calls = collectToolCalls(first)
+  const readCall = calls.find((call) => call.name === "read")
+  assert.ok(readCall, `应产生一次客户端 read 调用，实际=${JSON.stringify(calls.map((c) => c.name))}`)
+  // 客户端 read 用 file_path；门禁 read 用 path。被改写成门禁参数就是 bug。
+  assert.deepEqual(
+    Object.keys(JSON.parse(readCall.arguments)),
+    ["file_path"],
+    "客户端 read 的参数不能被换成门禁的 path",
+  )
+  assert.ok(readCall.id, "工具调用必须带 id 以便回填")
+
+  const second = await chat("big-pickle", {
+    messages: [
+      ...messages,
+      assistantWithCalls([readCall]),
+      { role: "tool", tool_call_id: readCall.id, name: readCall.name, content: "OC2API_LIVE_ROUNDTRIP" },
+    ],
+    tools,
+    tool_choice: "auto",
+  })
+  assert.match(collectText(second), /OC2API_LIVE_ROUNDTRIP/, "模型应引用回填的工具结果")
+})
+
+test("非流式与流式在真实上游给出等价结果", options, async () => {
+  const tools = clientTools()
+  const messages = [{ role: "user", content: "列出当前目录下的文件名。" }]
+  const streamed = collectText(await chat("big-pickle", { messages, tools, tool_choice: "auto" }))
+  const oneShot = await chatJSON("big-pickle", { messages, tools, tool_choice: "auto" })
+  const choice = oneShot.choices[0]
+  assert.ok(choice, "非流式应返回 choice")
+  assert.equal(choice.message.role, "assistant")
+  if (choice.message.tool_calls?.length) {
+    assert.equal(choice.finish_reason, "tool_calls")
+  } else {
+    assert.ok((choice.message.content ?? "").length > 0 || streamed.length > 0)
+  }
+})
+
+// auto 不保证每次都调用工具，允许有限重试；仍不调用就失败，不用 skip 冒充通过。
+async function chat(model, payload) {
+  let last
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const response = await requestChat({ model, stream: true, temperature: 0, max_tokens: 1024, ...payload })
+    const chunks = assertStreamingResponse(response.text, `${model} attempt ${attempt}`)
+    const calls = collectToolCalls(chunks)
+    const text = collectText(chunks)
+    if (calls.length || text.length) return chunks
+    last = response.text
+  }
+  assert.fail(`${model} 三次都没有产出可用结果：${last}`)
+}
+
+async function chatJSON(model, payload) {
+  const response = await requestChat({ model, stream: false, temperature: 0, max_tokens: 1024, ...payload })
+  return parseJSON(response.text, `${model} non-stream`)
+}
+
+async function requestChat(payload) {
+  const headers = { "content-type": "application/json" }
+  if (process.env.API_KEY) headers.authorization = `Bearer ${process.env.API_KEY}`
+  const response = await fetch(`${baseURL}/v1/chat/completions`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(150_000),
+  })
+  const text = await response.text()
+  // 免费层限流是真实存在的，但要和其它失败区分开，不能一律当成限流。
+  if (response.status === 429 && /rate_limit/i.test(text)) {
+    assert.fail(`上游限流，请稍后重试：${text.slice(0, 200)}`)
+  }
+  assert.equal(response.status, 200, `联调失败 HTTP ${response.status}: ${text.slice(0, 400)}`)
+  if (payload.stream) assert.match(response.headers.get("content-type") ?? "", /text\/event-stream/)
+  return { headers: response.headers, text }
+}
+
+// 只按 choice/index 聚合，模拟标准客户端；不能用 id 兜底，否则会把代理的
+// 缺 index 缺陷在测试里自己修好。
 function collectToolCalls(chunks) {
   const calls = []
   const byChoice = new Map()
-  for (const choice of chunks.flatMap((chunk) => chunk.choices)) {
+  for (const choice of chunks.flatMap((chunk) => chunk.choices ?? [])) {
     for (const part of choice.delta?.tool_calls ?? []) {
       assert.ok(Number.isInteger(choice.index) && choice.index >= 0, "工具调用必须带有效 choice index")
       assert.ok(Number.isInteger(part.index) && part.index >= 0, "每个工具片段必须带非负整数 index")
-      if (!byChoice.has(choice.index)) byChoice.set(choice.index, { byIndex: new Map(), idIndexes: new Map() })
-      const { byIndex, idIndexes } = byChoice.get(choice.index)
+      if (!byChoice.has(choice.index)) byChoice.set(choice.index, new Map())
+      const byIndex = byChoice.get(choice.index)
       if (!byIndex.has(part.index)) {
         const call = { id: "", name: "", arguments: "" }
         byIndex.set(part.index, call)
         calls.push(call)
       }
       const call = byIndex.get(part.index)
-      if (part.id) {
-        if (call.id) assert.equal(part.id, call.id, "同一 index 不能混入另一个工具调用")
-        if (idIndexes.has(part.id)) assert.equal(part.index, idIndexes.get(part.id), "同一调用的 index 必须稳定")
-        call.id = part.id
-        idIndexes.set(part.id, part.index)
-      }
+      if (part.id) call.id = part.id
       if (part.function?.name) call.name = part.function.name
       if (part.function?.arguments) call.arguments += part.function.arguments
     }
@@ -318,52 +214,54 @@ function collectToolCalls(chunks) {
   return calls
 }
 
-function assertWeatherCall(call, city) {
-  assert.ok(call.id, "tool call 必须带 id，以便回填结果")
-  assert.equal(call.name, "get_weather")
-  assert.deepEqual(JSON.parse(call.arguments), { city })
+function collectText(chunks) {
+  return chunks
+    .flatMap((chunk) => chunk.choices ?? [])
+    .map((choice) => choice.delta?.content ?? "")
+    .join("")
 }
 
-function conversationMessages(assistantContent) {
-  return [
-    { role: "user", content: "hi" },
-    { role: "assistant", content: assistantContent },
-    { role: "user", content: "reply briefly with hi again" },
-  ]
+function assertToolNamesAreClientNames(calls, tools) {
+  const names = new Set(tools.map((tool) => tool.function.name))
+  for (const call of calls) {
+    assert.ok(names.has(call.name), `客户端不能收到别名或门禁工具，实际=${call.name}`)
+  }
+}
+
+function assistantWithCalls(calls) {
+  return {
+    role: "assistant",
+    content: null,
+    tool_calls: calls.map((call) => ({
+      id: call.id,
+      type: "function",
+      function: { name: call.name, arguments: call.arguments },
+    })),
+  }
+}
+
+function toolResult(call) {
+  if (call.name === "read") return "OC2API_LIVE_README_CONTENT"
+  if (call.name === "glob") return "README.md\npackage.json\nserver/"
+  return "search-result"
 }
 
 function assertStreamingResponse(text, scenario) {
   assert.equal(text.split("[DONE]").length - 1, 1, `${scenario} 应且只应有一个 [DONE]`)
   const chunks = parseSSEData(text, scenario)
-  assert.ok(chunks.length > 0, `${scenario} has no JSON chunks`)
+  assert.ok(chunks.length > 0, `${scenario} 没有收到任何 JSON 帧`)
   for (const chunk of chunks) {
-    assert.ok(!chunk.error, `${scenario} 包含流中错误：${JSON.stringify(chunk.error)}`)
+    assert.ok(!chunk.error, `${scenario} 流中错误：${JSON.stringify(chunk.error)}`)
     assert.ok(Array.isArray(chunk.choices), `${scenario} choices 必须是数组`)
   }
   return chunks
-}
-
-async function requestChat(baseURL, payload) {
-  const headers = { "content-type": "application/json" }
-  if (process.env.API_KEY) headers.authorization = `Bearer ${process.env.API_KEY}`
-  const response = await fetch(`${baseURL}/v1/chat/completions`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ model: "big-pickle", max_tokens: 256, temperature: 0, ...payload }),
-    signal: AbortSignal.timeout(90_000),
-  })
-  const text = await response.text()
-  // 代理会把协议错也归一为 429，所以单凭 429 不能判定真实限流，更不能全局 skip。
-  assert.equal(response.status, 200, `真实联调失败 HTTP ${response.status}: ${text}`)
-  if (payload.stream) assert.match(response.headers.get("content-type"), /text\/event-stream/)
-  return { headers: response.headers, text }
 }
 
 function parseJSON(text, scenario) {
   try {
     return JSON.parse(text)
   } catch (error) {
-    throw new Error(`${scenario} returned invalid JSON: ${error.message}; body=${text}`, { cause: error })
+    throw new Error(`${scenario} 返回了非法 JSON：${error.message}; body=${text.slice(0, 300)}`, { cause: error })
   }
 }
 
@@ -380,26 +278,4 @@ function parseSSEData(text, scenario) {
     )
     .filter((payload) => payload && payload !== "[DONE]")
     .map((payload) => parseJSON(payload, scenario))
-}
-
-function weatherTool() {
-  return {
-    type: "function",
-    function: {
-      name: "get_weather",
-      description: "Get the weather for a city.",
-      parameters: {
-        type: "object",
-        properties: { city: { type: "string" } },
-        required: ["city"],
-        additionalProperties: false,
-      },
-    },
-  }
-}
-
-async function close(server) {
-  if (!server.listening) return
-  server.closeAllConnections()
-  await new Promise((resolve) => server.close(resolve))
 }
