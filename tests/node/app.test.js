@@ -137,7 +137,7 @@ test("合法请求端到端：流式与非流式都能拿到正文与 usage", as
   assert.ok(last.tools.some((tool) => tool.function.name === "oc2api_get_weather"))
 })
 
-test("上游失败时返回 429，供账号池切换", async (t) => {
+test("上游真实限流才返回 429，并透出限流语义", async (t) => {
   const server = await fixture(
     t,
     async () =>
@@ -385,7 +385,7 @@ test("HTTP 禁用工具：不透传用户定义或 none，并拒绝上游意外�
       "data: [DONE]\n\n"
     for (const payload of [input, { ...base, stream }]) {
       const response = await post(server.url, payload)
-      assert.equal(response.status, 429)
+      assert.equal(response.status, 502)
       assert.match(JSON.parse(response.text).error.message, /tools are disabled/)
       assert.ok(!response.text.includes("[DONE]"))
     }

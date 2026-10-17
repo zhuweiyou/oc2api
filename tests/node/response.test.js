@@ -84,7 +84,7 @@ test("禁用工具时两种模式都拒绝 tool_calls、legacy function_call 和
         ctx: { toolsDisabled: true },
       },
     )) {
-      assert.equal(response.statusCode, 429)
+      assert.equal(response.statusCode, 502)
       assert.match(response.body.error.message, /tools are disabled/)
       assert.ok(!response.text.includes("[DONE]"))
     }
@@ -95,7 +95,7 @@ test("禁用工具时正文后的意外调用以 SSE 错误结束，不发送工
   const toolFrame =
     'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"shell","arguments":"{}"}}]}}]}\n\n'
   const [full, stream] = await runBoth([partial, toolFrame, done], { ctx: { toolsDisabled: true } })
-  assert.equal(full.statusCode, 429)
+  assert.equal(full.statusCode, 502)
   assert.match(full.body.error.message, /tools are disabled/)
   assert.equal(stream.statusCode, 200)
   assert.match(stream.text, /tools are disabled/)
@@ -262,11 +262,11 @@ test("保留工具调用和未完成别名必须报错，不能下发客户端�
       done,
     ]
     const [full, stream] = await runBoth(chunks, options)
-    assert.equal(full.statusCode, 429)
+    assert.equal(full.statusCode, 502)
     assert.ok(!stream.text.includes("[DONE]"))
     if (name === "oc2api_") assert.match(full.body.error.message, /Incomplete upstream tool name/)
     else {
-      assert.equal(stream.statusCode, 429)
+      assert.equal(stream.statusCode, 502)
       assert.match(full.body.error.message, /reserved tool/)
     }
   }
@@ -613,21 +613,32 @@ test("多个并行工具调用按 index 独立累积，互不串味", async () =
   assert.deepEqual(byIndex.get(1), { name: "get_time", arguments: '{"zone":"JST"}' })
 })
 
-test("上游 HTTP 错误与错误事件都归一为 429", async () => {
+test("上游 HTTP 错误透出真实状态码，只有真限流是 429", async () => {
   const errorJSON = JSON.stringify({ error: { message: "boom", type: "server_error" } })
-  for (const status of [400, 401, 403, 429, 500, 503]) {
+  // 上游状态码即下游状态码：客户端据此判断是参数错、鉴权问题还是限流，
+  // 而不是一律被 429 吞掉、误以为是免费额度耗尽。
+  const expected = new Map([
+    [400, { status: 400, type: "invalid_request_error", code: "upstream_invalid_request" }],
+    [401, { status: 401, type: "authentication_error", code: "upstream_auth_error" }],
+    [403, { status: 403, type: "authentication_error", code: "upstream_auth_error" }],
+    [429, { status: 429, type: "rate_limit_error", code: "rate_limit_exceeded" }],
+    [500, { status: 500, type: "upstream_error", code: "upstream_error" }],
+    [503, { status: 503, type: "upstream_error", code: "upstream_error" }],
+  ])
+  for (const [status, want] of expected) {
     for (const response of await runBoth([errorJSON], { status })) {
-      assert.equal(response.statusCode, 429)
-      assert.equal(response.body.error.type, "rate_limit_error")
-      assert.equal(response.body.error.code, "rate_limit_exceeded")
+      assert.equal(response.statusCode, want.status, `上游 ${status} 应原样透出`)
+      assert.equal(response.body.error.type, want.type)
+      assert.equal(response.body.error.code, want.code)
       assert.match(response.body.error.message, /boom/)
       assert.equal(response.text, "")
     }
   }
 
-  // 响应头提交之前的 SSE 错误仍可退回 JSON
+  // 响应头提交之前的 SSE 错误仍可退回 JSON；这是网关侧流异常，用 502 而非 429。
   for (const response of await runBoth([`data: ${errorJSON}\n\n`, done])) {
-    assert.equal(response.statusCode, 429)
+    assert.equal(response.statusCode, 502)
+    assert.equal(response.body.error.code, "upstream_stream_error")
     assert.match(response.body.error.message, /boom/)
   }
 })
@@ -647,9 +658,9 @@ test("上游只回 usage、连 choice 都没有时判失败，两种模式一致
   // 这是上游异常（正常至少会有一个 choice 帧），与"上游明确完成的空回答"不同。
   const onlyUsage = [`data: {"choices":[],"usage":${JSON.stringify(usage)}}\n\n`, done]
   const [full, stream] = await runBoth(onlyUsage)
-  assert.equal(full.statusCode, 429)
+  assert.equal(full.statusCode, 502)
   assert.match(full.body.error.message, /Empty/)
-  assert.equal(stream.statusCode, 429)
+  assert.equal(stream.statusCode, 502)
   assert.match(stream.body.error.message, /Empty/)
 })
 
@@ -738,10 +749,10 @@ test("upstreamError 只识别真正的错误体", () => {
 
 test("流被截断时不伪装成正常完成，[DONE] 或 finish_reason 二者有一即算完成", async () => {
   const truncated = await runBoth([partial])
-  assert.equal(truncated[0].statusCode, 429)
+  assert.equal(truncated[0].statusCode, 502)
   assert.match(truncated[0].body.error.message, /Incomplete/)
   assert.ok(!truncated[1].text.includes("[DONE]"))
-  assert.match(truncated[1].text, /rate_limit_error/)
+  assert.match(truncated[1].text, /upstream_stream_error/)
 
   // 上游用 [DONE] 或 finish_reason 任一种收尾都算正常
   for (const chunks of [
@@ -776,7 +787,7 @@ test("两种响应模式对完成的判定一致", async () => {
   }
   for (const [name, [chunks, shouldFail]] of Object.entries(cases)) {
     const [full, stream] = await runBoth(chunks)
-    const jsonFailed = full.statusCode === 429
+    const jsonFailed = full.statusCode === 502
     assert.equal(jsonFailed, shouldFail, `非流式判定不符：${name}`)
     assert.equal(streamFailed(stream), shouldFail, `流式判定不符：${name}`)
   }
@@ -837,15 +848,15 @@ test("[DONE] 之后的迟到错误或残缺帧不会毁掉已完成的回答", a
   }
 })
 
-test("只有 role 的帧之后上游报错时仍能退回 JSON 429", async () => {
-  // 早期版本会先 flushHeaders，导致账号池在流式路径上看不到 429。
+test("只有 role 的帧之后上游报错时仍能退回 JSON 错误", async () => {
+  // 早期版本会先 flushHeaders，导致流式路径上看不到结构化错误。
   const chunks = [
     'data: {"choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n',
     `data: ${JSON.stringify({ error: { message: "upstream blew up" } })}\n\n`,
     done,
   ]
   for (const response of await runBoth(chunks)) {
-    assert.equal(response.statusCode, 429)
+    assert.equal(response.statusCode, 502)
     assert.match(response.body.error.message, /blew up/)
   }
 })
@@ -1031,7 +1042,7 @@ test("多 choice 中仅一个 finish 不能掩盖其余 choice 截断", async ()
     ],
   })}\n\n`
   const [full, stream] = await runBoth([head, finish])
-  assert.equal(full.statusCode, 429)
+  assert.equal(full.statusCode, 502)
   assert.match(full.body.error.message, /Incomplete/)
   assert.ok(!stream.text.includes("[DONE]"))
   assert.match(stream.text, /Incomplete/)
@@ -1156,7 +1167,7 @@ test("HTTP 200 原始 JSON 错误立即识别，不必等待 SSE 空闲窗口或
       }),
     )
     await handler(response, source, ctx)
-    assert.equal(response.statusCode, 429)
+    assert.equal(response.statusCode, 502)
     assert.match(response.body.error.message, /raw limit/)
     assert.ok(cancelled)
   }
@@ -1166,8 +1177,8 @@ test("原始 JSON 错误跨网络块切开 UTF-8 字符时，诊断文本不损�
   const bytes = new TextEncoder().encode('{"error":{"message":"你好，限制"}}')
   for (let split = 1; split < bytes.length; split++) {
     for (const response of await runBoth([bytes.subarray(0, split), bytes.subarray(split)])) {
-      assert.equal(response.statusCode, 429)
-      assert.equal(response.body.error.message, "你好，限制 (free model rate limit)", `split=${split}`)
+      assert.equal(response.statusCode, 502)
+      assert.equal(response.body.error.message, "你好，限制", `split=${split}`)
     }
   }
 })
@@ -1184,7 +1195,7 @@ test("碎片化原始 JSON 错误有界解析，不逐字节重复 JSON.parse", 
     parses = 0
     const response = new ResponseStub()
     await handler(response, upstream([...new TextEncoder().encode(raw)].map((byte) => Uint8Array.of(byte))), ctx)
-    assert.equal(response.statusCode, 429)
+    assert.equal(response.statusCode, 502)
     assert.match(response.body.error.message, /fragmented limit/)
     assert.ok(parses <= 2, `原始 JSON 错误只应解析首段与最终正文，实际 ${parses} 次`)
   }
@@ -1209,11 +1220,11 @@ test("残缺原始 JSON 错误最多读取一秒，超大错误正文受字节�
     await new Promise((resolve) => setImmediate(resolve))
     t.mock.timers.tick(1000)
     await work
-    assert.equal(response.statusCode, 429)
+    assert.equal(response.statusCode, 502)
     assert.ok(cancelled)
     const big = new ResponseStub()
     await handler(big, upstream(['{"error":{"message":"' + "x".repeat(70_000) + '"}}']), ctx)
-    assert.equal(big.statusCode, 429)
+    assert.equal(big.statusCode, 502)
     assert.ok(big.body.error.message.length < 100, "错误正文过大时应返回有界诊断，不回显无限长 message")
   }
 })

@@ -1,12 +1,12 @@
 // OpenAI 兼容响应层：上游本就是 OpenAI 协议，这里只做最小必要改写
-// （思考字段归一为 reasoning_content、剥掉 cost/delta.name、失败归一为 429），
+// （思考字段归一为 reasoning_content、剥掉 cost/delta.name、失败保留上游真实错误），
 // 不解析也不重组正文。上游只支持流式，非流式请求在这里把 SSE 聚合成 JSON。
 //
 // 完成语义有几处反直觉，改动前先看 tests/node/response.test.js：
 //   - 所有 choice 的 finish_reason 或 [DONE] 表示完成；finish 后仍读 usage，空闲超时也算成功；
 //   - 完成信号之后的帧只吸收 usage，越界正文既不写入也不产生新 choice；
 //   - "明确完成的空回答"算成功（对齐 opencode 官方），只回 usage 而无 choice 才算异常；
-//   - 首个正文之前只压住少量无内容帧（保留退回 JSON 429 的能力），上限恒定，
+//   - 首个正文之前只压住少量无内容帧（保留退回 JSON 错误的能力），上限恒定，
 //     上游异常刷屏时直接放行而不是无界攒内存。
 import { logUpstreamBody } from "./log.js"
 
@@ -32,15 +32,43 @@ class ZenStreamError extends Error {
   }
 }
 
-// 上游一切失败都归一为 429：下游账号池工具（CLIProxyAPI/sub2api/new-api）依赖它切号。
-export function rateLimitError(message) {
+// 错误必须保留上游的真实语义：只有上游真的限流才是 429，
+// 其余（参数错误、鉴权、模型不可用等）原样透出，客户端才能判断问题并反馈给上游仓库。
+// 早期版本把一切失败归一成 429 便于账号池切号，代价是错误信息被吞掉，已废弃。
+export function upstreamFailure(status, message) {
+  const text = message || `Upstream returned HTTP ${status}`
+  if (status === 429) {
+    return {
+      error: { message: `${text} (free model rate limit)`, type: "rate_limit_error", code: "rate_limit_exceeded" },
+    }
+  }
+  if (status === 401 || status === 403) {
+    return { error: { message: text, type: "authentication_error", code: "upstream_auth_error" } }
+  }
+  if (status >= 400 && status < 500) {
+    // 上游明确拒绝请求（如 GLM 不接受 role:tool 的 name 字段）：
+    // 属于请求侧问题，不能让客户端误以为是限流而反复重试。
+    return { error: { message: text, type: "invalid_request_error", code: "upstream_invalid_request" } }
+  }
+  return { error: { message: text, type: "upstream_error", code: "upstream_error" } }
+}
+
+// oc2api 自身的流异常（无完成信号、上游调用了保留工具等）：
+// 上游已接受连接但内容不可用，属于网关侧失败，用 502 而不是 429。
+export function streamFailure(message) {
   return {
     error: {
-      message: `${message || "Rate limit exceeded"} (free model rate limit)`,
-      type: "rate_limit_error",
-      code: "rate_limit_exceeded",
+      message: message || "Upstream stream error",
+      type: "upstream_error",
+      code: "upstream_stream_error",
     },
   }
+}
+
+// 上游非 2xx 时把上游状态码原样映射给下游，不做归一。
+function upstreamStatus(upstream) {
+  const status = Number(upstream?.status)
+  return Number.isInteger(status) && status >= 400 && status <= 599 ? status : 502
 }
 
 function sendJson(response, body, status = 200, headers = {}) {
@@ -474,8 +502,11 @@ function assertCompleted({ sawDone, choiceIndexes, finishedIndexes }) {
 }
 
 export async function respondStream(response, upstream, ctx) {
-  if (!upstream.ok) return sendJson(response, rateLimitError(await readErrorBody(upstream, ctx)), 429)
-  if (!upstream.body) return sendJson(response, rateLimitError("Empty response from upstream"), 429)
+  if (!upstream.ok) {
+    const status = upstreamStatus(upstream)
+    return sendJson(response, upstreamFailure(status, await readErrorBody(upstream, ctx)), status)
+  }
+  if (!upstream.body) return sendJson(response, streamFailure("Empty response from upstream"), 502)
 
   const reader = upstream.body.getReader()
   const client = watchClose(response, reader)
@@ -490,8 +521,8 @@ export async function respondStream(response, upstream, ctx) {
   // 每个 choice 独立维护上游调用身份与下游 index，映射只在本次请求内存在。
   const streamToolCalls = new Map()
   // 首个正文之前先压住少量无内容帧（role / 空 delta / 纯 usage），这样上游随后报错
-  // 还能退回 JSON 429。上限保证内存恒定 O(1)：正常流量下只有 1~2 帧，
-  // 一旦上游异常刷屏就直接放行，不再为"保留 429"而无界攒内存。
+  // 还能退回 JSON 错误。上限保证内存恒定 O(1)：正常流量下只有 1~2 帧，
+  // 一旦上游异常刷屏就直接放行，不再为"保留错误响应"而无界攒内存。
   const pending = []
 
   // 首个有效事件之前不提交 SSE 头，这样还能退回普通 JSON 错误。
@@ -574,9 +605,9 @@ export async function respondStream(response, upstream, ctx) {
   } catch (error) {
     if (!(error instanceof ZenStreamError)) throw error
     if (client.closed || response.destroyed) return
-    if (!started) return sendJson(response, rateLimitError(error.message), 429)
+    if (!started) return sendJson(response, streamFailure(error.message), 502)
     // 响应头已提交，只能以 SSE 错误事件结束，且不补 [DONE]（避免伪装成正常完成）。
-    await send(rateLimitError(error.message))
+    await send(streamFailure(error.message))
   } finally {
     client.release()
     if (started && !client.closed && !response.destroyed && !response.writableEnded) response.end()
@@ -681,8 +712,11 @@ function newCallState() {
 }
 
 export async function respondJson(response, upstream, ctx) {
-  if (!upstream.ok) return sendJson(response, rateLimitError(await readErrorBody(upstream, ctx)), 429)
-  if (!upstream.body) return sendJson(response, rateLimitError("Empty response from upstream"), 429)
+  if (!upstream.ok) {
+    const status = upstreamStatus(upstream)
+    return sendJson(response, upstreamFailure(status, await readErrorBody(upstream, ctx)), status)
+  }
+  if (!upstream.body) return sendJson(response, streamFailure("Empty response from upstream"), 502)
 
   const reader = upstream.body.getReader()
   const client = watchClose(response, reader)
@@ -767,7 +801,7 @@ export async function respondJson(response, upstream, ctx) {
     response.status(upstream.status).json(result)
   } catch (error) {
     if (!(error instanceof ZenStreamError)) throw error
-    if (!client.closed && !response.destroyed) sendJson(response, rateLimitError(error.message), 429)
+    if (!client.closed && !response.destroyed) sendJson(response, streamFailure(error.message), 502)
   } finally {
     client.release()
   }
