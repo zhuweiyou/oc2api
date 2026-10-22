@@ -2,11 +2,7 @@
 
 OpenCode Free API 代理，使用一套 Express 业务逻辑，同时支持本地运行、Docker 和 Vercel 部署，并支持 SSE 流式响应。
 
-## 除了 OpenCode 想反代其它 AI ？
-
-[zhuweiyou/codearts2api](https://github.com/zhuweiyou/codearts2api) 把十几种 AI 账号或订阅统一汇聚成 OpenAI 兼容接口，支持多账号池、额度管理、自动选号和失败切换，可自建、可容器部署。
-
-已覆盖 workbuddy、codearts、trae、qoder、cline、opencode、minimax、gemini、智谱 AutoClaw、ModelScope、阿里 Accio 等。
+还想反代其它 AI？可以看 [codearts2api](https://github.com/zhuweiyou/codearts2api)：把十几种 AI 账号或订阅汇聚成 OpenAI 兼容接口。
 
 ```mermaid
 flowchart TD
