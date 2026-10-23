@@ -33,6 +33,9 @@ const ZEN_API_BASE_URL = normalizeZenBase(process.env.ZEN_API_BASE_URL || "https
 const ZEN_CHAT_URL = `${ZEN_API_BASE_URL}/chat/completions`
 const ZEN_MODELS_URL = `${ZEN_API_BASE_URL}/models`
 
+// 供诊断端点展示，避免部署后无法确认实际打到了哪个上游。
+export const zenBaseUrl = ZEN_API_BASE_URL
+
 // 对齐 App.useragent：opencode/<channel>/<version>/<client>。
 const ZEN_USER_AGENT = "opencode/latest/2.0.29/cli"
 

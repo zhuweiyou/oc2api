@@ -25,7 +25,7 @@ const TRAILING_USAGE_TIMEOUT_MS = 1000
 // 这个上限只是为了让"上游异常刷屏"时内存保持 O(1)。
 const MAX_PENDING_FRAMES = 8
 
-class ZenStreamError extends Error {
+export class ZenStreamError extends Error {
   constructor(message) {
     super(typeof message === "string" ? message : message?.message || "Upstream stream error")
     this.name = "ZenStreamError"
@@ -66,7 +66,7 @@ export function streamFailure(message) {
 }
 
 // 上游非 2xx 时把上游状态码原样映射给下游，不做归一。
-function upstreamStatus(upstream) {
+export function upstreamStatus(upstream) {
   const status = Number(upstream?.status)
   return Number.isInteger(status) && status >= 400 && status <= 599 ? status : 502
 }
@@ -113,7 +113,7 @@ function normalizeDelta(delta, thinkingEnabled) {
   return next
 }
 
-function normalizeChunk(chunk, model, thinkingEnabled) {
+export function normalizeChunk(chunk, model, thinkingEnabled) {
   if (!chunk || typeof chunk !== "object") return null
   const next = { ...chunk }
   delete next.cost
@@ -134,7 +134,7 @@ function normalizeChunk(chunk, model, thinkingEnabled) {
   return next
 }
 
-function hasContent(chunk) {
+export function hasContent(chunk) {
   if (!Array.isArray(chunk?.choices)) return false
   return chunk.choices.some((choice) => {
     const delta = choice?.delta
@@ -147,7 +147,7 @@ function hasContent(chunk) {
 
 // 流式侧就地改写 finish_reason：必须按 choice 追踪工具调用，否则 n>1 时
 // 某个带工具的 choice 会把纯文本 choice 的 stop 一起改写成 tool_calls。
-function rewriteFinishReason(chunk, toolCallChoiceIndexes) {
+export function rewriteFinishReason(chunk, toolCallChoiceIndexes) {
   for (const choice of chunk.choices ?? []) {
     if (!choice.finish_reason) continue
     const index = Number.isInteger(choice.index) ? choice.index : 0
@@ -157,14 +157,14 @@ function rewriteFinishReason(chunk, toolCallChoiceIndexes) {
 
 // 上游约 40% 的情况下把「带工具调用」的响应标成 finish_reason:"stop"（实测 big-pickle）。
 // opencode 官方对此会归一为 tool-calls，下游据此才会去执行工具而不是当作回答结束。
-function normalizeFinish(reason, toolCallCount) {
+export function normalizeFinish(reason, toolCallCount) {
   return reason === "stop" && toolCallCount > 0 ? "tool_calls" : reason
 }
 
 // 非流式聚合必须带上流式会透传、但聚合器未专门处理的 delta 字段，否则同一份
 // 上游响应在两种模式下结果不同。字符串增量拼接、对象递归合并——上游会把
 // function_call 的 name 与 arguments 拆在不同帧，直接覆盖会丢掉先到的字段。
-function mergePassthrough(state, delta) {
+export function mergePassthrough(state, delta) {
   for (const [key, value] of Object.entries(delta)) {
     if (key === "role" || key === "content" || key === "reasoning_content" || key === "tool_calls") continue
     if (value == null) continue
@@ -458,7 +458,7 @@ function watchClose(response, reader) {
 }
 
 // 上游错误响应的正文只用于诊断，必须有界读取，否则上游不结束时请求会挂着。
-async function readErrorBody(upstream, ctx) {
+export async function readErrorBody(upstream, ctx) {
   if (!upstream.body) return `Upstream returned HTTP ${upstream.status}`
   return readError(upstream.body.getReader(), ctx, upstream.status)
 }
@@ -493,12 +493,83 @@ async function readError(reader, ctx, status, initialText = "", decoder = new Te
 //   - 一个 choice 都没有（只回了 usage）→ 上游异常；
 //   - 有 choice 但没收到完成信号、且仍有 choice 缺 finish_reason → 截断；
 //   - 其余（[DONE] 或所有 choice 都 finish）→ 正常完成。
-function assertCompleted({ sawDone, choiceIndexes, finishedIndexes }) {
+export function assertCompleted({ sawDone, choiceIndexes, finishedIndexes }) {
   if (!choiceIndexes.size) throw new ZenStreamError("Empty response from upstream")
   const allFinished = [...choiceIndexes].every((index) => finishedIndexes.has(index))
   if (!sawDone && !allFinished) {
     throw new ZenStreamError("Incomplete response from upstream")
   }
+}
+
+// 把上游事件整理成「要写给下游的 SSE 载荷」序列。与传输无关：
+// Node 版写进 express 响应，Workers 版写进 ReadableStream，两边共用这一份。
+// 生产者负责补齐返回给客户端的收尾语义（[DONE]），错误以异常抛给消费者决定怎么收场。
+export async function* streamFrames(reader, ctx) {
+  let sawDone = false
+  // 尚未产出任何帧。首个正文之前压住少量无内容帧，上游随后报错时还能退回 JSON 错误。
+  let started = false
+  // 出现过的 choice index、已收尾的 choice index：完成判定必须按 choice 而非全局，
+  // 否则某个 choice 先 finish 会把其它 choice 后续的 finish 帧一并吞掉。
+  const sawChoiceIndexes = new Set()
+  const finishedChoiceIndexes = new Set()
+  // 出现过工具调用的 choice index 集合：finish_reason 归一只应作用于这些 choice。
+  const toolCallChoiceIndexes = new Set()
+  // 每个 choice 独立维护上游调用身份与下游 index，映射只在本次请求内存在。
+  const streamToolCalls = new Map()
+  // 上限保证内存恒定 O(1)：正常流量下只有 1~2 帧，
+  // 一旦上游异常刷屏就直接放行，不再为"保留错误响应"而无界攒内存。
+  const pending = []
+
+  for await (const chunk of readEvents(reader, ctx)) {
+    if (chunk === null) {
+      sawDone = true
+      continue
+    }
+    // 完成判定按 choice：n>1 时各 choice 可能分别在不同帧收尾，
+    // 用全局布尔会把后收尾的 choice 整个吞掉。
+    const normalized = normalizeChunk(chunk, ctx.model, ctx.thinkingEnabled)
+    if (!normalized) continue
+    // 已收尾的 choice（含 [DONE] 之后的所有 choice）不再接收正文：
+    // 上游补发的越界内容不能写进已结束的响应。
+    const usableChoices = (normalized.choices ?? []).filter((choice) => {
+      const index = Number.isInteger(choice.index) ? choice.index : 0
+      return !sawDone && !finishedChoiceIndexes.has(index)
+    })
+    const usable = { ...normalized, choices: usableChoices }
+    const hasChoices = usableChoices.length > 0
+    // 上游结尾的 {choices:[],cost} 之类空帧没有转发价值；
+    // 但带 usage 的帧即使没有可用 choice 也要转（补齐统计）。
+    if (!hasChoices && !usable.usage) continue
+    for (const choice of usableChoices) {
+      const index = Number.isInteger(choice.index) ? choice.index : 0
+      sawChoiceIndexes.add(index)
+      // 工具调用帧总在 finish 帧之前到达，所以这里能判断出该不该改写 finish_reason。
+      // 按 choice 追踪：n>1 时某个 choice 带工具，不代表其它 choice 也带。
+      if (choice.delta?.tool_calls?.length) {
+        toolCallChoiceIndexes.add(index)
+        if (!streamToolCalls.has(index)) {
+          streamToolCalls.set(index, { calls: newCallState(), indexes: new Set(), nextIndex: 0 })
+        }
+        choice.delta.tool_calls = normalizeStreamToolCalls(choice.delta.tool_calls, streamToolCalls.get(index))
+      }
+      if (choice.finish_reason) finishedChoiceIndexes.add(index)
+    }
+    rewriteFinishReason(usable, toolCallChoiceIndexes)
+
+    if (!hasContent(usable) && !started && pending.length < MAX_PENDING_FRAMES) {
+      pending.push(usable)
+      continue
+    }
+    // 首个正文或达到上限：先按序排空旧帧，再发新帧；一旦输出不再重新缓冲。
+    started = true
+    for (const buffered of pending.splice(0)) yield buffered
+    yield usable
+  }
+  // 与流式共用同一判定：无完成信号即截断，不能补 [DONE] 伪装成正常完成；
+  // 但"明确完成的空回答"算成功（对齐 opencode 官方）。
+  assertCompleted({ sawDone, choiceIndexes: sawChoiceIndexes, finishedIndexes: finishedChoiceIndexes })
+  for (const buffered of pending.splice(0)) yield buffered
+  yield "[DONE]"
 }
 
 export async function respondStream(response, upstream, ctx) {
@@ -511,19 +582,6 @@ export async function respondStream(response, upstream, ctx) {
   const reader = upstream.body.getReader()
   const client = watchClose(response, reader)
   let started = false
-  let sawDone = false
-  // 出现过的 choice index、已收尾的 choice index：完成判定必须按 choice 而非全局，
-  // 否则某个 choice 先 finish 会把其它 choice 后续的 finish 帧一并吞掉。
-  const sawChoiceIndexes = new Set()
-  const finishedChoiceIndexes = new Set()
-  // 出现过工具调用的 choice index 集合：finish_reason 归一只应作用于这些 choice。
-  const toolCallChoiceIndexes = new Set()
-  // 每个 choice 独立维护上游调用身份与下游 index，映射只在本次请求内存在。
-  const streamToolCalls = new Map()
-  // 首个正文之前先压住少量无内容帧（role / 空 delta / 纯 usage），这样上游随后报错
-  // 还能退回 JSON 错误。上限保证内存恒定 O(1)：正常流量下只有 1~2 帧，
-  // 一旦上游异常刷屏就直接放行，不再为"保留错误响应"而无界攒内存。
-  const pending = []
 
   // 首个有效事件之前不提交 SSE 头，这样还能退回普通 JSON 错误。
   const write = async (text) => {
@@ -550,58 +608,11 @@ export async function respondStream(response, upstream, ctx) {
   const send = (payload) => write(`data: ${typeof payload === "string" ? payload : JSON.stringify(payload)}\n\n`)
 
   try {
-    for await (const chunk of readEvents(reader, ctx)) {
+    for await (const payload of streamFrames(reader, ctx)) {
       if (client.closed) break
-      if (chunk === null) {
-        sawDone = true
-        continue
-      }
-      // 完成判定按 choice：n>1 时各 choice 可能分别在不同帧收尾，
-      // 用全局布尔会把后收尾的 choice 整个吞掉。
-      const normalized = normalizeChunk(chunk, ctx.model, ctx.thinkingEnabled)
-      if (!normalized) continue
-      // 已收尾的 choice（含 [DONE] 之后的所有 choice）不再接收正文：
-      // 上游补发的越界内容不能写进已结束的响应。
-      const usableChoices = (normalized.choices ?? []).filter((choice) => {
-        const index = Number.isInteger(choice.index) ? choice.index : 0
-        return !sawDone && !finishedChoiceIndexes.has(index)
-      })
-      const usable = { ...normalized, choices: usableChoices }
-      const hasChoices = usableChoices.length > 0
-      // 上游结尾的 {choices:[],cost} 之类空帧没有转发价值；
-      // 但带 usage 的帧即使没有可用 choice 也要转（补齐统计）。
-      if (!hasChoices && !usable.usage) continue
-      for (const choice of usableChoices) {
-        const index = Number.isInteger(choice.index) ? choice.index : 0
-        sawChoiceIndexes.add(index)
-        // 工具调用帧总在 finish 帧之前到达，所以这里能判断出该不该改写 finish_reason。
-        // 按 choice 追踪：n>1 时某个 choice 带工具，不代表其它 choice 也带。
-        if (choice.delta?.tool_calls?.length) {
-          toolCallChoiceIndexes.add(index)
-          if (!streamToolCalls.has(index)) {
-            streamToolCalls.set(index, { calls: newCallState(), indexes: new Set(), nextIndex: 0 })
-          }
-          choice.delta.tool_calls = normalizeStreamToolCalls(choice.delta.tool_calls, streamToolCalls.get(index))
-        }
-        if (choice.finish_reason) finishedChoiceIndexes.add(index)
-      }
-      rewriteFinishReason(usable, toolCallChoiceIndexes)
-
-      if (!hasContent(usable) && !started && pending.length < MAX_PENDING_FRAMES) {
-        pending.push(usable)
-        continue
-      }
-      // 首个正文或达到上限：先按序排空旧帧，再写新帧；一旦输出不再重新缓冲。
-      for (const buffered of pending.splice(0)) await send(buffered)
-      await send(usable)
-      if (client.closed) break
+      await send(payload)
     }
     if (client.closed) return
-    // 与流式共用同一判定：无完成信号即截断，不能补 [DONE] 伪装成正常完成；
-    // 但"明确完成的空回答"算成功（对齐 opencode 官方）。
-    assertCompleted({ sawDone, choiceIndexes: sawChoiceIndexes, finishedIndexes: finishedChoiceIndexes })
-    for (const buffered of pending.splice(0)) await send(buffered)
-    await send("[DONE]")
   } catch (error) {
     if (!(error instanceof ZenStreamError)) throw error
     if (client.closed || response.destroyed) return
@@ -618,7 +629,7 @@ export async function respondStream(response, upstream, ctx) {
 // 下游 index 一旦发出就不能变；后到的真实 index 只用于定位同一个 target。
 // 标准 indexed 流保留原值；若它与已发出的自动 index 碰撞，则分配空闲值，
 // 后续片段始终沿用 target.streamIndex，不能把两个调用交给客户端并到一处。
-function normalizeStreamToolCalls(calls, state) {
+export function normalizeStreamToolCalls(calls, state) {
   return calls.map((call) => {
     const target = toolCallTarget(state.calls, call)
     if (typeof call.id === "string" && call.id) {
@@ -642,7 +653,7 @@ function normalizeStreamToolCalls(calls, state) {
 //   - 不带 index 且带新 id / 函数名：新建槽位；
 //   - 不带 index 且只有 arguments（参数续传）：并入当前正在累积的调用。
 // 自动槽位用 "auto:N" 这类字符串键，避免与上游真正的数字 index 撞键。
-function toolCallTarget(state, call) {
+export function toolCallTarget(state, call) {
   const identified = state.callsById.get(call.id)
   if (Number.isInteger(call.index)) {
     let target = state.calls.get(call.index)
@@ -688,7 +699,7 @@ function newToolCall(state) {
   return { id: "", name: "", arguments: "", order: state.nextOrder++, slot: null }
 }
 
-function orderedToolCalls(state) {
+export function orderedToolCalls(state) {
   const entries = [...state.calls.entries()]
   // 标准 indexed 流按 index 还原顺序（与 main 一致）；混合无 index 流才保留到达顺序。
   if (entries.every(([index]) => Number.isInteger(index))) entries.sort(([a], [b]) => a - b)
@@ -696,7 +707,7 @@ function orderedToolCalls(state) {
   return entries.map(([, call]) => call)
 }
 
-function newCallState() {
+export function newCallState() {
   return {
     role: "assistant",
     content: "",
@@ -720,83 +731,9 @@ export async function respondJson(response, upstream, ctx) {
 
   const reader = upstream.body.getReader()
   const client = watchClose(response, reader)
-  const choices = new Map()
-  let id = ""
-  let created
-  let usage
-  let sawDone = false
-
   try {
-    for await (const chunk of readEvents(reader, ctx)) {
-      if (client.closed) return
-      if (chunk === null) {
-        sawDone = true
-        continue
-      }
-      // 完成信号之后只吸收 usage；判定按 choice，避免某个 choice 先收尾
-      // 就把其它 choice 后续的 finish_reason 丢掉（会被下面的 ?? "stop" 掩盖）。
-      const normalized = normalizeChunk(chunk, ctx.model, ctx.thinkingEnabled)
-      if (!normalized) continue
-
-      if (!id && typeof normalized.id === "string") id = normalized.id
-      if (created == null) created = normalized.created
-      if (normalized.usage) usage = normalized.usage
-
-      for (const choice of normalized.choices ?? []) {
-        const index = Number.isInteger(choice.index) ? choice.index : 0
-        // 已收尾的 choice：后续越界帧（例如 [DONE] 之后补发的正文）不再并进结果。
-        if (sawDone || choices.get(index)?.finish) continue
-        if (!choices.has(index)) choices.set(index, newCallState())
-        const state = choices.get(index)
-        const delta = choice.delta ?? {}
-        if (typeof delta.role === "string" && delta.role) state.role = delta.role
-        if (typeof delta.content === "string") state.content += delta.content
-        if (typeof delta.reasoning_content === "string") state.reasoning += delta.reasoning_content
-        // 非流式必须把流式会透传的东西也带上，否则同一次上游调用在两种模式下结果不同。
-        mergePassthrough(state, delta)
-        for (const call of delta.tool_calls ?? []) {
-          const target = toolCallTarget(state, call)
-          if (typeof call.id === "string" && call.id) {
-            target.id = call.id
-            state.callsById.set(call.id, target)
-          }
-          if (typeof call.function?.name === "string" && call.function.name) target.name = call.function.name
-          if (typeof call.function?.arguments === "string") target.arguments += call.function.arguments
-        }
-        if (typeof choice.finish_reason === "string" && choice.finish_reason) state.finish = choice.finish_reason
-      }
-    }
+    const result = await aggregateChunks(reader, ctx, () => client.closed)
     if (client.closed) return
-    // 与流式共用同一判定，避免同输入在两种模式下结论相反。
-    assertCompleted({
-      sawDone,
-      choiceIndexes: new Set(choices.keys()),
-      finishedIndexes: new Set([...choices.entries()].filter(([, state]) => state.finish).map(([index]) => index)),
-    })
-
-    const result = {
-      id: id || ctx.requestId,
-      object: "chat.completion",
-      created: created ?? Math.floor(Date.now() / 1000),
-      model: ctx.model,
-      choices: [...choices.entries()]
-        .sort(([a], [b]) => a - b)
-        .map(([index, state]) => {
-          const message = { role: state.role, content: state.content || null }
-          if (state.reasoning) message.reasoning_content = state.reasoning
-          if (state.calls.size) {
-            message.tool_calls = orderedToolCalls(state).map((call) => ({
-              id: call.id,
-              type: "function",
-              function: { name: call.name, arguments: call.arguments },
-            }))
-          }
-          // 流式会把未知字段原样透传，非流式也必须带上，否则两种模式结果不同。
-          Object.assign(message, state.extra)
-          return { index, message, finish_reason: normalizeFinish(state.finish ?? "stop", state.calls.size) }
-        }),
-    }
-    if (usage) result.usage = usage
     response.setHeader("x-request-id", ctx.requestId)
     response.status(upstream.status).json(result)
   } catch (error) {
@@ -805,4 +742,85 @@ export async function respondJson(response, upstream, ctx) {
   } finally {
     client.release()
   }
+}
+
+// 把上游事件聚合成一个 chat.completion 对象。与传输无关，Node 与 Workers 共用。
+// isClosed 是可选的下游断开检查：断开后不再继续吸收上游。
+export async function aggregateChunks(reader, ctx, isClosed = () => false) {
+  const choices = new Map()
+  let id = ""
+  let created
+  let usage
+  let sawDone = false
+
+  for await (const chunk of readEvents(reader, ctx)) {
+    if (isClosed()) return null
+    if (chunk === null) {
+      sawDone = true
+      continue
+    }
+    // 完成信号之后只吸收 usage；判定按 choice，避免某个 choice 先收尾
+    // 就把其它 choice 后续的 finish_reason 丢掉（会被下面的 ?? "stop" 掩盖）。
+    const normalized = normalizeChunk(chunk, ctx.model, ctx.thinkingEnabled)
+    if (!normalized) continue
+
+    if (!id && typeof normalized.id === "string") id = normalized.id
+    if (created == null) created = normalized.created
+    if (normalized.usage) usage = normalized.usage
+
+    for (const choice of normalized.choices ?? []) {
+      const index = Number.isInteger(choice.index) ? choice.index : 0
+      // 已收尾的 choice：后续越界帧（例如 [DONE] 之后补发的正文）不再并进结果。
+      if (sawDone || choices.get(index)?.finish) continue
+      if (!choices.has(index)) choices.set(index, newCallState())
+      const state = choices.get(index)
+      const delta = choice.delta ?? {}
+      if (typeof delta.role === "string" && delta.role) state.role = delta.role
+      if (typeof delta.content === "string") state.content += delta.content
+      if (typeof delta.reasoning_content === "string") state.reasoning += delta.reasoning_content
+      // 非流式必须把流式会透传的东西也带上，否则同一次上游调用在两种模式下结果不同。
+      mergePassthrough(state, delta)
+      for (const call of delta.tool_calls ?? []) {
+        const target = toolCallTarget(state, call)
+        if (typeof call.id === "string" && call.id) {
+          target.id = call.id
+          state.callsById.set(call.id, target)
+        }
+        if (typeof call.function?.name === "string" && call.function.name) target.name = call.function.name
+        if (typeof call.function?.arguments === "string") target.arguments += call.function.arguments
+      }
+      if (typeof choice.finish_reason === "string" && choice.finish_reason) state.finish = choice.finish_reason
+    }
+  }
+  // 与流式共用同一判定，避免同输入在两种模式下结论相反。
+  assertCompleted({
+    sawDone,
+    choiceIndexes: new Set(choices.keys()),
+    finishedIndexes: new Set([...choices.entries()].filter(([, state]) => state.finish).map(([index]) => index)),
+  })
+
+  const result = {
+    id: id || ctx.requestId,
+    object: "chat.completion",
+    created: created ?? Math.floor(Date.now() / 1000),
+    model: ctx.model,
+    choices: [...choices.entries()]
+      .sort(([a], [b]) => a - b)
+      .map(([index, state]) => {
+        const message = { role: state.role, content: state.content || null }
+        if (state.reasoning) message.reasoning_content = state.reasoning
+        if (state.calls.size) {
+          message.tool_calls = orderedToolCalls(state).map((call) => ({
+            id: call.id,
+            type: "function",
+            function: { name: call.name, arguments: call.arguments },
+          }))
+        }
+        // 流式会把未知字段原样透传，非流式也必须带上，否则两种模式结果不同。
+        Object.assign(message, state.extra)
+        return { index, message, finish_reason: normalizeFinish(state.finish ?? "stop", state.calls.size) }
+      }),
+  }
+  if (usage) result.usage = usage
+  return result
 }

@@ -1,6 +1,6 @@
 # oc2api
 
-OpenCode Free API 代理，使用一套 Express 业务逻辑，同时支持本地运行、Docker 和 Vercel 部署，并支持 SSE 流式响应。
+OpenCode Free API 代理，一套业务逻辑同时支持 Cloudflare Workers、本地运行、Docker 和 Vercel 部署，并支持 SSE 流式响应。
 
 还想反代其它 AI？可以看 [codearts2api](https://github.com/zhuweiyou/codearts2api)：把十几种 AI 账号或订阅汇聚成 OpenAI 兼容接口。
 
@@ -22,13 +22,46 @@ flowchart TD
     c --> zen
 ```
 
-## Vercel 部署
+## 部署方式
 
-### 一键部署
+四种方式共用同一套 `server/` 业务逻辑，接口、鉴权、会话与错误语义完全一致，按出口可用性排序。
+
+<details open>
+<summary><b>1. Cloudflare Workers（推荐）</b> — 边缘运行，出口 IP 目前最容易跑通</summary>
+
+<br>
+
+`worker/` 只放 Workers 原生入口与 Web Streams 适配，业务逻辑仍然全部来自 `server/`。
+
+选择它的原因：免费模型的额度按出口 IP 计量。Vercel 的 AWS 出口段实测长期处于限流状态（对话返回 `429 rate_limit_error`，而 `/v1/models` 正常），Cloudflare 边缘出口目前更容易跑通。两边都不保证额度，可按 `/ip` 自行核对。
+
+```bash
+npm i -g wrangler@latest
+wrangler login
+
+cd worker                     # 必须先进入 worker/ 目录再执行
+wrangler deploy               # 得到 https://oc2api.<子域>.workers.dev
+wrangler secret put API_KEY   # 可选，留空则匿名访问
+```
+
+**注意必须在 `worker/` 目录里执行 `wrangler deploy`**：`worker/src/index.js` 通过 `../../server/*.js` 引用外层代码，wrangler 会用 esbuild 在构建期把这些文件打包成单个脚本再上传（实测 46 KB / gzip 13 KB）。只把 `worker/` 单独拷出去部署会因找不到外层文件而构建失败。
+
+`API_KEY`、`DEBUG`、`ZEN_API_BASE_URL`、`ZEN_CONNECT_TIMEOUT_MS` 与本地版含义相同。
+
+📖 完整说明（本地调试、校验命令、CPU 限制）：**[worker/README.md](worker/README.md)**
+
+</details>
+
+<details>
+<summary><b>2. Vercel</b> — 一条命令部署，但出口 IP 常被上游限流</summary>
+
+<br>
+
+**一键部署：**
 
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fzhuweiyou%2Foc2api&env=API_KEY%2CDEBUG&envDefaults=%7B%22API_KEY%22%3A%22sk-zhu%22%2C%22DEBUG%22%3A%22true%22%7D&envDescription=API_KEY%EF%BC%9AAPI%20%E5%AF%86%E9%92%A5%EF%BC%88%E7%95%99%E7%A9%BA%E5%88%99%E5%8C%BF%E5%90%8D%E8%AE%BF%E9%97%AE%EF%BC%89%EF%BC%9BDEBUG%EF%BC%9A%E8%AE%BE%E4%B8%BA%20true%20%E5%BC%80%E5%90%AF%E8%B0%83%E8%AF%95%E6%97%A5%E5%BF%97&envLink=https%3A%2F%2Fgithub.com%2Fzhuweiyou%2Foc2api%23vercel-%E9%83%A8%E7%BD%B2)
 
-### 手动部署
+**手动部署：**
 
 1. Fork 本仓库到你的 GitHub
 2. 打开 [Vercel Dashboard](https://vercel.com)，点击 **Add New > Project**
@@ -40,9 +73,37 @@ flowchart TD
 
 部署完成后会得到一个 `https://<项目名>.vercel.app` 的域名。
 
-你可以 Fork 后部署多个 Vercel Project，在 [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)、[Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api)、[QuantumNous/new-api](https://github.com/QuantumNous/new-api) 等聚合网关中配置多个域名，实现轮询、负载分摊。多个项目不保证出口 IP 不同，需通过各实例的 `/ip` 核对；独立出口取决于实际部署。
+你也可以 Fork 后部署多个 Vercel Project，在 [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)、[Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api)、[QuantumNous/new-api](https://github.com/QuantumNous/new-api) 等聚合网关中配置多个域名，实现轮询、负载分摊。多个项目不保证出口 IP 不同，需通过各实例的 `/ip` 核对；独立出口取决于实际部署。
 
-## 本地运行
+</details>
+
+<details>
+<summary><b>3. Docker（云函数 / 容器平台）</b> — 阿里云、腾讯云等支持自定义容器的环境</summary>
+
+<br>
+
+适用于云函数与容器平台：把镜像推上去，平台把 HTTP 请求转发到容器监听的端口即可。阿里云函数计算、腾讯云云函数、以及其它支持自定义容器的环境都适用，出口 IP 由平台分配。
+
+镜像定义与编排文件统一放在 `docker/` 目录下（根目录不放 Dockerfile，避免 Vercel 把项目误判为容器项目）：
+
+```bash
+cd docker && docker compose up -d --build
+```
+
+容器内执行 `node server/index.js`，监听 `PORT`（默认 `8080`），所以把平台的监听端口配成 8080 即可。在云函数环境里建议注意：
+
+- **超时时间**调到 300 秒，否则长回答的流式响应会被平台提前截断
+- 平台层做鉴权，或继续用本项目的 `API_KEY`
+- 保留至少 1 个常驻实例，避免冷启动打断进行中的 SSE 连接
+
+**多地域分流**：同一种云函数可以在不同地域各建一个实例，出口 IP 通常互不相同。把这些地址一起填进 [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)、[Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api)、[QuantumNous/new-api](https://github.com/QuantumNous/new-api) 等聚合网关做轮询或填充，就能把免费额度摊到多个出口 IP 上，绕开单个 IP 被限流（对应顶部架构图里的 A/B/C 实例）。是否真的独立，用每个实例的 `/ip` 核对——同一地域的实例可能共用出口。
+
+</details>
+
+<details>
+<summary><b>4. 本地运行（Node）</b> — 调试与临时使用</summary>
+
+<br>
 
 要求 Node.js 24 或更高版本。
 
@@ -74,13 +135,7 @@ ZEN_API_BASE_URL=http://127.0.0.1:2082/v1 ZEN_CONNECT_TIMEOUT_MS=300000 npm star
 curl http://localhost:8080/health
 ```
 
-## Docker 部署
-
-镜像定义与编排文件统一放在 `docker/` 目录下（根目录不放 Dockerfile，避免 Vercel 把项目误判为容器项目）：
-
-```bash
-cd docker && docker compose up -d --build
-```
+</details>
 
 ## API
 

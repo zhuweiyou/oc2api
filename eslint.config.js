@@ -4,7 +4,7 @@ import globals from "globals"
 
 export default [
   {
-    ignores: ["node_modules/", ".vercel/", ".git/", "dist/"],
+    ignores: ["node_modules/", ".vercel/", ".git/", "dist/", "worker/dist/"],
   },
   js.configs.recommended,
   {

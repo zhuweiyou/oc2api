@@ -10,3 +10,5 @@ oc2api
 coverage/
 .vercel
 .env*
+
+worker/dist/
