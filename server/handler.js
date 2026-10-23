@@ -6,9 +6,9 @@ import {
   areToolsDisabled,
   buildUpstreamRequest,
   fetchUpstream,
-  getSession,
   isAllowedModelId,
   listModels,
+  sessionFor,
 } from "./zen.js"
 import { respondJson, respondStream } from "./openai.js"
 
@@ -103,7 +103,9 @@ export async function chat(request, response) {
     messages: input.messages.length,
   })
 
-  const sessionId = getSession(request.auth.user)
+  // 会话按「使用者 + 这段对话」复用：同一段对话的每轮共享上游 prompt 缓存，
+  // 两段并行对话不会互相顶掉。调用方自己给了合法 session id 时原样沿用。
+  const sessionId = sessionFor(request.auth.user, request, input)
   const upstreamRequest = buildUpstreamRequest(input, sessionId)
   logZenRequest(requestId, "openai", input.model, stream, request.auth.user, upstreamRequest, input.messages.length)
 

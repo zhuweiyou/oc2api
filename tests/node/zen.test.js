@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 
 import { areToolsDisabled, buildUpstreamRequest, gateTool, isAllowedModelId, getSession } from "../../server/zen.js"
+import { isRealSessionId, normalizeZenBase, sessionFor, sessionId, sessionSeed } from "../../server/zen.js"
 
 test("免费层必要条件：UA、session、门禁工具、强制流式", () => {
   const request = buildUpstreamRequest({ model: "big-pickle", messages: [{ role: "user", content: "hi" }] }, "ses_test")
@@ -381,4 +382,77 @@ test("buildUpstreamRequest 不修改用户工具、消息或参数原对象", ()
   assert.equal(body.tools.length, 2)
   assert.equal(body.max_tokens, 0)
   assert.deepEqual(body.messages, payload.messages)
+})
+
+test("上游基地址归一：旧 /zen 写法改写到 /inference，其它原样保留", () => {
+  const cases = [
+    ["https://opencode.ai/zen/v1", "https://opencode.ai/inference/v1"],
+    ["https://opencode.ai/zen", "https://opencode.ai/inference"],
+    ["https://opencode.ai/zen/openai/v1", "https://opencode.ai/inference/openai/v1"],
+    ["https://opencode.ai/inference/v1", "https://opencode.ai/inference/v1"],
+    ["https://opencode.ai/inference/v1/", "https://opencode.ai/inference/v1"],
+    ["https://opencode.ai/zen/go/v1", "https://opencode.ai/zen/go/v1"],
+    ["http://127.0.0.1:2082/v1", "http://127.0.0.1:2082/v1"],
+    ["https://relay.example.com/zen/v1", "https://relay.example.com/zen/v1"],
+    ["not-a-url", "not-a-url"],
+    ["", ""],
+  ]
+  for (const [input, expected] of cases) assert.equal(normalizeZenBase(input), expected, input)
+})
+
+test("session id 的低 12 位是取反后的小序号，同一毫秒内也不越界", () => {
+  const now = Date.now()
+  const ids = new Set()
+  for (let index = 0; index < 64; index += 1) {
+    const id = sessionId(now)
+    ids.add(id)
+    assert.ok(isRealSessionId(id), `生成的 id 必须被上游认可：${id}`)
+    const low = Number.parseInt(id.slice(13, 16), 16)
+    assert.ok(0xfff - low < 16, `低 12 位越界：${id}`)
+  }
+  assert.equal(ids.size, 64, "同一毫秒内产生的 id 不能重复")
+})
+
+test("isRealSessionId 只认 OpenCode 可能生成的形状", () => {
+  assert.equal(isRealSessionId(sessionId()), true)
+  assert.equal(isRealSessionId("ses_0123456789ab0123456789ABCD"), false, "低 12 位不是小序号")
+  assert.equal(isRealSessionId("ses_abc"), false)
+  assert.equal(isRealSessionId("hash_0123456789ab0123456789AB"), false)
+  assert.equal(isRealSessionId(""), false)
+  assert.equal(isRealSessionId(null), false)
+})
+
+test("会话 seed 按优先级取：客户端 id > 会话头 > prompt_cache_key > 首条 user 消息", () => {
+  const own = sessionId()
+  assert.equal(sessionSeed({ headers: { "x-opencode-session": own } }, {}), own)
+  assert.equal(
+    sessionSeed({ headers: { "x-opencode-session": "not-valid", "x-session-affinity": "conv-1" } }, {}),
+    "header:conv-1",
+  )
+  assert.equal(sessionSeed({ headers: {} }, { prompt_cache_key: "thread-1" }), "cache:thread-1")
+
+  const first = sessionSeed({ headers: {} }, { messages: [{ role: "user", content: "hi" }] })
+  const again = sessionSeed({ headers: {} }, { messages: [{ role: "user", content: "hi" }] })
+  const other = sessionSeed({ headers: {} }, { messages: [{ role: "user", content: "hello" }] })
+  assert.match(first, /^first:[0-9a-f]{64}$/)
+  assert.equal(first, again, "同一段对话的首句必须得到同一个 seed")
+  assert.notEqual(first, other)
+  assert.equal(sessionSeed({ headers: {} }, { messages: [] }), "")
+})
+
+test("会话按对话隔离：同一对话复用，不同对话与不同使用者互不共用", () => {
+  const conversation = { messages: [{ role: "user", content: "同一段对话" }] }
+  const headers = {}
+  const a1 = sessionFor("user-default", { headers }, conversation)
+  const a2 = sessionFor("user-default", { headers }, conversation)
+  assert.equal(a1, a2, "同一段对话的下一轮必须复用同一 session")
+
+  const b = sessionFor("user-default", { headers }, { messages: [{ role: "user", content: "另一段对话" }] })
+  assert.notEqual(b, a1, "并行对话不能共用 session")
+
+  const c = sessionFor("user-other", { headers }, conversation)
+  assert.notEqual(c, a1, "不同使用者不能共用上游缓存")
+
+  const mine = sessionId()
+  assert.equal(sessionFor("user-default", { headers: { "x-opencode-session": mine } }, conversation), mine)
 })

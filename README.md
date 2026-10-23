@@ -63,8 +63,10 @@ API_KEY=your-key DEBUG=true PORT=8080 npm start
 ZEN_API_BASE_URL=http://127.0.0.1:2082/v1 ZEN_CONNECT_TIMEOUT_MS=300000 npm start
 ```
 
-- `ZEN_API_BASE_URL`：上游地址，默认 `https://opencode.ai/inference/v1`
+- `ZEN_API_BASE_URL`：上游地址，默认 `https://opencode.ai/inference/v1`。免费层只认 `inference` 路径，所以填 `https://opencode.ai/zen/v1` 这类旧写法会被自动改写到 `/inference/v1`；其它主机（例如自建中继）原样使用
 - `ZEN_CONNECT_TIMEOUT_MS`：收到响应头前的等待时间，默认 60000 毫秒，允许 1–600000；使用中继重试时应设置为大于其恢复窗口
+
+同一段对话的每一轮会复用同一个上游 session，从而命中它的 prompt 缓存；换一段对话或换一个调用方则各自独立。调用方自己带的 `x-opencode-session` 会被沿用，也可以用 `x-session-affinity`、`X-Session-Id`、`conversation-id` 或请求体的 `prompt_cache_key` 指定会话。
 
 健康检查：
 

@@ -3,10 +3,33 @@
 //   - 免费层要求内置 read 工具（名字与参数 schema），只带 read 即可放行，缺 read 一律 403；
 //   - 显式 tool_choice:none 也会被 403，改用保留工具描述并在响应层禁止工具调用。
 // 不注入 OpenCode 系统提示词；客户端工具名双向映射，消息正文和业务参数保持不变。
+import { createHash } from "node:crypto"
+
 import { debugLog } from "./log.js"
 
+// 免费层只在 inference 路径放行：/zen/v1 即便请求本身完全合规也回 403 FreeTier。
+// 所以 ZEN_API_BASE_URL 允许沿用旧写法（/zen、/zen/v1、/zen/openai/v1），
+// 落到 opencode.ai 时统一改写到 /inference 的同名子路径；自建中继等其它主机原样保留。
+export function normalizeZenBase(raw) {
+  const base = String(raw || "")
+    .trim()
+    .replace(/\/+$/, "")
+  let url
+  try {
+    url = new URL(base)
+  } catch {
+    return base
+  }
+  if (url.hostname !== "opencode.ai" && !url.hostname.endsWith(".opencode.ai")) return base
+  const rest = url.pathname.replace(/^\/zen(?=\/|$)/, "")
+  // /zen/go 是付费 Go 网关，和免费层无关，不改写。
+  if (rest === url.pathname || rest === "/go" || rest.startsWith("/go/")) return base
+  url.pathname = `/inference${rest}`
+  return url.toString().replace(/\/+$/, "")
+}
+
 // A local relay can recover rejected requests before the adapter sees them.
-const ZEN_API_BASE_URL = (process.env.ZEN_API_BASE_URL || "https://opencode.ai/inference/v1").replace(/\/+$/, "")
+const ZEN_API_BASE_URL = normalizeZenBase(process.env.ZEN_API_BASE_URL || "https://opencode.ai/inference/v1")
 const ZEN_CHAT_URL = `${ZEN_API_BASE_URL}/chat/completions`
 const ZEN_MODELS_URL = `${ZEN_API_BASE_URL}/models`
 
@@ -252,18 +275,36 @@ export async function listModels() {
   }
 }
 
-// 上游按 x-opencode-session 归并会话；同一使用者复用同一个 session 直到过期。
+// 上游按 x-opencode-session 归并会话：同一个 id 的回合会落到同一台后端，
+// 它的 prompt cache 也只按这个 id 命中。所以会话粒度必须是「一段对话」而不是
+// 「一个使用者」——否则并行开的两段对话会互相抢同一份缓存，其中一段还会一直
+// 命中别人写进去的前缀。这里沿用 OpenCode 自己的做法：一个 seed 对应一个 id，
+// 直到空闲 30 分钟。
 const SESSION_TTL_MS = 30 * 60 * 1000
-const userSessions = new Map()
+// 同时记住的对话数：OpenCode 自己保留最近 1000 段；超出后丢最久未用的。
+const SESSION_CACHE_LIMIT = 1000
+const sessions = new Map()
 
 // session 头必须符合 OpenCode 的 ID 格式，否则上游一律 403 FreeTier：
 // `ses_` + 12 位十六进制 + 14 位 base62（共 30 字符）。首 12 位不是任意十六进制，
-// 必须是 descending() 的 `~(timestamp * 0x1000 + counter)` 高 48 位，上游会据此校验。
+// 而是 descending() 的 `~(timestamp * 0x1000 + counter)` 低 48 位：时间戳占高位，
+// 低 12 位是取反后的同一毫秒内序号，上游会据此校验（序号过大同样 403）。
 const ID_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+const SESSION_ID_PATTERN = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/
+// 同一个毫秒内允许创建的 id 数；取反后低 12 位必须落在 [0xFF0, 0xFFF]。
+const MAX_PER_MILLISECOND = 16
+
+let lastMillisecond = 0
+let counterInMillisecond = 0
 
 export function sessionId(timestamp = Date.now()) {
+  if (timestamp !== lastMillisecond) {
+    lastMillisecond = timestamp
+    counterInMillisecond = 0
+  }
+  const counter = counterInMillisecond++ % MAX_PER_MILLISECOND
   // 与上游 descending() 一致：value = ~(timestamp * 0x1000 + counter) 取低 48 位十六进制。
-  const value = ~(BigInt(timestamp) * 0x1000n + 1n)
+  const value = ~(BigInt(timestamp) * 0x1000n + BigInt(counter))
   let time = ""
   for (let index = 0; index < 6; index += 1) {
     time += Number((value >> BigInt(40 - 8 * index)) & 0xffn)
@@ -275,14 +316,85 @@ export function sessionId(timestamp = Date.now()) {
   return "ses_" + time + [...bytes].map((byte) => ID_CHARS[byte % 62]).join("")
 }
 
-export function getSession(user) {
+// 判断一个 id 是不是 OpenCode 真的可能生成出来的：形状对，且低 12 位是取反后
+// 的小序号。客户端塞进来的哈希截断或随便拼的字符串都会被上游 403。
+export function isRealSessionId(id) {
+  if (typeof id !== "string" || !SESSION_ID_PATTERN.test(id)) return false
+  const low = Number.parseInt(id.slice(13, 16), 16)
+  return Number.isInteger(low) && 0xfff - low < MAX_PER_MILLISECOND
+}
+
+// 一段对话的 seed。优先级从「调用方明确指定」到「从内容推断」：
+//   1. 客户端自己带的合法 x-opencode-session —— OpenCode / Claude Code 等会带；
+//   2. 调用方给的会话标识头（x-session-affinity、X-Session-Id、conversation-id）；
+//   3. body 的 prompt_cache_key（Codex 的 thread）；
+//   4. 首条 user 消息的哈希 —— 多轮对话里它比末条稳定。
+// 同一次对话的每一轮得到同一个 seed，两段对话不会因为首句相同而合并（见跨用户隔离）。
+export function sessionSeed(request, payload) {
+  const header = (name) => {
+    const value = request?.headers?.[name]
+    return typeof value === "string" ? value.trim() : ""
+  }
+
+  for (const name of ["x-opencode-session", "x-opencode-session-id"]) {
+    const value = header(name)
+    if (isRealSessionId(value)) return value
+  }
+  for (const name of ["x-session-affinity", "x-session-id", "conversation-id"]) {
+    const value = header(name)
+    if (value) return `header:${value.slice(0, 200)}`
+  }
+
+  const cacheKey = payload?.prompt_cache_key
+  if (typeof cacheKey === "string" && cacheKey.trim()) return `cache:${cacheKey.trim().slice(0, 200)}`
+
+  const messages = Array.isArray(payload?.messages) ? payload.messages : []
+  const firstUser = messages.find((message) => message?.role === "user")
+  const text = contentText(firstUser?.content)
+  if (text) return `first:${createHash("sha256").update(text).digest("hex")}`
+  return ""
+}
+
+function contentText(content) {
+  if (typeof content === "string") return content
+  if (!Array.isArray(content)) return ""
+  return content
+    .map((part) => (typeof part?.text === "string" ? part.text : ""))
+    .join("")
+    .trim()
+}
+
+// seed 已经是一个合法 id 时直接沿用（调用方指定的会话不能被我们改掉）。
+export function getSession(seed) {
+  if (isRealSessionId(seed)) return seed
+
   const now = Date.now()
-  const existing = userSessions.get(user)
-  if (existing && now - existing.at < SESSION_TTL_MS) {
+  const existing = sessions.get(seed)
+  if (existing) {
+    // 重新插入一次，让 Map 的迭代顺序成为最近使用顺序。
+    sessions.delete(seed)
+    if (now - existing.at >= SESSION_TTL_MS) return remember(seed, sessionId(now), now)
     existing.at = now
+    sessions.set(seed, existing)
     return existing.id
   }
-  const id = sessionId(now)
-  userSessions.set(user, { id, at: now })
+  return remember(seed, sessionId(now), now)
+}
+
+// 对外入口：按「使用者 + 这段对话」取 session。
+// 使用者要参与 seed，否则两个调用方首句相同就会共用同一份上游缓存；
+// seed 推不出来（没有消息、没有会话头）时退化成每个使用者一个 session。
+export function sessionFor(user, request, payload) {
+  const seed = sessionSeed(request, payload)
+  if (isRealSessionId(seed)) return seed
+  return getSession(`${user || "anonymous"}\x00${seed}`)
+}
+
+function remember(seed, id, at) {
+  sessions.set(seed, { id, at })
+  while (sessions.size > SESSION_CACHE_LIMIT) {
+    const oldest = sessions.keys().next().value
+    sessions.delete(oldest)
+  }
   return id
 }
