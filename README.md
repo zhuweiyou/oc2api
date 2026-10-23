@@ -22,6 +22,12 @@ flowchart TD
     c --> zen
 ```
 
+## 多地域分流
+
+免费模型的额度按出口 IP 计量。同一种部署可以在不同地域各建一个实例（对应上图里的 A/B/C），出口 IP 通常互不相同；把它们的地址一起填进 [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)、[Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api)、[QuantumNous/new-api](https://github.com/QuantumNous/new-api) 等聚合网关做轮询或填充，就能把免费额度摊到多个出口 IP 上，绕开单个 IP 被限流。
+
+是否真的独立，用每个实例的 `/ip` 核对——同一地域的实例可能共用出口。Vercel、Cloudflare Workers、云函数都可以这样叠加。
+
 ## 部署方式
 
 四种方式共用同一套 `server/` 业务逻辑，接口、鉴权、会话与错误语义完全一致，按出口可用性排序。
@@ -117,9 +123,7 @@ cd docker && docker compose up -d --build
 
 - **超时时间**调到 300 秒，否则长回答的流式响应会被平台提前截断
 - 平台层做鉴权，或继续用本项目的 `API_KEY`
-- 保留至少 1 个常驻实例，避免冷启动打断进行中的 SSE 连接
-
-**多地域分流**：同一种云函数可以在不同地域各建一个实例，出口 IP 通常互不相同。把这些地址一起填进 [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)、[Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api)、[QuantumNous/new-api](https://github.com/QuantumNous/new-api) 等聚合网关做轮询或填充，就能把免费额度摊到多个出口 IP 上，绕开单个 IP 被限流（对应顶部架构图里的 A/B/C 实例）。是否真的独立，用每个实例的 `/ip` 核对——同一地域的实例可能共用出口。
+- **实例数可以设为 0**（按请求扩缩）以节省资源：冷启动只发生在请求开始时，不会打断进行中的 SSE 连接
 
 </details>
 
