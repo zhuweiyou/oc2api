@@ -6,8 +6,6 @@ on:
   push:
     branches:
       - main
-      # TODO: 临时放开当前分支用于验证工作流，测试通过后删掉这一行。
-      - feat/opencode-v2-alignment
     tags:
       - "v*"
   workflow_dispatch:
