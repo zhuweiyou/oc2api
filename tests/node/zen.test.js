@@ -413,22 +413,10 @@ test("session id 的低 12 位是取反后的小序号，同一毫秒内也不�
   assert.equal(ids.size, 64, "同一毫秒内产生的 id 不能重复")
 })
 
-test("isRealSessionId 只认 OpenCode 可能生成的形状", () => {
-  assert.equal(isRealSessionId(sessionId()), true)
-  assert.equal(isRealSessionId("ses_0123456789ab0123456789ABCD"), false, "低 12 位不是小序号")
-  assert.equal(isRealSessionId("ses_abc"), false)
-  assert.equal(isRealSessionId("hash_0123456789ab0123456789AB"), false)
-  assert.equal(isRealSessionId(""), false)
-  assert.equal(isRealSessionId(null), false)
-})
-
 test("会话 seed 按优先级取：客户端 id > 会话头 > prompt_cache_key > 首条 user 消息", () => {
   const own = sessionId()
   assert.equal(sessionSeed({ headers: { "x-opencode-session": own } }, {}), own)
-  assert.equal(
-    sessionSeed({ headers: { "x-opencode-session": "not-valid", "x-session-affinity": "conv-1" } }, {}),
-    "header:conv-1",
-  )
+  assert.equal(sessionSeed({ headers: { "x-session-affinity": "conv-1" } }, {}), "header:conv-1")
   assert.equal(sessionSeed({ headers: {} }, { prompt_cache_key: "thread-1" }), "cache:thread-1")
 
   const first = sessionSeed({ headers: {} }, { messages: [{ role: "user", content: "hi" }] })

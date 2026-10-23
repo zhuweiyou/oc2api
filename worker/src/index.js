@@ -3,6 +3,7 @@
 // 与 server/app.js 的 Node 版共用同一套上游适配（server/zen.js）和响应语义
 // （server/openai.js + ./respond.js），这里只做 Workers 原生的路由、鉴权与请求体解析。
 import { config } from "../../server/config.js"
+import { logZenRequest } from "../../server/log.js"
 import {
   areToolsDisabled,
   buildUpstreamRequest,
@@ -147,6 +148,8 @@ async function chat(request, env, auth) {
 
   const sessionId = sessionFor(auth.user, request, input)
   const upstreamRequest = buildUpstreamRequest(input, sessionId)
+  // 与 Node 版 handler 保持一致：DEBUG=true 时输出上游请求摘要（含会话 id）。
+  logZenRequest(id, "openai", input.model, stream, auth.user, upstreamRequest, input.messages.length)
 
   let upstream
   try {
