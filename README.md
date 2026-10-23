@@ -2,8 +2,6 @@
 
 OpenCode Free API 代理，一套业务逻辑同时支持 Cloudflare Workers、本地运行、Docker 和 Vercel 部署，并支持 SSE 流式响应。
 
-还想反代其它 AI？可以看 [codearts2api](https://github.com/zhuweiyou/codearts2api)：把十几种 AI 账号或订阅汇聚成 OpenAI 兼容接口。
-
 ```mermaid
 flowchart TD
     client["客户端<br/>Claude Code / Codex / DSH 等"]
@@ -218,3 +216,5 @@ npm run format        # Prettier 自动格式化
 ```
 
 联调用例会对 `big-pickle`、`mimo-v2.6-flash-free`、`deepseek-v4.1-flash-free`、`glm-5.3-flash-free` 各跑一次多轮连续工具调用（含与内置同名的客户端 `read`），真实请求上游，受免费层限流影响；未设置 `OC2API_LIVE_TEST=1` 时自动跳过。因为依赖真实模型和上游配额，它不纳入 CI 门禁，需要时本地执行。
+
+还想反代其它 AI？可以看 [codearts2api](https://github.com/zhuweiyou/codearts2api)：把十几种 AI 账号或订阅汇聚成 OpenAI 兼容接口。
