@@ -32,7 +32,7 @@ flowchart TD
 
 四种方式共用同一套 `server/` 业务逻辑，接口、鉴权、会话与错误语义完全一致，按出口可用性排序。
 
-<details open>
+<details>
 <summary><b>1. Cloudflare Workers（推荐）</b> — 边缘运行，出口 IP 目前最容易跑通</summary>
 
 <br>
