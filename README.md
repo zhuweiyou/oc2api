@@ -84,6 +84,29 @@ wrangler secret put API_KEY   # 可选，留空则匿名访问
 
 适用于云函数与容器平台：把镜像推上去，平台把 HTTP 请求转发到容器监听的端口即可。阿里云函数计算、腾讯云云函数、以及其它支持自定义容器的环境都适用，出口 IP 由平台分配。
 
+**直接拉取预构建镜像**
+
+`Publish image` 工作流在推送到 `main` 或推 `v*` 标签时自动构建 `linux/amd64` 与 `linux/arm64` 镜像，发布到 [`ghcr.io/zhuweiyou/oc2api`](https://github.com/zhuweiyou/oc2api/pkgs/container/oc2api)：
+
+```bash
+docker pull ghcr.io/zhuweiyou/oc2api:latest
+
+docker run -d --name oc2api --restart unless-stopped \
+  -p 8080:8080 \
+  -e API_KEY=your-key \
+  ghcr.io/zhuweiyou/oc2api:latest
+```
+
+| 触发方式               | 镜像标签                                                       |
+| ---------------------- | -------------------------------------------------------------- |
+| 推送到 `main`          | `latest`、`sha-<完整提交 SHA>`                                 |
+| 推送版本标签 `v2.10.0` | `2.10.0`、`2.10`、`sha-<完整提交 SHA>`（`latest` 只跟 `main`） |
+| Actions 页手动运行     | 当前分支或标签的 `sha-<完整提交 SHA>`                          |
+
+发布使用内置 `GITHUB_TOKEN`，不需要额外 Secret。首次发布后如需匿名拉取，在 **Packages → 镜像包 → Package settings** 把可见性设为 **Public**。
+
+**本地构建**
+
 镜像定义与编排文件统一放在 `docker/` 目录下（根目录不放 Dockerfile，避免 Vercel 把项目误判为容器项目）：
 
 ```bash
