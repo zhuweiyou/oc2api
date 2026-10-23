@@ -334,8 +334,12 @@ export function isRealSessionId(id) {
 //   4. 首条 user 消息的哈希 —— 多轮对话里它比末条稳定。
 // 同一次对话的每一轮得到同一个 seed，两段对话不会因为首句相同而合并（见跨用户隔离）。
 export function sessionSeed(request, payload) {
+  // Express 的 req.headers 是普通对象，Workers 的 request.headers 是 Headers：
+  // 两种都要读得到，否则 Cloudflare 上客户端自带的会话 id 会被静默忽略。
   const header = (name) => {
-    const value = request?.headers?.[name]
+    const headers = request?.headers
+    if (!headers) return ""
+    const value = typeof headers.get === "function" ? headers.get(name) : headers[name]
     return typeof value === "string" ? value.trim() : ""
   }
 

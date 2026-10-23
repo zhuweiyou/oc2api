@@ -22,6 +22,11 @@ const SSE_HEADERS = {
 
 const encoder = new TextEncoder()
 
+// 与 Node 版 `send` 一致：字符串载荷（只有 "[DONE]"）原样写，其余序列化成 JSON。
+function frame(payload) {
+  return encoder.encode(`data: ${typeof payload === "string" ? payload : JSON.stringify(payload)}\n\n`)
+}
+
 export function jsonResponse(body, status = 200, headers = {}) {
   return new Response(JSON.stringify(body), {
     status,
@@ -86,9 +91,9 @@ export async function respondStream(upstream, ctx) {
   const body = iteratorStream(
     (async function* () {
       try {
-        yield encoder.encode(`data: ${JSON.stringify(first.value)}\n\n`)
+        yield frame(first.value)
         for await (const payload of frames) {
-          yield encoder.encode(`data: ${typeof payload === "string" ? payload : JSON.stringify(payload)}\n\n`)
+          yield frame(payload)
         }
       } finally {
         await reader.cancel().catch(() => {})

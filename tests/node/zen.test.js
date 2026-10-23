@@ -456,3 +456,20 @@ test("会话按对话隔离：同一对话复用，不同对话与不同使用�
   const mine = sessionId()
   assert.equal(sessionFor("user-default", { headers: { "x-opencode-session": mine } }, conversation), mine)
 })
+
+test("会话 seed 同时支持 Express 的普通对象与 Workers 的 Headers", () => {
+  const own = sessionId()
+  assert.equal(sessionSeed({ headers: { "x-opencode-session": own } }, {}), own, "Express 路径")
+  assert.equal(sessionSeed({ headers: new Headers({ "x-opencode-session": own }) }, {}), own, "Workers 路径")
+  assert.equal(
+    sessionSeed({ headers: new Headers({ "x-session-affinity": "conv-9" }) }, {}),
+    "header:conv-9",
+    "Headers 上的会话头也必须读到",
+  )
+  assert.equal(sessionSeed({ headers: new Headers() }, {}), "")
+  assert.equal(sessionSeed({}, {}), "")
+
+  // 端到端：两种请求对象给出同一个上游 session，客户端指定的 id 被沿用。
+  const withHeaders = sessionFor("user-default", { headers: new Headers({ "x-opencode-session": own }) }, {})
+  assert.equal(withHeaders, own)
+})
