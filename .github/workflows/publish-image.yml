@@ -1,7 +1,7 @@
 name: Publish image
 
 # 只有推送到 main、推版本标签（v*）或手动触发时才构建发布；
-# 普通分支与 PR 不跑，避免重复消耗构建额度（CI 已覆盖静态检查）。
+# 普通分支与 PR 不跑，避免重复消耗构建额度（静态检查由 static-checks.yml 覆盖）。
 on:
   push:
     branches:
