@@ -132,7 +132,7 @@ func classifyChunk(data string, renames *shape.Renames, decisions map[int]bool) 
 				undecided++
 				continue
 			}
-			decisions[index] = renames.IsRenamed(name)
+			decisions[index] = !dropToolCall(name, renames)
 			decided++
 		}
 	}
@@ -412,4 +412,17 @@ func setFinish(chunk map[string]any, value string) {
 			choice["finish_reason"] = value
 		}
 	}
+}
+
+// dropToolCall 只丢“官方内置、且客户端没有同名工具”的调用。
+// 其余一律放行：客户端声明的工具（oc2api_ 前缀）要还原，未知名字也不拦，
+// 避免把合法调用误伤成空回答。
+func dropToolCall(name string, renames *shape.Renames) bool {
+	if name == "" {
+		return false
+	}
+	if renames.IsRenamed(name) || renames.HasClientTool(name) {
+		return false
+	}
+	return shape.OfficialTool(name)
 }

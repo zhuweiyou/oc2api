@@ -69,3 +69,22 @@ func TestStreamDropsBuiltinToolCallsAndRewritesFinish(t *testing.T) {
 type stringWriter struct{ builder *strings.Builder }
 
 func (w *stringWriter) Write(p []byte) (int, error) { return w.builder.Write(p) }
+
+func TestStreamKeepsUnknownToolCalls(t *testing.T) {
+	chunks := []string{
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"run_command","arguments":"{\"command\":\"ls\"}"}}]}}]}` + "\n\n",
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}` + "\n\n",
+		"data: [DONE]\n\n",
+	}
+	var buffer strings.Builder
+	if err := Stream(&stringWriter{&buffer}, sseResponse(chunks...), shape.EmptyRenames()); err != nil {
+		t.Fatal(err)
+	}
+	output := buffer.String()
+	if !strings.Contains(output, `"run_command"`) {
+		t.Fatalf("非内置的工具调用必须放行: %s", output)
+	}
+	if !strings.Contains(output, `"finish_reason":"tool_calls"`) {
+		t.Fatalf("放行时 finish_reason 应保持 tool_calls: %s", output)
+	}
+}

@@ -29,6 +29,27 @@ type Renames struct {
 	reverse map[string]string // 上游名 -> 客户端名
 }
 
+// HasClientTool 判断某个名字是不是客户端声明过的工具（原名）。
+func (r *Renames) HasClientTool(name string) bool {
+	if r == nil {
+		return false
+	}
+	_, ok := r.forward[name]
+	return ok
+}
+
+// OfficialTool 判断某个名字是不是我们发出去的官方内置工具（目前只有 read）。
+func OfficialTool(name string) bool {
+	for _, raw := range officialTools() {
+		if tool, ok := raw.(map[string]any); ok {
+			if fn, ok := tool["function"].(map[string]any); ok && fn["name"] == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // EmptyRenames 返回一个没有任何映射的 Renames，便于测试与「无客户端工具」场景。
 func EmptyRenames() *Renames { return newRenames() }
 
