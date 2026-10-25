@@ -1,5 +1,6 @@
 {
   "buildCommand": "bash scripts/build-go.sh",
+  "outputDirectory": "public",
   "functions": {
     "api/index.js": {
       "maxDuration": 300,
@@ -11,6 +12,5 @@
       "source": "/(.*)",
       "destination": "/api/index.js"
     }
-  ],
-  "outputDirectory": "public"
+  ]
 }

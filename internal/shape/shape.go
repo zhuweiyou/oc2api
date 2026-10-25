@@ -5,7 +5,6 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
-	"os"
 	"regexp"
 	"runtime"
 	"strings"
@@ -90,10 +89,9 @@ const reservedToolDescription = "Reserved for the host runtime; do not call or s
 
 // officialPrompt 生成随模型/环境变化的官方系统提示词。
 func officialPrompt(model string) string {
-	workdir := strings.TrimSpace(os.Getenv("OC2API_WORKDIR"))
-	if workdir == "" {
-		workdir = "/workspace"
-	}
+	// 客户端的工作目录不会经过 API 传上来，这里给一个稳定的占位值，
+	// 只为了让提示词的结构和真实客户端一致。
+	const workdir = "/workspace"
 	platform := runtime.GOOS
 	if platform == "windows" {
 		platform = "win32"
