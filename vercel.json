@@ -1,14 +1,16 @@
 {
-  "version": 2,
+  "buildCommand": "bash scripts/build-go.sh",
   "functions": {
     "api/index.js": {
-      "maxDuration": 300
+      "maxDuration": 300,
+      "includeFiles": "bin/**"
     }
   },
-  "routes": [
+  "rewrites": [
     {
-      "src": "/(.*)",
-      "dest": "/api/index.js"
+      "source": "/(.*)",
+      "destination": "/api/index.js"
     }
-  ]
+  ],
+  "outputDirectory": "public"
 }
