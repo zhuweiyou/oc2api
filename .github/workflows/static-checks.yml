@@ -12,7 +12,7 @@ on:
 permissions:
   contents: read
 
-# 只做离线检查：lint、vet、单元测试、交叉编译。
+# 只做离线检查：lint、单元测试、交叉编译（lint 已包含 govet，不再单独跑 vet）。
 # 真实联调刻意不放进 CI：依赖真实模型与免费层配额，上游瞬时限流会让结果不稳定。
 jobs:
   static-checks:
@@ -32,9 +32,6 @@ jobs:
         uses: golangci/golangci-lint-action@v8
         with:
           version: v2.15.0
-
-      - name: Vet
-        run: go vet ./...
 
       - name: Test
         run: go test ./...
