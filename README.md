@@ -27,16 +27,32 @@ flowchart TD
 ## 部署方式
 
 <details open>
-<summary><b>1. Vercel</b> — 推荐，一键部署</summary>
+<summary><b>1. Vercel</b> — 一键部署，或导入仓库手动部署</summary>
 
 <br>
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fzhuweiyou%2Foc2api&env=API_KEY&envDescription=API_KEY%EF%BC%9AAPI%20%E5%AF%86%E9%92%A5%EF%BC%8C%E7%95%99%E7%A9%BA%E5%88%99%E5%8C%BF%E5%90%8D)
+**一键部署：**
 
-也可以手动导入仓库，构建时会自动编译 Go 核心；环境变量：
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fzhuweiyou%2Foc2api&env=API_KEY%2CDEBUG&envDefaults=%7B%22API_KEY%22%3A%22sk-zhu%22%2C%22DEBUG%22%3A%22false%22%7D&envDescription=API_KEY%EF%BC%9AAPI%20%E5%AF%86%E9%92%A5%EF%BC%88%E7%95%99%E7%A9%BA%E5%88%99%E5%8C%BF%E5%90%8D%E8%AE%BF%E9%97%AE%EF%BC%89%EF%BC%9BDEBUG%EF%BC%9A%E8%AE%BE%E4%B8%BA%20true%20%E5%BC%80%E5%90%AF%E8%B0%83%E8%AF%95%E6%97%A5%E5%BF%97&envLink=https%3A%2F%2Fgithub.com%2Fzhuweiyou%2Foc2api%23vercel-%E9%83%A8%E7%BD%B2)
 
-- `API_KEY` — API 密钥，留空则匿名访问
-- `DEBUG` — 设为 `true` 开启调试日志
+**手动部署：**
+
+1. Fork 本仓库到你的 GitHub
+2. 打开 [Vercel Dashboard](https://vercel.com)，点击 **Add New > Project**
+3. 选择你 Fork 的仓库，点击 **Import**
+4. 在 **Environment Variables** 中添加：
+   - `API_KEY` — API 密钥（留空则匿名访问）
+   - `DEBUG` — 设为 `true` 开启调试日志（可选）
+5. 点击 **Deploy**，等待部署完成
+
+部署完成后会得到一个 `https://<项目名>.vercel.app` 的域名。
+
+构建阶段会自动下载 Go 工具链、编译出 linux 二进制并随函数打包（`scripts/build-go.sh`），
+首次部署大概 1–2 分钟。Vercel 的 Go runtime 会缓冲整段响应，所以 Vercel 上的流式由
+`api/index.js` 这层薄 Node 转发实现，业务逻辑仍然全在 Go 二进制里。
+
+你也可以 Fork 后部署多个 Vercel Project 做轮询、负载分摊；多个项目不保证出口 IP 不同，
+需通过各自实例的 `/ip` 核对。
 
 </details>
 
