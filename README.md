@@ -26,7 +26,7 @@ flowchart TD
 
 ## 部署方式
 
-<details open>
+<details>
 <summary><b>1. Vercel</b> — 一键部署，或导入仓库手动部署</summary>
 
 <br>
