@@ -51,17 +51,17 @@ func TestBuildShapesOfficialRequest(t *testing.T) {
 	for _, raw := range tools {
 		fn := raw.(map[string]any)["function"].(map[string]any)
 		names = append(names, fn["name"].(string))
-		if strings.HasPrefix(fn["name"].(string), "clint_") {
+		if strings.HasPrefix(fn["name"].(string), "oc2api_") {
 			continue
 		}
 		if fn["description"] != reservedToolDescription {
 			t.Fatalf("内置工具 %s 的描述没有改成禁止调用", fn["name"])
 		}
 	}
-	if !contains(names, "clint_get_weather") {
+	if !contains(names, "oc2api_get_weather") {
 		t.Fatalf("客户端工具没有改名: %v", names)
 	}
-	if renames.Restore("clint_get_weather") != "get_weather" {
+	if renames.Restore("oc2api_get_weather") != "get_weather" {
 		t.Fatal("工具名还原失败")
 	}
 }

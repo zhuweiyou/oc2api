@@ -8,7 +8,7 @@
 cmd/oc2api/        入口：默认 HTTP 服务；-stdio 起 stdio JSON-RPC（Vercel 用）
 internal/config    环境变量与版本号
 internal/zen       uTLS 传输（Bun ClientHello）、上游请求、会话 id、模型列表
-internal/shape     官方 system 提示词 + 工具集整形（clint_ 改名、32k 上限）
+internal/shape     官方 system 提示词 + 工具集整形（oc2api_ 改名、32k 上限）
 internal/chat      整形 → 上游 → 非流式聚合与兜底重试
 internal/protocol  SSE 解析、聚合、[DONE]/错误语义、内置工具过滤
 internal/httpapi   本地/Docker HTTP 入口（/、/health、/ip、/v1/*）
@@ -42,6 +42,8 @@ scripts/build-go.sh Vercel 构建期交叉编译 linux/amd64 到 bin/
 - 官方工具集（`internal/shape/assets/tools.json`，12 个工具）；**去掉 tools 或置空直接 429**；
 - `stream: true` + `stream_options.include_usage`；`stream:false` 也 429，非流式在本地聚合；
 - `max_completion_tokens: 32000`；
+- system 提示词里的 `<env>` 环境块**不能删**：去掉后实测直接 429，整段提示词要按原样保留
+  （只替换模型名 / 日期等占位符）；
 - `ses_` + 12 位倒序十六进制时间戳 + 14 位 base62 的会话 id。时间戳取当前毫秒，
   **毫秒内序号从 1 开始**（序号 0 会落到 0xFFF 被拒）。
 
@@ -51,11 +53,11 @@ scripts/build-go.sh Vercel 构建期交叉编译 linux/amd64 到 bin/
 
 免费层要工具集，客户端却没有这些工具，所以：
 
-1. 客户端工具改名 `clint_<sanitized>`（`internal/shape`），响应侧还原；
+1. 客户端工具改名 `oc2api_<sanitized>`（`internal/shape`），响应侧还原；
 2. 官方工具的描述统一换成 "Reserved for the host runtime; do not call or select this
    function."——实测这样模型就不再选中它们，且不影响免费层校验；
 3. 客户端没声明工具时，system 末尾再补一句"不要调用工具"；
-4. 兜底：`internal/protocol` 按 `index` 缓冲工具调用，确认不是 `clint_` 的整条丢弃，
+4. 兜底：`internal/protocol` 按 `index` 缓冲工具调用，确认不是 `oc2api_` 的整条丢弃，
    `finish_reason` 从 `tool_calls` 回退 `stop`；非流式没有正文时带更强提示重试一次。
 
 ## Vercel 为什么是「薄 Node + Go 二进制」

@@ -12,7 +12,7 @@ import (
 	"oc2api/internal/shape"
 )
 
-// Stream 逐帧转发上游 SSE：把 clint_ 工具名还原成客户端声明的名字，
+// Stream 逐帧转发上游 SSE：把 oc2api_ 前缀的工具名还原成客户端声明的名字，
 // 同时丢掉上游自己选中、但客户端没声明的内置工具调用（客户端无法执行它们）。
 func Stream(w io.Writer, upstream *http.Response, renames *shape.Renames) error {
 	writer := bufio.NewWriter(w)

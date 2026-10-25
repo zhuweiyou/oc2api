@@ -19,15 +19,15 @@ var toolsJSON []byte
 
 const (
 	// 免费层要求请求看起来像官方客户端：system 提示词 + 官方工具集 + 32k 输出上限。
-	promptMarker = "You are opencode, an interactive CLI tool"
-	clientPrefix = "clint_"
-	outputLimit  = 32000
+	// ToolPrefix 是客户端工具发往上游时加的前缀；请求侧加、响应侧剥，都用它。
+	ToolPrefix  = "oc2api_"
+	outputLimit = 32000
 )
 
 // Renames 记录客户端工具名与发往上游的名字之间的双向映射。
 type Renames struct {
-	forward map[string]string // 客户端名 -> clint_ 名
-	reverse map[string]string // clint_ 名 -> 客户端名
+	forward map[string]string // 客户端名 -> 上游名
+	reverse map[string]string // 上游名 -> 客户端名
 }
 
 // EmptyRenames 返回一个没有任何映射的 Renames，便于测试与「无客户端工具」场景。
@@ -39,7 +39,7 @@ func newRenames() *Renames {
 
 var unsafeToolChars = regexp.MustCompile(`[^A-Za-z0-9_-]`)
 
-// rename 把客户端工具名换成 clint_<sanitized>，并保证不与已用的名字冲突。
+// rename 把客户端工具名换成 <ToolPrefix><sanitized>，并保证不与已用的名字冲突。
 func (r *Renames) rename(name string) string {
 	if name == "" {
 		return name
@@ -47,7 +47,7 @@ func (r *Renames) rename(name string) string {
 	if mapped, ok := r.forward[name]; ok {
 		return mapped
 	}
-	base := clientPrefix + unsafeToolChars.ReplaceAllString(name, "_")
+	base := ToolPrefix + unsafeToolChars.ReplaceAllString(name, "_")
 	if len(base) > 64 {
 		base = base[:64]
 	}
