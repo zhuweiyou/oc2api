@@ -38,13 +38,14 @@ scripts/build-go.sh Vercel 构建期交叉编译 linux/amd64 到 bin/
 
 请求体必须同时满足（缺一项就 429）：
 
-- 官方 system 提示词（`internal/shape/assets/prompt.txt`，运行期填模型名/日期/环境块）；
+- 官方 system 提示词：现在是最小版（874 字节，见 `internal/shape/assets/prompt.txt`），
+  去掉了 Code Mode / 工具说明；但 **`<env>` 块必须保留**，且至少要有
+  `Working directory`，否则直接 429（`Platform`、`Is directory a git repo` 可删）；
 - 官方工具集：**`tools` 不能为空**（去掉或置空直接 429）。实测**只发 `read` 一项就能过**，
   所以现在只发 read，避免模型以为自己有 shell / 文件系统；
 - `stream: true` + `stream_options.include_usage`；`stream:false` 也 429，非流式在本地聚合；
 - `max_completion_tokens: 32000`；
-- system 提示词里的 `<env>` 环境块**不能删**：去掉后实测直接 429，整段提示词要按原样保留
-  （只替换模型名 / 日期等占位符）；
+- 工作目录写 `./`，不要写 `/workspace` 之类的绝对路径：模型看到真实路径会以为自己能访问；
 - `ses_` + 12 位倒序十六进制时间戳 + 14 位 base62 的会话 id。时间戳取当前毫秒，
   **毫秒内序号从 1 开始**（序号 0 会落到 0xFFF 被拒）。
 
