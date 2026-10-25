@@ -161,32 +161,6 @@ func (e *emitWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// Handler 是 HTTP 载体（-rpc 调试模式 / Go 函数）。
-func Handler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST required", http.StatusMethodNotAllowed)
-			return
-		}
-		raw, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
-		if err != nil {
-			http.Error(w, "read error", http.StatusBadRequest)
-			return
-		}
-		w.Header().Set("Content-Type", "application/x-ndjson")
-		w.Header().Set("Cache-Control", "no-store")
-		w.WriteHeader(http.StatusOK)
-		flusher, _ := w.(http.Flusher)
-		Handle(r.Context(), raw, func(msg map[string]any) {
-			payload, _ := json.Marshal(msg)
-			_, _ = w.Write(append(payload, '\n'))
-			if flusher != nil {
-				flusher.Flush()
-			}
-		})
-	})
-}
-
 // ServeStdio 从 stdin 读 NDJSON 请求，逐条处理；每条一个 goroutine，
 // 输出用互斥锁串行化，避免不同请求的消息交错。
 func ServeStdio() error {

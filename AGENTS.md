@@ -5,14 +5,14 @@
 ## 架构
 
 ```
-cmd/oc2api/        入口：默认 HTTP 服务；-rpc 起 HTTP JSON-RPC；-stdio 起 stdio JSON-RPC
+cmd/oc2api/        入口：默认 HTTP 服务；-stdio 起 stdio JSON-RPC（Vercel 用）
 internal/config    环境变量与版本号
 internal/zen       uTLS 传输（Bun ClientHello）、上游请求、会话 id、模型列表
 internal/shape     官方 system 提示词 + 工具集整形（clint_ 改名、32k 上限）
 internal/chat      整形 → 上游 → 非流式聚合与兜底重试
 internal/protocol  SSE 解析、聚合、[DONE]/错误语义、内置工具过滤
 internal/httpapi   本地/Docker HTTP 入口（/、/health、/ip、/v1/*）
-internal/rpc       JSON-RPC 2.0（HTTP 与 stdio 两种载体）
+internal/rpc       JSON-RPC 2.0 over stdio（Vercel 薄层用）
 api/index.js       Vercel 薄层：路由、鉴权、SSE 翻译、spawn Go 二进制
 scripts/build-go.sh Vercel 构建期交叉编译 linux/amd64 到 bin/
 ```

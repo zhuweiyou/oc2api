@@ -1,4 +1,4 @@
-// oc2api 的 Go 核心：本地/Docker 直接起 HTTP 服务，Vercel 用 -rpc 走 JSON-RPC。
+// oc2api 的 Go 核心：默认起 HTTP 服务；-stdio 走 JSON-RPC（Vercel 由薄 Node 层拉起）。
 package main
 
 import (
@@ -13,7 +13,6 @@ import (
 )
 
 func main() {
-	rpcMode := flag.Bool("rpc", false, "以 HTTP JSON-RPC 模式启动（调试用）")
 	stdio := flag.Bool("stdio", false, "以 stdio JSON-RPC 模式启动（Vercel 上由 Node 薄层拉起）")
 	listen := flag.String("listen", "", "监听地址，默认取 PORT（:8080）")
 	flag.Parse()
@@ -35,21 +34,12 @@ func main() {
 		return
 	}
 
-	var h http.Handler
-	mode := "http"
-	if *rpcMode {
-		h = rpc.Handler()
-		mode = "rpc"
-	} else {
-		h = httpapi.Server()
-	}
-
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           h,
+		Handler:           httpapi.Server(),
 		ReadHeaderTimeout: 15 * time.Second,
 	}
-	log.Printf("oc2api go (%s) listening on %s", mode, addr)
+	log.Printf("oc2api go (http) listening on %s", addr)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
