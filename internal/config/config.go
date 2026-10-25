@@ -4,6 +4,7 @@ package config
 import (
 	"os"
 	"strings"
+	"sync"
 )
 
 // Version 与 package.json 的版本保持一致，/health 直接透出。
@@ -14,9 +15,15 @@ type Config struct {
 	Debug  bool
 }
 
-func Load() Config {
+// 环境变量在进程生命周期内不会变，读一次就够了。
+var current = sync.OnceValue(func() Config {
 	return Config{
 		APIKey: strings.TrimSpace(os.Getenv("API_KEY")),
 		Debug:  os.Getenv("DEBUG") == "true",
 	}
+})
+
+// Get 返回进程级配置；首次调用时读取环境变量，之后直接返回缓存值。
+func Get() Config {
+	return current()
 }

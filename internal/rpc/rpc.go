@@ -147,7 +147,7 @@ func handleChat(ctx context.Context, req request, emit emitter) {
 
 	writer := &emitWriter{emit: emit, id: req.ID}
 	err = protocol.Stream(writer, resp, renames)
-	if config.Load().Debug {
+	if config.Get().Debug {
 		log.Printf("[rpc] stream done model=%s bytes=%d content=%dB finish=%q calls=%v err=%v", model, writer.bytes, writer.content, writer.finish, writer.calls, err)
 	}
 	if err != nil {

@@ -27,14 +27,15 @@ func UpstreamWithSession(ctx context.Context, payload map[string]any, model, ses
 	if err != nil {
 		return nil, nil, err
 	}
-	if config.Load().Debug {
+	debug := config.Get().Debug
+	if debug {
 		log.Printf("[chat] model=%s session=%s%s tools=%d body=%dB", model, session, describeMessages(payload), countClientTools(payload), len(body))
 	}
 	resp, err := zen.Post(ctx, "/openai/v1/chat/completions", body, session)
 	if err != nil {
 		return nil, nil, err
 	}
-	if config.Load().Debug {
+	if debug {
 		log.Printf("[chat] upstream status=%d retry-after=%s", resp.StatusCode, resp.Header.Get("Retry-After"))
 	}
 	return resp, renames, nil

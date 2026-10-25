@@ -40,7 +40,7 @@ func writeOpenAIError(w http.ResponseWriter, status int, message, kind, code str
 
 // Server 组装路由：/ 与 /health 公开，其余按 API_KEY 鉴权。
 func Server() http.Handler {
-	cfg := config.Load()
+	cfg := config.Get()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", withCORS(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
