@@ -45,3 +45,27 @@ func TestAggregateDropsBuiltinToolCalls(t *testing.T) {
 	}
 	_ = json.Marshal
 }
+
+func TestStreamDropsBuiltinToolCallsAndRewritesFinish(t *testing.T) {
+	chunks := []string{
+		`data: {"choices":[{"index":0,"delta":{"role":"assistant"}}]}` + "\n\n",
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read","arguments":"{\"path\":\"a\"}"}}]}}]}` + "\n\n",
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}` + "\n\n",
+		"data: [DONE]\n\n",
+	}
+	var buffer strings.Builder
+	if err := Stream(&stringWriter{&buffer}, sseResponse(chunks...), shape.EmptyRenames()); err != nil {
+		t.Fatal(err)
+	}
+	output := buffer.String()
+	if strings.Contains(output, `"tool_calls"`) {
+		t.Fatalf("内置工具调用不应透给客户端: %s", output)
+	}
+	if !strings.Contains(output, `"finish_reason":"stop"`) {
+		t.Fatalf("被丢光后 finish_reason 应回退成 stop: %s", output)
+	}
+}
+
+type stringWriter struct{ builder *strings.Builder }
+
+func (w *stringWriter) Write(p []byte) (int, error) { return w.builder.Write(p) }

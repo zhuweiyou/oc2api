@@ -4,8 +4,11 @@ package chat
 import (
 	"context"
 	"io"
+	"log"
 	"net/http"
 	"strings"
+
+	"oc2api/internal/config"
 
 	"oc2api/internal/protocol"
 
@@ -24,11 +27,35 @@ func UpstreamWithSession(ctx context.Context, payload map[string]any, model, ses
 	if err != nil {
 		return nil, nil, err
 	}
+	if config.Load().Debug {
+		log.Printf("[chat] model=%s session=%s%s tools=%d body=%dB", model, session, describeMessages(payload), countClientTools(payload), len(body))
+	}
 	resp, err := zen.Post(ctx, "/openai/v1/chat/completions", body, session)
 	if err != nil {
 		return nil, nil, err
 	}
+	if config.Load().Debug {
+		log.Printf("[chat] upstream status=%d retry-after=%s", resp.StatusCode, resp.Header.Get("Retry-After"))
+	}
 	return resp, renames, nil
+}
+
+// describeMessages 汇总消息角色，便于在日志里还原客户端请求形态。
+func describeMessages(payload map[string]any) string {
+	messages, _ := payload["messages"].([]any)
+	roles := make([]string, 0, len(messages))
+	for _, raw := range messages {
+		if message, ok := raw.(map[string]any); ok {
+			role, _ := message["role"].(string)
+			roles = append(roles, role)
+		}
+	}
+	return " messages=" + strings.Join(roles, ",")
+}
+
+func countClientTools(payload map[string]any) int {
+	tools, _ := payload["tools"].([]any)
+	return len(tools)
 }
 
 // Validate 与 Node 版保持同一套门面校验：只拦明显不合法的请求，

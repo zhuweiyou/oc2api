@@ -18,11 +18,11 @@ func Stream(w io.Writer, upstream *http.Response, renames *shape.Renames) error 
 	writer := bufio.NewWriter(w)
 	defer func() { _ = writer.Flush() }()
 
-	decisions := map[int]bool{} // true=保留, false=丢弃
+	state := &streamState{decisions: map[int]bool{}} // true=保留, false=丢弃
 	var buffered []string
 	flushBuffered := func() error {
 		for _, raw := range buffered {
-			if text, ok := rewriteChunk(raw, renames, decisions, true); ok {
+			if text, ok := rewriteChunk(raw, renames, state, true); ok {
 				if _, err := writer.WriteString("data: " + text + "\n\n"); err != nil {
 					return err
 				}
@@ -41,7 +41,7 @@ func Stream(w io.Writer, upstream *http.Response, renames *shape.Renames) error 
 			return writer.Flush()
 		}
 
-		decided, undecided := classifyChunk(data, renames, decisions)
+		decided, undecided := classifyChunk(data, renames, state.decisions)
 		if undecided > 0 {
 			// 名字还没到：先压住整帧，等定夺后一起放。
 			buffered = append(buffered, data)
@@ -53,7 +53,7 @@ func Stream(w io.Writer, upstream *http.Response, renames *shape.Renames) error 
 				return err
 			}
 		}
-		text, ok := rewriteChunk(data, renames, decisions, false)
+		text, ok := rewriteChunk(data, renames, state, false)
 		if !ok {
 			return nil
 		}
@@ -296,7 +296,7 @@ func scanSSE(body io.Reader, fn func(data string) error) error {
 
 // rewriteChunk 改写一帧：还原客户端工具名、丢掉内置工具调用。
 // buffered=true 表示这一帧来自缓冲区，未知名字一律丢弃。
-func rewriteChunk(data string, renames *shape.Renames, decisions map[int]bool, buffered bool) (string, bool) {
+func rewriteChunk(data string, renames *shape.Renames, state *streamState, buffered bool) (string, bool) {
 	var chunk map[string]any
 	if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 		return data, true
@@ -325,7 +325,7 @@ func rewriteChunk(data string, renames *shape.Renames, decisions map[int]bool, b
 			if value, ok := call["index"].(float64); ok {
 				index = int(value)
 			}
-			keep, known := decisions[index]
+			keep, known := state.decisions[index]
 			if !known {
 				if buffered {
 					continue
@@ -341,21 +341,29 @@ func rewriteChunk(data string, renames *shape.Renames, decisions map[int]bool, b
 				}
 			}
 			kept = append(kept, call)
+			state.kept = true
 		}
 		if len(kept) == 0 {
 			delete(delta, "tool_calls")
-			if finish, _ := choice["finish_reason"].(string); finish == "tool_calls" {
-				choice["finish_reason"] = "stop"
-			}
 		} else {
 			delta["tool_calls"] = kept
 		}
+	}
+	// 上游说这一轮以 tool_calls 结束，但所有调用都被我们丢掉了：
+	// 必须改成 stop，否则客户端会等一个永远不会到来的工具执行。
+	if finish, _ := choiceFinish(chunk); finish == "tool_calls" && !state.kept {
+		setFinish(chunk, "stop")
 	}
 	encoded, err := json.Marshal(chunk)
 	if err != nil {
 		return data, true
 	}
 	return string(encoded), true
+}
+
+type streamState struct {
+	decisions map[int]bool
+	kept      bool
 }
 
 // ErrorBody 把上游非 2xx 映射成 OpenAI 风格错误，与 Node 版语义一致。
@@ -381,4 +389,27 @@ func ErrorBody(status int, message string) map[string]any {
 	return map[string]any{"error": map[string]any{
 		"message": text, "type": "upstream_error", "code": "upstream_error",
 	}}
+}
+
+// choiceFinish 返回首个 choice 的 finish_reason。
+func choiceFinish(chunk map[string]any) (string, bool) {
+	choices, _ := chunk["choices"].([]any)
+	for _, raw := range choices {
+		if choice, ok := raw.(map[string]any); ok {
+			if finish, ok := choice["finish_reason"].(string); ok && finish != "" {
+				return finish, true
+			}
+		}
+	}
+	return "", false
+}
+
+// setFinish 把 finish_reason 改写成指定值。
+func setFinish(chunk map[string]any, value string) {
+	choices, _ := chunk["choices"].([]any)
+	for _, raw := range choices {
+		if choice, ok := raw.(map[string]any); ok {
+			choice["finish_reason"] = value
+		}
+	}
 }

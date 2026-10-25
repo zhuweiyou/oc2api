@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -144,7 +145,12 @@ func handleChat(ctx context.Context, req request, emit emitter) {
 		return
 	}
 
-	if err := protocol.Stream(&emitWriter{emit: emit, id: req.ID}, resp, renames); err != nil {
+	writer := &emitWriter{emit: emit, id: req.ID}
+	err = protocol.Stream(writer, resp, renames)
+	if config.Load().Debug {
+		log.Printf("[rpc] stream done model=%s bytes=%d content=%dB finish=%q calls=%v err=%v", model, writer.bytes, writer.content, writer.finish, writer.calls, err)
+	}
+	if err != nil {
 		return
 	}
 	emitNotify(emit, req.ID, "end", map[string]any{})
@@ -152,13 +158,75 @@ func handleChat(ctx context.Context, req request, emit emitter) {
 
 // emitWriter 把 SSE 文本包成带 id 的通知，一帧一条。
 type emitWriter struct {
-	emit emitter
-	id   any
+	emit    emitter
+	id      any
+	bytes   int
+	content int
+	finish  string
+	calls   []string
 }
 
 func (e *emitWriter) Write(p []byte) (int, error) {
+	e.bytes += len(p)
+	e.track(string(p))
 	emitNotify(e.emit, e.id, "sse", map[string]any{"data": string(p)})
 	return len(p), nil
+}
+
+// toolCallNames 取出这一帧里的工具名。
+func toolCallNames(line string) []string {
+	var chunk struct {
+		Choices []struct {
+			Delta struct {
+				ToolCalls []struct {
+					Function struct {
+						Name string `json:"name"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"delta"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &chunk); err != nil {
+		return nil
+	}
+	names := make([]string, 0, 1)
+	for _, choice := range chunk.Choices {
+		for _, call := range choice.Delta.ToolCalls {
+			if call.Function.Name != "" {
+				names = append(names, call.Function.Name)
+			}
+		}
+	}
+	return names
+}
+
+// track 统计正文长度与 finish_reason，DEBUG 日志用它判断“空回答”。
+func (e *emitWriter) track(frame string) {
+	for _, line := range strings.Split(frame, "\n") {
+		if !strings.HasPrefix(line, "data: {") {
+			continue
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+				FinishReason any `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &chunk); err != nil {
+			continue
+		}
+		for _, choice := range chunk.Choices {
+			e.content += len(choice.Delta.Content)
+			if reason, ok := choice.FinishReason.(string); ok && reason != "" {
+				e.finish = reason
+			}
+		}
+		if names := toolCallNames(line); len(names) > 0 {
+			e.calls = append(e.calls, names...)
+		}
+	}
 }
 
 // ServeStdio 从 stdin 读 NDJSON 请求，逐条处理；每条一个 goroutine，
