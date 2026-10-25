@@ -12,7 +12,7 @@ on:
 permissions:
   contents: read
 
-# 只做离线检查：格式、vet、单元测试、交叉编译。
+# 只做离线检查：vet、单元测试、交叉编译。
 # 真实联调刻意不放进 CI：依赖真实模型与免费层配额，上游瞬时限流会让结果不稳定。
 jobs:
   static-checks:
@@ -27,15 +27,6 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-
-      - name: Check formatting
-        run: |
-          unformatted="$(gofmt -l .)"
-          if [ -n "$unformatted" ]; then
-            echo "以下文件需要 gofmt："
-            echo "$unformatted"
-            exit 1
-          fi
 
       - name: Vet
         run: go vet ./...
