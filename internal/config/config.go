@@ -7,7 +7,7 @@ import (
 )
 
 // Version 与 package.json 的版本保持一致，/health 直接透出。
-const Version = "3.0.0"
+const Version = "4.0.0"
 
 type Config struct {
 	APIKey string
