@@ -150,10 +150,8 @@ func SessionID() string {
 
 // UpstreamHeaders 复刻官方客户端的请求头。
 func UpstreamHeaders(session string) map[string]string {
-	token := strings.TrimSpace(os.Getenv("OPENCODE_API_KEY"))
-	if token == "" {
-		token = "public"
-	}
+	// 只做免费层：固定使用公共匿名标识。
+	const token = "public"
 	trace, span := randomHex(16), randomHex(8)
 	return map[string]string{
 		"Content-Type":          "application/json",

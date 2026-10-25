@@ -2,7 +2,5 @@
 .github/
 .idea/
 .env*
-node_modules/
 tests/
 docker/
-worker/

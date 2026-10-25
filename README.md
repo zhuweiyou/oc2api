@@ -1,199 +1,68 @@
 # oc2api
 
-OpenCode Free API 代理，一套业务逻辑同时支持 Cloudflare Workers、本地运行、Docker 和 Vercel 部署，并支持 SSE 流式响应。
+OpenCode 免费模型的 OpenAI 兼容代理。纯 Go 实现，可在本地、Docker、Vercel 上跑，支持 SSE 流式。
 
 ```mermaid
-flowchart TD
-    client["客户端<br/>Claude Code / Codex / DSH 等"]
+flowchart LR
+    client["客户端<br/>Claude Code / Codex / DSH"]
     gateway["聚合网关<br/>CLIProxyAPI / SUB2API / NEWAPI"]
-    a["oc2api 实例 A<br/>出口 IP 1"]
-    b["oc2api 实例 B<br/>出口 IP 2"]
-    c["oc2api 实例 C<br/>出口 IP 3"]
+    a["oc2api 实例 A"]
+    b["oc2api 实例 B"]
     zen["OpenCode Zen<br/>免费模型"]
 
     client --> gateway
     gateway -->|轮询 / 负载| a
     gateway -->|轮询 / 负载| b
-    gateway -->|轮询 / 负载| c
     a --> zen
     b --> zen
-    c --> zen
 ```
 
-## 多地域分流
+## 为什么是 Go
 
-免费模型的额度按出口 IP 计量。同一种部署可以在不同地域各建一个实例（对应上图里的 A/B/C），出口 IP 通常互不相同；把它们的地址一起填进 [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)、[Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api)、[QuantumNous/new-api](https://github.com/QuantumNous/new-api) 等聚合网关做轮询或填充，就能把免费额度摊到多个出口 IP 上，绕开单个 IP 被限流。
+免费层现在按**传输层指纹**识别客户端：Node、curl、Cloudflare 的 TLS 握手都会被判定成"非 OpenCode 流量"并返回 `429 FreeUsageLimitError`，只有 Bun（OpenCode 官方客户端的运行时）能过。Go 用 `refraction-networking/utls` 复刻 Bun 的 ClientHello（JA4 `t13d1713h1`），配合官方 system 提示词、官方工具集、`max_completion_tokens` 和 `ses_` 会话 id，才能稳定拿到 200。
 
-是否真的独立，用每个实例的 `/ip` 核对——同一地域的实例可能共用出口。Vercel、Cloudflare Workers、云函数都可以这样叠加。
+## 部署
 
-## 部署方式
-
-四种方式共用同一套 `server/` 业务逻辑，接口、鉴权、会话与错误语义完全一致。
-
-<details>
-<summary><b>1. Cloudflare Workers（推荐）</b> — 边缘运行，出口 IP 目前最容易跑通</summary>
-
-<br>
-
-`worker/` 只放 Workers 原生入口与 Web Streams 适配，业务逻辑仍然全部来自 `server/`。
-
-选择它的原因：免费模型的额度按出口 IP 计量。Vercel 的 AWS 出口段实测长期处于限流状态（对话返回 `429 rate_limit_error`，而 `/v1/models` 正常），Cloudflare 边缘出口目前更容易跑通。两边都不保证额度，可按 `/ip` 自行核对。
+### 本地
 
 ```bash
-npm i -g wrangler@latest
-wrangler login
-
-cd worker                     # 必须先进入 worker/ 目录再执行
-wrangler deploy               # 得到 https://oc2api.<子域>.workers.dev
-wrangler secret put API_KEY   # 可选，留空则匿名访问
+go run ./cmd/oc2api           # 默认 :8080，可用 PORT 覆盖
+API_KEY=your-key go run ./cmd/oc2api
 ```
 
-**注意必须在 `worker/` 目录里执行 `wrangler deploy`**：`worker/src/index.js` 通过 `../../server/*.js` 引用外层代码，wrangler 会用 esbuild 在构建期把这些文件打包成单个脚本再上传（实测 46 KB / gzip 13 KB）。只把 `worker/` 单独拷出去部署会因找不到外层文件而构建失败。
-
-`API_KEY`、`DEBUG`、`ZEN_API_BASE_URL`、`ZEN_CONNECT_TIMEOUT_MS` 与本地版含义相同。
-
-📖 完整说明（本地调试、校验命令、CPU 限制）：**[worker/README.md](worker/README.md)**
-
-</details>
-
-<details>
-<summary><b>2. Docker（云函数 / 容器平台）</b> — 阿里云、腾讯云等支持自定义容器的环境</summary>
-
-<br>
-
-适用于云函数与容器平台：把镜像推上去，平台把 HTTP 请求转发到容器监听的端口即可。阿里云函数计算、腾讯云云函数、以及其它支持自定义容器的环境都适用，出口 IP 由平台分配。
-
-**直接拉取预构建镜像**
-
-`Publish image` 工作流在推送到 `main` 或推 `v*` 标签时自动构建 `linux/amd64` 与 `linux/arm64` 镜像，发布到 [`ghcr.io/zhuweiyou/oc2api`](https://github.com/zhuweiyou/oc2api/pkgs/container/oc2api)：
-
-```bash
-docker pull ghcr.io/zhuweiyou/oc2api:latest
-
-docker run -d --name oc2api --restart unless-stopped \
-  -p 8080:8080 \
-  -e API_KEY=your-key \
-  ghcr.io/zhuweiyou/oc2api:latest
-```
-
-| 触发方式               | 镜像标签                                                       |
-| ---------------------- | -------------------------------------------------------------- |
-| 推送到 `main`          | `latest`、`sha-<完整提交 SHA>`                                 |
-| 推送版本标签 `v2.10.0` | `2.10.0`、`2.10`、`sha-<完整提交 SHA>`（`latest` 只跟 `main`） |
-| Actions 页手动运行     | 当前分支或标签的 `sha-<完整提交 SHA>`                          |
-
-发布使用内置 `GITHUB_TOKEN`，不需要额外 Secret。首次发布后如需匿名拉取，在 **Packages → 镜像包 → Package settings** 把可见性设为 **Public**。
-
-**本地构建**
-
-镜像定义与编排文件统一放在 `docker/` 目录下（根目录不放 Dockerfile，避免 Vercel 把项目误判为容器项目）：
+### Docker
 
 ```bash
 cd docker && docker compose up -d --build
 ```
 
-容器内执行 `node server/index.js`，监听 `PORT`（默认 `8080`），所以把平台的监听端口配成 8080 即可。在云函数环境里建议注意：
+镜像分两阶段：`golang:1.24-alpine` 编译静态二进制，`distroless/static` 运行，没有 Node 和依赖树。
 
-- **超时时间**调到 300 秒，否则长回答的流式响应会被平台提前截断
-- 平台层做鉴权，或继续用本项目的 `API_KEY`
-- **实例数可以设为 0**（按请求扩缩）以节省资源：冷启动只发生在请求开始时，不会打断进行中的 SSE 连接
+### Vercel
 
-</details>
+Vercel 的 Go runtime 会缓冲整段响应，SSE 出不来，所以走"薄 Node + Go 二进制"：
 
-<details>
-<summary><b>3. Vercel</b> — 网页导入仓库即可部署，但出口 IP 常被上游限流（目前大概率不可用）</summary>
-
-<br>
-
-**一键部署：**
-
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fzhuweiyou%2Foc2api&env=API_KEY%2CDEBUG&envDefaults=%7B%22API_KEY%22%3A%22sk-zhu%22%2C%22DEBUG%22%3A%22true%22%7D&envDescription=API_KEY%EF%BC%9AAPI%20%E5%AF%86%E9%92%A5%EF%BC%88%E7%95%99%E7%A9%BA%E5%88%99%E5%8C%BF%E5%90%8D%E8%AE%BF%E9%97%AE%EF%BC%89%EF%BC%9BDEBUG%EF%BC%9A%E8%AE%BE%E4%B8%BA%20true%20%E5%BC%80%E5%90%AF%E8%B0%83%E8%AF%95%E6%97%A5%E5%BF%97&envLink=https%3A%2F%2Fgithub.com%2Fzhuweiyou%2Foc2api%23vercel-%E9%83%A8%E7%BD%B2)
-
-**手动部署：**
-
-1. Fork 本仓库到你的 GitHub
-2. 打开 [Vercel Dashboard](https://vercel.com)，点击 **Add New > Project**
-3. 选择你 Fork 的仓库，点击 **Import**
-4. 在 **Environment Variables** 中添加：
-   - `API_KEY` — API 密钥（留空则匿名访问）
-   - `DEBUG` — 设为 `true` 开启调试日志（可选）
-5. 点击 **Deploy**，等待部署完成
-
-部署完成后会得到一个 `https://<项目名>.vercel.app` 的域名。
-
-你也可以 Fork 后部署多个 Vercel Project 做轮询、负载分摊；多个项目不保证出口 IP 不同，需通过各自实例的 `/ip` 核对。
-
-</details>
-
-<details>
-<summary><b>4. 本地运行（Node）</b> — 调试与临时使用</summary>
-
-<br>
-
-要求 Node.js 24 或更高版本。
+- `scripts/build-go.sh`：构建期下载 Go 工具链、交叉编译 `linux/amd64` 二进制到 `bin/`；
+- `api/index.js`：首次请求 `spawn` 二进制（`-stdio`）并常驻，用带 `id` 的 JSON-RPC 分发并发请求，只做路由、鉴权和 SSE 翻译；
+- 业务逻辑全在 Go，Node 侧没有任何上游逻辑。
 
 ```bash
-npm install
-npm start
+vercel --prod
 ```
 
-默认监听 `http://localhost:8080`。也可以通过环境变量配置：
+需要配置环境变量 `API_KEY`（留空则匿名访问）。
+
+### 多出口
+
+免费额度按网络计量，一个出口用光就换下一个：
 
 ```bash
-API_KEY=your-key DEBUG=true PORT=8080 npm start
+curl https://<实例>/ip   # 核对出口 IP
 ```
 
-可选的本地上游中继可以在 OC2API 转换响应前处理限流重试：
-
-```sh
-ZEN_API_BASE_URL=http://127.0.0.1:2082/v1 ZEN_CONNECT_TIMEOUT_MS=300000 npm start
-```
-
-- `ZEN_API_BASE_URL`：上游地址，默认 `https://opencode.ai/inference/v1`。免费层只认 `inference` 路径，所以填 `https://opencode.ai/zen/v1` 这类旧写法会被自动改写到 `/inference/v1`；其它主机（例如自建中继）原样使用
-- `ZEN_CONNECT_TIMEOUT_MS`：收到响应头前的等待时间，默认 60000 毫秒，允许 1–600000；使用中继重试时应设置为大于其恢复窗口
-
-同一段对话的每一轮会复用同一个上游 session，从而命中它的 prompt 缓存；换一段对话或换一个调用方则各自独立。调用方自己带的 `x-opencode-session` 会被沿用，也可以用 `x-session-affinity`、`X-Session-Id`、`conversation-id` 或请求体的 `prompt_cache_key` 指定会话。
-
-健康检查：
-
-```bash
-curl http://localhost:8080/health
-```
-
-</details>
-
-## Go 核心
-
-`internal/` 下是一套纯 Go 实现，与 Node 版端点、鉴权、错误语义保持一致：
-
-```bash
-go run ./cmd/oc2api            # 默认起 HTTP 服务（PORT，默认 8080）
-go run ./cmd/oc2api -rpc       # HTTP JSON-RPC（调试用）
-go run ./cmd/oc2api -stdio     # stdio JSON-RPC（Vercel 由 Node 拉起）
-```
-
-为什么要 Go：免费层按**传输层指纹**识别客户端，Node/curl/Cloudflare 的 TLS 握手一律回 `429`，
-只有 Bun（OpenCode 官方客户端的运行时）能过。Go 用 `utls` 复刻 Bun 的 ClientHello
-（JA4 `t13d1713h1`），再配合官方的 system 提示词、官方工具集、`max_completion_tokens`
-和 `ses_` 会话 id，才能稳定拿到 200。
-
-| 包                  | 职责                                                |
-| ------------------- | --------------------------------------------------- |
-| `internal/config`   | 环境变量与版本号                                    |
-| `internal/zen`      | uTLS 传输、上游请求、会话 id、模型列表              |
-| `internal/shape`    | 系统提示词与工具整形（`clint_` 改名、32k 输出上限） |
-| `internal/chat`     | 串起整形与上游调用，非流式聚合 + 兜底重试           |
-| `internal/protocol` | SSE 解析、聚合、`[DONE]`/错误语义、内置工具过滤     |
-| `internal/httpapi`  | 本地/Docker 的 HTTP 入口                            |
-| `internal/rpc`      | JSON-RPC（HTTP 与 stdio 两种载体）                  |
-
-Vercel 上不能用 Go 函数直接跑：Go runtime 会缓冲整段响应，流式（SSE）出不来。
-所以 `scripts/build-go.sh` 在构建期交叉编译 linux 二进制，`api/index.js` 首次请求时
-`spawn` 并常驻，用带 `id` 的 JSON-RPC 分发并发请求，Node 只负责路由、鉴权和 SSE 翻译。
+把多个实例填进 [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)、[Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api)、[QuantumNous/new-api](https://github.com/QuantumNous/new-api) 做轮询。
 
 ## API
-
-兼容 OpenAI API 格式，路径均支持带 `/v1` 前缀或不带：
 
 | 路径                                          | 方法 | 说明                                  |
 | --------------------------------------------- | ---- | ------------------------------------- |
@@ -202,48 +71,62 @@ Vercel 上不能用 Go 函数直接跑：Go runtime 会缓冲整段响应，流�
 | `/` 或 `/health`                              | GET  | 健康检查                              |
 | `/ip`                                         | GET  | 查询出口 IP                           |
 
-配置 API Key 后，请求携带：
-
-```text
-Authorization: Bearer <api-key>
-```
-
-也支持 `X-API-Key`。
-
-客户端工具、工具选择、历史工具调用和多轮工具结果回填均可正常使用，工具名与参数原样往返。
+配置 `API_KEY` 后，请求携带 `Authorization: Bearer <api-key>` 或 `X-API-Key`；留空则匿名。
 
 ## 免费模型
 
-代理仅放行免费模型（`big-pickle` 及所有以 `-free` 结尾的模型）。以下是常用且已验证可用的几个：
+代理只放行 `big-pickle` 和所有以 `-free` 结尾的模型，列表来自 `https://models.opencode.ai/api.json` 对应的上游 `/v1/models`。
 
-| 模型                       | 上下文  | 输出   | 图片输入 |
-| -------------------------- | ------- | ------ | -------- |
-| `big-pickle`               | 200,000 | 32,000 | ❌       |
-| `mimo-v2.6-flash-free`     | 200,000 | 32,000 | ✅       |
-| `deepseek-v4.1-flash-free` | 200,000 | 32,000 | ✅       |
-| `glm-5.3-flash-free`       | 200,000 | 32,000 | ✅       |
+### 免费额度与错误语义
 
-- `context`：最大上下文窗口，单位 tokens
-- `output`：最大单次输出长度，单位 tokens
+额度由上游按账号/网络计量，代理本身没有配额：
 
-以上数据来源于 [https://models.opencode.ai/api.json](https://models.opencode.ai/api.json)（`opencode` key 下对应模型的 `limit` 与 `modalities` 字段），可自行查看核实，以实际使用为准。
+| 状态 | 错误类型                                  | 含义                                                            |
+| ---- | ----------------------------------------- | --------------------------------------------------------------- |
+| 403  | `FreeTierError`                           | 请求不像 OpenCode 客户端（缺官方工具集、`ses_` 会话 id 不合法） |
+| 429  | `FreeUsageLimitError`（带 `Retry-After`） | 形状已通过校验，但账号 / 网络当天的免费额度用完了               |
 
-## 错误处理
+`Retry-After` 会原样透给客户端（并通过 CORS 暴露）。共享出口（云函数、Serverless）容易被别人先用掉额度，表现就是"昨天还好、今天全 429"。
 
-上游返回 HTTP 错误时透出可判断的真实语义，不再一律归一成 `429`：只有上游真的限流才是 `429`（`rate_limit_error`），参数错误为 `400`（`invalid_request_error`），鉴权失败为 `401`/`403`（`authentication_error`），服务端问题为 `5xx`（`upstream_error`）。这样客户端能区分「额度用尽」和「请求写错了」，也便于把问题反馈给上游。流式响应头尚未发送前错误以普通 JSON 返回；头已发送后返回 SSE 错误事件且不补 `[DONE]`。oc2api 自身的流异常（缺少完成信号、上游误选保留工具）使用 `502`（`upstream_stream_error`）；建连网络失败、建连超时及模型列表错误使用 `502` / `504`。
+## 配置
 
-上游误选代理内部保留工具时按错误结束，不会把它当成客户端同名工具交回客户端执行。
+| 变量                     | 说明                                               |
+| ------------------------ | -------------------------------------------------- |
+| `API_KEY`                | 本服务鉴权密钥，留空则匿名                         |
+| `PORT`                   | 本地/Docker 监听端口，默认 `8080`                  |
+| `DEBUG`                  | 设为 `true` 输出调试日志                           |
+| `ZEN_API_BASE_URL`       | 覆盖上游地址，默认 `https://opencode.ai/inference` |
+| `OC2API_WORKDIR`         | 注入提示词里的工作目录，默认 `/workspace`          |
+| `ZEN_CONNECT_TIMEOUT_MS` | 建连超时，默认 600000 毫秒                         |
+
+## 工具处理
+
+免费层要求请求带上官方工具集（去掉 `tools` 直接 429），但客户端并没有这些工具：
+
+- 客户端声明的每个工具改名 `clint_<name>`，响应里再还原；
+- 官方工具的描述统一改成"Reserved for the host runtime; do not call..."，降低被选中的概率；
+- 客户端没声明任何工具时，system 末尾再补一句"不要调用工具"；
+- 响应侧按 `index` 缓冲工具调用，确认不是客户端声明的就整条丢弃，`finish_reason` 从 `tool_calls` 回退成 `stop`；
+- 非流式如果因此没有正文，带更强提示重试一次。
 
 ## 开发
 
 ```bash
-npm test              # 离线测试，不访问上游；CI 只跑这个
-npm run test:live     # 真实联调，需要网络，不进 CI
-npm run lint          # ESLint 静态检查
-npm run format:check  # 检查格式
-npm run format        # Prettier 自动格式化
+go test ./...      # 单元测试（离线）
+go vet ./...       # 静态检查
+gofmt -l .         # 格式检查
+go build ./cmd/oc2api
 ```
 
-联调用例会对 `big-pickle`、`mimo-v2.6-flash-free`、`deepseek-v4.1-flash-free`、`glm-5.3-flash-free` 各跑一次多轮连续工具调用（含与内置同名的客户端 `read`），真实请求上游，受免费层限流影响；未设置 `OC2API_LIVE_TEST=1` 时自动跳过。因为依赖真实模型和上游配额，它不纳入 CI 门禁，需要时本地执行。
+包职责：
 
-还想反代其它 AI？可以看 [codearts2api](https://github.com/zhuweiyou/codearts2api)：把十几种 AI 账号或订阅汇聚成 OpenAI 兼容接口。
+| 包                  | 职责                                               |
+| ------------------- | -------------------------------------------------- |
+| `internal/config`   | 环境变量与版本号                                   |
+| `internal/zen`      | uTLS 传输、上游请求、会话 id、模型列表             |
+| `internal/shape`    | 系统提示词与工具整形（`clint_` 改名、32k 上限）    |
+| `internal/chat`     | 串起整形与上游调用，非流式聚合 + 兜底重试          |
+| `internal/protocol` | SSE 解析、聚合、错误语义、内置工具过滤             |
+| `internal/httpapi`  | 本地/Docker 的 HTTP 入口                           |
+| `internal/rpc`      | JSON-RPC（HTTP 与 stdio 两种载体）                 |
+| `api/index.js`      | Vercel 薄层：路由、鉴权、SSE 翻译、spawn Go 二进制 |

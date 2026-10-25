@@ -1,8 +1,8 @@
-node_modules/
 .git/
+.github/
 .vercel/
 .idea/
-.env
-.env.*
+.env*
 *.log
 .DS_Store
+bin/

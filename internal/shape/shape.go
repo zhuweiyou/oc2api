@@ -5,7 +5,9 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"os"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -28,6 +30,9 @@ type Renames struct {
 	forward map[string]string // 客户端名 -> clint_ 名
 	reverse map[string]string // clint_ 名 -> 客户端名
 }
+
+// EmptyRenames 返回一个没有任何映射的 Renames，便于测试与「无客户端工具」场景。
+func EmptyRenames() *Renames { return newRenames() }
 
 func newRenames() *Renames {
 	return &Renames{forward: map[string]string{}, reverse: map[string]string{}}
@@ -79,22 +84,59 @@ func (r *Renames) Restore(name string) string {
 	return name
 }
 
-// officialPrompt 生成随模型变化的官方系统提示词：模型名 + 环境块。
+// reservedToolDescription 让模型别去选内置工具：它们只是免费层的形状要求，
+// 客户端执行不了。这一招沿用旧 Node 实现（只带 read 时同样这样写）。
+const reservedToolDescription = "Reserved for the host runtime; do not call or select this function. Use tools explicitly supplied by the user instead."
+
+// officialPrompt 生成随模型/环境变化的官方系统提示词。
 func officialPrompt(model string) string {
-	prompt := strings.ReplaceAll(promptTemplate, "{{MODEL}}", model)
-	// 抓包里的日期/目录是采集机器的，换成当前进程的值，看起来才像真实客户端。
-	today := time.Now().UTC().Format("Mon Jan 02 2006")
-	prompt = regexp.MustCompile(`Today's date: .*`).ReplaceAllString(prompt, "Today's date: "+today)
-	wd := "/workspace"
-	prompt = regexp.MustCompile(`Working directory: .*`).ReplaceAllString(prompt, "Working directory: "+wd)
-	prompt = regexp.MustCompile(`Workspace root folder: .*`).ReplaceAllString(prompt, "Workspace root folder: "+wd)
-	return prompt
+	workdir := strings.TrimSpace(os.Getenv("OC2API_WORKDIR"))
+	if workdir == "" {
+		workdir = "/workspace"
+	}
+	platform := runtime.GOOS
+	if platform == "windows" {
+		platform = "win32"
+	}
+	replacer := strings.NewReplacer(
+		"{{MODEL}}", model,
+		"{{MODELNAME}}", displayName(model),
+		"{{DATE}}", time.Now().UTC().Format("Mon Jan 02 2006"),
+		"{{WORKDIR}}", workdir,
+		"{{GIT}}", "yes",
+		"{{PLATFORM}}", platform,
+	)
+	return replacer.Replace(promptTemplate)
+}
+
+// displayName 把模型 id 变成人类可读的名字，例如
+// deepseek-v4.1-flash-free -> Deepseek V4.1 Flash Free。
+func displayName(model string) string {
+	parts := strings.Split(model, "-")
+	for index, part := range parts {
+		if part == "" {
+			continue
+		}
+		parts[index] = strings.ToUpper(part[:1]) + part[1:]
+	}
+	return strings.Join(parts, " ")
 }
 
 func officialTools() []any {
 	var tools []any
 	if err := json.Unmarshal(toolsJSON, &tools); err != nil {
 		panic("官方工具集解析失败: " + err.Error())
+	}
+	// 官方工具只为满足免费层的形状校验，客户端并没有这些工具；
+	// 把描述改成明确的“禁止调用”，尽量让模型不要选中它们。
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if fn, ok := tool["function"].(map[string]any); ok {
+			fn["description"] = reservedToolDescription
+		}
 	}
 	return tools
 }
