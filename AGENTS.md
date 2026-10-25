@@ -57,8 +57,8 @@ scripts/build-go.sh Vercel 构建期交叉编译 linux/amd64 到 bin/
 
 1. 客户端工具改名 `oc2api_<sanitized>`（`internal/shape`），响应侧还原；
 2. 官方工具（现在只有 `read`）的描述换成 "Reserved for the host runtime; do not call or
-   select this function."。注意提示词里仍有 “Use the `execute` tool …” 的 Code Mode 段落，
-   模型会据此提到 shell，这是提示词决定的，不靠描述删干净；
+   select this function."，提示词里也已经没有 Code Mode / 工具说明，模型不会再声称自己能跑
+   shell 或读文件；
 3. 客户端没声明工具时，system 末尾再补一句"不要调用工具"；
 4. 兜底：`internal/protocol` 按 `index` 缓冲工具调用，确认不是 `oc2api_` 的整条丢弃，
    `finish_reason` 从 `tool_calls` 回退 `stop`；非流式没有正文时带更强提示重试一次。
