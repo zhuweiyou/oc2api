@@ -39,7 +39,8 @@ scripts/build-go.sh Vercel 构建期交叉编译 linux/amd64 到 bin/
 请求体必须同时满足（缺一项就 429）：
 
 - 官方 system 提示词（`internal/shape/assets/prompt.txt`，运行期填模型名/日期/环境块）；
-- 官方工具集（`internal/shape/assets/tools.json`，12 个工具）；**去掉 tools 或置空直接 429**；
+- 官方工具集：**`tools` 不能为空**（去掉或置空直接 429）。实测**只发 `read` 一项就能过**，
+  所以现在只发 read，避免模型以为自己有 shell / 文件系统；
 - `stream: true` + `stream_options.include_usage`；`stream:false` 也 429，非流式在本地聚合；
 - `max_completion_tokens: 32000`；
 - system 提示词里的 `<env>` 环境块**不能删**：去掉后实测直接 429，整段提示词要按原样保留
@@ -54,8 +55,9 @@ scripts/build-go.sh Vercel 构建期交叉编译 linux/amd64 到 bin/
 免费层要工具集，客户端却没有这些工具，所以：
 
 1. 客户端工具改名 `oc2api_<sanitized>`（`internal/shape`），响应侧还原；
-2. 官方工具的描述统一换成 "Reserved for the host runtime; do not call or select this
-   function."——实测这样模型就不再选中它们，且不影响免费层校验；
+2. 官方工具（现在只有 `read`）的描述换成 "Reserved for the host runtime; do not call or
+   select this function."。注意提示词里仍有 “Use the `execute` tool …” 的 Code Mode 段落，
+   模型会据此提到 shell，这是提示词决定的，不靠描述删干净；
 3. 客户端没声明工具时，system 末尾再补一句"不要调用工具"；
 4. 兜底：`internal/protocol` 按 `index` 缓冲工具调用，确认不是 `oc2api_` 的整条丢弃，
    `finish_reason` 从 `tool_calls` 回退 `stop`；非流式没有正文时带更强提示重试一次。

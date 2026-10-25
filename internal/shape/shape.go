@@ -125,18 +125,24 @@ func officialTools() []any {
 	if err := json.Unmarshal(toolsJSON, &tools); err != nil {
 		panic("官方工具集解析失败: " + err.Error())
 	}
-	// 官方工具只为满足免费层的形状校验，客户端并没有这些工具；
-	// 把描述改成明确的“禁止调用”，尽量让模型不要选中它们。
+	// 免费层只把 read 当作必需门禁：实测只发 read 一样 200，而多发的工具只会让模型
+	// 以为自己有 shell/文件系统。描述统一写“禁止调用”，进一步降低被选中的概率。
+	only := make([]any, 0, 1)
 	for _, raw := range tools {
 		tool, ok := raw.(map[string]any)
 		if !ok {
 			continue
 		}
-		if fn, ok := tool["function"].(map[string]any); ok {
-			fn["description"] = reservedToolDescription
+		fn, ok := tool["function"].(map[string]any)
+		if !ok {
+			continue
+		}
+		fn["description"] = reservedToolDescription
+		if fn["name"] == "read" {
+			only = append(only, tool)
 		}
 	}
-	return tools
+	return only
 }
 
 // Build 把客户端的 OpenAI chat 请求整形成官方客户端的形状。
