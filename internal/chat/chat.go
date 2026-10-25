@@ -15,11 +15,16 @@ import (
 
 // Upstream 发起一次上游对话请求（上游只接受流式，非流式由调用方聚合）。
 func Upstream(ctx context.Context, payload map[string]any, model string) (*http.Response, *shape.Renames, error) {
+	return UpstreamWithSession(ctx, payload, model, zen.SessionID())
+}
+
+// UpstreamWithSession 允许复用会话 id，多轮对话可以命中上游 prompt 缓存。
+func UpstreamWithSession(ctx context.Context, payload map[string]any, model, session string) (*http.Response, *shape.Renames, error) {
 	body, renames, err := shape.Build(payload, model)
 	if err != nil {
 		return nil, nil, err
 	}
-	resp, err := zen.Post(ctx, "/openai/v1/chat/completions", body, zen.SessionID())
+	resp, err := zen.Post(ctx, "/openai/v1/chat/completions", body, session)
 	if err != nil {
 		return nil, nil, err
 	}

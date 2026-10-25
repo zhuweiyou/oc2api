@@ -72,23 +72,25 @@ Vercel 的 Go runtime 会**缓冲整段响应**：用 700ms 间隔 flush 的测�
 `public/robots.txt`（**不能放 index.html**，否则 `/` 会被静态文件抢走，拿不到和
 `/health` 同构的 JSON）。仓库里没有 `public/`。
 
-## 测试 / CI
+## 测试
+
+离线单元测试（整形、响应过滤、错误语义）：
 
 ```bash
-go test ./...        # 单元测试（离线）
+go test ./...
 go vet ./...
 gofmt -l .
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ./cmd/oc2api
 ```
 
-真实联调依赖上游免费额度，不进 CI：额度用完后上游回 429，和"形态不对"的 429
-文案相同，容易误判。区分办法：403 `FreeTierError` 才是形态问题；
-429 且带 `Retry-After` 通常是额度或网络被限。
+改动之后跑一次真实冒烟（`internal/chat/live_test.go`）：一次流式 + 自定义工具的请求，
+再用同一段对话追问一轮，两次都 200 且流里有正文和 `[DONE]` 即通过。
 
-## 常见坑
+```bash
+OC2API_LIVE_TEST=1 go test ./internal/chat -run Live -v
+```
 
-- 改动提示词/工具集后，先用 `curl /v1/chat/completions` 打一次真实请求确认 200，
-  再用「列出当前目录下的文件」这类问题确认模型没有选中内置工具。
-- `internal/shape/assets/tools.json` 是官方客户端的原始 schema，任何格式化工具都
-  不要动它，改坏会影响免费层校验。
-- Vercel 上 `API_KEY` 不设就是匿名（与原 Node 版一致）。
+默认跳过，因为它消耗免费额度。额度用尽时上游回 429，和"形态不对"的 429 文案相同：
+403 `FreeTierError` 才是形态问题，429 且带 `Retry-After` 通常是额度或网络被限。
+本地 IP 没额度时，同样的两轮请求可以直接打部署实例验证（`curl -N`，第二轮把上一轮的
+assistant 消息带回 messages）。
