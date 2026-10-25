@@ -132,7 +132,7 @@ func handleChat(ctx context.Context, req request, emit emitter) {
 		emitError(emit, req.ID, -32000, err.Error())
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		text, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))

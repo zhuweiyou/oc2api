@@ -1,0 +1,10 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  # 标准集：errcheck / govet / ineffassign / staticcheck / unused
+  default: standard
+  enable:
+    - misspell

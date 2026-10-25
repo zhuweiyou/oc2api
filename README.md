@@ -152,9 +152,9 @@ Authorization: Bearer <api-key>
 ## 开发
 
 ```bash
-go test ./...      # 离线单元测试
+go test ./...              # 离线单元测试
 go vet ./...
-gofmt -l .
+golangci-lint run ./...    # lint（配置见 .golangci.yml）
 ```
 
 实现细节（为什么用 uTLS、免费层的形状要求、Vercel 为什么是薄 Node 层）见 [AGENTS.md](AGENTS.md)。

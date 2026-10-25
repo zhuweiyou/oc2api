@@ -66,7 +66,7 @@ func streamOnce(t *testing.T, model, session string, payload map[string]any, tim
 	if err != nil {
 		t.Fatalf("请求失败: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		t.Fatalf("期望 200，实际 %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))

@@ -58,7 +58,7 @@ func Complete(ctx context.Context, payload map[string]any, model string) (map[st
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		text, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		return nil, &UpstreamError{Status: resp.StatusCode, RetryAfter: resp.Header.Get("Retry-After"), Body: text}
@@ -76,7 +76,7 @@ func Complete(ctx context.Context, payload map[string]any, model string) (map[st
 	if err != nil {
 		return result, nil
 	}
-	defer resp2.Body.Close()
+	defer func() { _ = resp2.Body.Close() }()
 	if resp2.StatusCode != http.StatusOK {
 		return result, nil
 	}

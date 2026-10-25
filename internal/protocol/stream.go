@@ -12,18 +12,11 @@ import (
 	"oc2api/internal/shape"
 )
 
-// 上游只支持 SSE；非流式请求在 Aggregate 里聚合。
-type toolCallState struct {
-	ID        string
-	Name      string
-	Arguments strings.Builder
-}
-
 // Stream 逐帧转发上游 SSE：把 clint_ 工具名还原成客户端声明的名字，
 // 同时丢掉上游自己选中、但客户端没声明的内置工具调用（客户端无法执行它们）。
 func Stream(w io.Writer, upstream *http.Response, renames *shape.Renames) error {
 	writer := bufio.NewWriter(w)
-	defer writer.Flush()
+	defer func() { _ = writer.Flush() }()
 
 	decisions := map[int]bool{} // true=保留, false=丢弃
 	var buffered []string

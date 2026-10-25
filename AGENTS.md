@@ -79,9 +79,11 @@ Vercel 的 Go runtime 会**缓冲整段响应**：用 700ms 间隔 flush 的测�
 ```bash
 go test ./...
 go vet ./...
-gofmt -l .
+golangci-lint run ./...
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ./cmd/oc2api
 ```
+
+lint 配置在 `.golangci.yml`：标准集（errcheck / govet / ineffassign / staticcheck / unused）加 misspell。
 
 改动之后跑一次真实冒烟（`internal/chat/live_test.go`）：一次流式 + 自定义工具的请求，
 再用同一段对话追问一轮，两次都 200 且流里有正文和 `[DONE]` 即通过。

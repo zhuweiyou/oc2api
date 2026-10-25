@@ -89,11 +89,11 @@ func Client() *http.Client {
 				}
 				tlsConn := utls.UClient(conn, &utls.Config{ServerName: host}, utls.HelloCustom)
 				if err := tlsConn.ApplyPreset(bunClientHello()); err != nil {
-					conn.Close()
+					_ = conn.Close()
 					return nil, err
 				}
 				if err := tlsConn.HandshakeContext(ctx); err != nil {
-					conn.Close()
+					_ = conn.Close()
 					return nil, err
 				}
 				return tlsConn, nil
@@ -138,7 +138,7 @@ func SessionID() string {
 	var b strings.Builder
 	b.WriteString("ses_")
 	for i := 0; i < 6; i++ {
-		b.WriteString(fmt.Sprintf("%02x", byte(value>>(40-8*i))))
+		fmt.Fprintf(&b, "%02x", byte(value>>(40-8*i)))
 	}
 	random := make([]byte, 14)
 	_, _ = rand.Read(random)
@@ -200,7 +200,7 @@ func FetchModels(ctx context.Context) ([]map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	if res.StatusCode != http.StatusOK {
 		text, _ := io.ReadAll(io.LimitReader(res.Body, 512))
 		return nil, fmt.Errorf("上游模型列表返回 %d: %s", res.StatusCode, strings.TrimSpace(string(text)))

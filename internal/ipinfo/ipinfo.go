@@ -19,7 +19,7 @@ func Lookup(client *http.Client) (string, string) {
 			continue
 		}
 		body, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
-		res.Body.Close()
+		_ = res.Body.Close()
 		if match := ipv4Pattern.FindString(string(body)); match != "" {
 			return match, source
 		}
