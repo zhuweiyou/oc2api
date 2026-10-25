@@ -1,16 +1,17 @@
-.vercel/
-node_modules/
-.idea/
+# 构建产物
+/bin/
+/public/
+*.log
+
+# 本地环境
 .env
 .env.*
 !.env.example
-oc2api
-*.log
-.DS_Store
-coverage/
-.vercel
-.env*
 
-worker/dist/
-bin/
-public/
+# 编辑器 / 系统
+.idea/
+.DS_Store
+
+# 部署与本地产物
+.vercel/
+.captures/

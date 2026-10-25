@@ -1,8 +1,13 @@
 .git/
 .github/
 .vercel/
+.captures/
 .idea/
 .env*
 *.log
 .DS_Store
 bin/
+public/
+api/
+scripts/
+**/*_test.go

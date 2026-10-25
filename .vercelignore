@@ -1,6 +1,11 @@
 .git/
 .github/
 .idea/
+.captures/
 .env*
-tests/
+*.log
+.DS_Store
 docker/
+bin/
+public/
+**/*_test.go
