@@ -1,4 +1,4 @@
-package zc
+package zen
 
 import (
 	"context"
@@ -20,7 +20,6 @@ import (
 
 const (
 	UpstreamBase = "https://opencode.ai/inference"
-	Version      = "4.0.0"
 	clientUA     = "opencode/latest/2.1.4/cli"
 	projectID    = "3f3f7816fd9ceeaf0c3df15f6048b06b7f4e1787"
 )

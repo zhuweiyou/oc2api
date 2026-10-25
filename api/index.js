@@ -25,8 +25,7 @@ function ensureChild() {
   fs.chmodSync(BIN_PATH, 0o755)
   child = spawn(BIN_PATH, ["-stdio"], { stdio: ["pipe", "pipe", "pipe"] })
   child.stderr.on("data", (chunk) => console.error("[go]", chunk.toString().trim()))
-  const lines = createInterface({ input: child.stdout })
-  lines.on("line", (line) => {
+  createInterface({ input: child.stdout }).on("line", (line) => {
     let message
     try {
       message = JSON.parse(line)
@@ -36,25 +35,25 @@ function ensureChild() {
     const entry = pending.get(message.id)
     if (!entry) return
     if (message.method === "sse") {
-      entry.onEvent?.("sse", message.params?.data ?? "")
+      entry.onEvent?.(message.params?.data ?? "")
       return
     }
     if (message.method === "end") {
       pending.delete(message.id)
-      entry.resolve({ ended: true })
+      entry.resolve({ type: "end" })
       return
     }
     if (message.error) {
       pending.delete(message.id)
-      entry.reject(new Error(message.error.message || "rpc error"))
+      entry.resolve({ type: "rpc_error", error: message.error.message || "rpc error" })
       return
     }
     pending.delete(message.id)
-    entry.resolve(message.result)
+    entry.resolve({ type: "result", value: message.result })
   })
   child.on("exit", () => {
     child = null
-    for (const [, entry] of pending) entry.reject(new Error("go core exited"))
+    for (const [, entry] of pending) entry.resolve({ type: "rpc_error", error: "go core exited" })
     pending.clear()
   })
   child.stdin.on("error", () => {})
@@ -64,8 +63,8 @@ function ensureChild() {
 function rpcCall(method, params, onEvent) {
   const proc = ensureChild()
   const id = nextId++
-  return new Promise((resolve, reject) => {
-    pending.set(id, { resolve, reject, onEvent })
+  return new Promise((resolve) => {
+    pending.set(id, { resolve, onEvent })
     proc.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`)
   })
 }
@@ -85,12 +84,14 @@ const errorPayload = (message, type, code) => ({
   error: { message, type, ...(code ? { code } : {}) },
 })
 
+// 与 Node 版 authenticate 等价：authorization 优先，回退 x-api-key；
+// 带不带 "Bearer " 前缀都接受，比较的是去掉前缀后的原始 token。
 function authorized(req) {
   const key = process.env.API_KEY
   if (!key) return true
-  const header = req.headers.authorization || ""
-  if (header.startsWith("Bearer ") && header.slice(7).trim() === key) return true
-  return (req.headers["x-api-key"] || "").trim() === key
+  const header = req.headers.authorization || req.headers["x-api-key"] || ""
+  const token = header.toLowerCase().startsWith("bearer ") ? header.slice(7).trim() : header.trim()
+  return token === key
 }
 
 function readBody(req) {
@@ -102,6 +103,18 @@ function readBody(req) {
   })
 }
 
+async function rpcJson(req, res, method, params) {
+  const outcome = await rpcCall(method, params)
+  if (outcome.type !== "result") {
+    return sendJson(res, 503, errorPayload(outcome.error || "go core unavailable", "upstream_error"))
+  }
+  if (typeof outcome.value?.status === "number" && outcome.value.status !== 200) {
+    const headers = outcome.value.retryAfter ? { "Retry-After": outcome.value.retryAfter } : {}
+    return sendJson(res, outcome.value.status, outcome.value.error, headers)
+  }
+  return sendJson(res, 200, outcome.value)
+}
+
 export default async function handler(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`)
   const path = url.pathname.replace(/\/+$/, "") || "/"
@@ -111,18 +124,8 @@ export default async function handler(req, res) {
     return res.end()
   }
 
-  if (path === "/" || path === "/health") {
-    try {
-      const result = await rpcCall("health", {})
-      return sendJson(res, 200, { ...result, runtime: "vercel-go-core" })
-    } catch (error) {
-      return sendJson(res, 503, errorPayload(String(error.message), "upstream_error"))
-    }
-  }
-
-  if (path === "/ip") {
-    return sendJson(res, 200, { ip: req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || null })
-  }
+  if (path === "/" || path === "/health") return rpcJson(req, res, "health", {}, 503)
+  if (path === "/ip") return rpcJson(req, res, "ip", {})
 
   if (!["/v1/models", "/models", "/v1/chat/completions", "/chat/completions"].includes(path)) {
     return sendJson(res, 404, errorPayload("Not found", "invalid_request_error"))
@@ -132,14 +135,7 @@ export default async function handler(req, res) {
     return sendJson(res, 401, errorPayload("Invalid API key", "authentication_error"))
   }
 
-  if (path === "/v1/models" || path === "/models") {
-    try {
-      const result = await rpcCall("models", {})
-      return sendJson(res, 200, result)
-    } catch (error) {
-      return sendJson(res, 502, errorPayload(String(error.message), "upstream_error", "upstream_error"))
-    }
-  }
+  if (path === "/v1/models" || path === "/models") return rpcJson(req, res, "models", {})
 
   const raw = await readBody(req)
   let payload
@@ -148,33 +144,31 @@ export default async function handler(req, res) {
   } catch {
     return sendJson(res, 400, errorPayload("Invalid JSON body", "invalid_request_error"))
   }
-
-  const stream = payload.stream === true
-  if (!stream) {
-    try {
-      const result = await rpcCall("chat", { body: payload, stream: false })
-      if (result?.status && result.status !== 200) {
-        const headers = result.retryAfter ? { "Retry-After": result.retryAfter } : {}
-        return sendJson(res, result.status, result.error, headers)
-      }
-      return sendJson(res, 200, result)
-    } catch (error) {
-      return sendJson(res, 502, errorPayload(String(error.message), "upstream_error", "upstream_stream_error"))
-    }
+  if (payload?.stream !== true) {
+    return rpcJson(req, res, "chat", { body: payload, stream: false })
   }
 
-  res.writeHead(200, {
-    ...CORS,
-    "Content-Type": "text/event-stream; charset=utf-8",
-    "Cache-Control": "no-cache, no-transform",
-    "X-Accel-Buffering": "no",
+  // 流式：先等第一条消息，确认不是校验错误再提交 SSE 响应头。
+  let started = false
+  const outcome = await rpcCall("chat", { body: payload, stream: true }, (data) => {
+    if (!started) {
+      res.writeHead(200, {
+        ...CORS,
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",
+      })
+      started = true
+    }
+    res.write(data)
   })
-  try {
-    await rpcCall("chat", { body: payload, stream: true }, (_event, data) => {
-      res.write(data)
-    })
-  } catch {
-    // 上游错误已在业务层处理，这里只保证连接收尾。
+
+  if (!started) {
+    if (outcome.type === "result" && typeof outcome.value?.status === "number" && outcome.value.status !== 200) {
+      const headers = outcome.value.retryAfter ? { "Retry-After": outcome.value.retryAfter } : {}
+      return sendJson(res, outcome.value.status, outcome.value.error, headers)
+    }
+    return sendJson(res, 502, errorPayload(outcome.error || "upstream stream error", "upstream_error"))
   }
   res.end()
 }

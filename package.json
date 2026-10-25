@@ -12,7 +12,8 @@
     "test:live": "OC2API_LIVE_TEST=1 node --test tests/node/live.test.js",
     "lint": "eslint .",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "start:go": "go run ./cmd/oc2api"
   },
   "dependencies": {
     "cors": "^2.8.6",

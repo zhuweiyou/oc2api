@@ -3,7 +3,7 @@ import { createServer, request as httpRequest } from "node:http"
 import { once } from "node:events"
 import test from "node:test"
 
-import vercelApp from "../../api/index.js"
+import thinEntry from "../../api/index.js"
 import app from "../../server/app.js"
 import { config } from "../../server/config.js"
 
@@ -16,8 +16,10 @@ const sse = [
 
 const base = { model: "big-pickle", messages: [{ role: "user", content: "hi" }] }
 
-test("Vercel 入口导出同一个 Express app", () => {
-  assert.strictEqual(vercelApp, app)
+test("Vercel 入口是薄层处理器，不再是 Express app", () => {
+  // 业务逻辑已迁到 Go 核心，Vercel 入口只做路由/鉴权/SSE 翻译。
+  assert.equal(typeof thinEntry, "function")
+  assert.notStrictEqual(thinEntry, app)
 })
 
 test("health、CORS 与未知路径不经过鉴权", async (t) => {

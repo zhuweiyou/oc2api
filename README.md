@@ -162,6 +162,35 @@ curl http://localhost:8080/health
 
 </details>
 
+## Go 核心
+
+`internal/` 下是一套纯 Go 实现，与 Node 版端点、鉴权、错误语义保持一致：
+
+```bash
+go run ./cmd/oc2api            # 默认起 HTTP 服务（PORT，默认 8080）
+go run ./cmd/oc2api -rpc       # HTTP JSON-RPC（调试用）
+go run ./cmd/oc2api -stdio     # stdio JSON-RPC（Vercel 由 Node 拉起）
+```
+
+为什么要 Go：免费层按**传输层指纹**识别客户端，Node/curl/Cloudflare 的 TLS 握手一律回 `429`，
+只有 Bun（OpenCode 官方客户端的运行时）能过。Go 用 `utls` 复刻 Bun 的 ClientHello
+（JA4 `t13d1713h1`），再配合官方的 system 提示词、官方工具集、`max_completion_tokens`
+和 `ses_` 会话 id，才能稳定拿到 200。
+
+| 包                  | 职责                                                |
+| ------------------- | --------------------------------------------------- |
+| `internal/config`   | 环境变量与版本号                                    |
+| `internal/zen`      | uTLS 传输、上游请求、会话 id、模型列表              |
+| `internal/shape`    | 系统提示词与工具整形（`clint_` 改名、32k 输出上限） |
+| `internal/chat`     | 串起整形与上游调用，非流式聚合 + 兜底重试           |
+| `internal/protocol` | SSE 解析、聚合、`[DONE]`/错误语义、内置工具过滤     |
+| `internal/httpapi`  | 本地/Docker 的 HTTP 入口                            |
+| `internal/rpc`      | JSON-RPC（HTTP 与 stdio 两种载体）                  |
+
+Vercel 上不能用 Go 函数直接跑：Go runtime 会缓冲整段响应，流式（SSE）出不来。
+所以 `scripts/build-go.sh` 在构建期交叉编译 linux 二进制，`api/index.js` 首次请求时
+`spawn` 并常驻，用带 `id` 的 JSON-RPC 分发并发请求，Node 只负责路由、鉴权和 SSE 翻译。
+
 ## API
 
 兼容 OpenAI API 格式，路径均支持带 `/v1` 前缀或不带：

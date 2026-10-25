@@ -1,4 +1,4 @@
-package zc
+package shape
 
 import (
 	"bytes"
@@ -60,6 +60,15 @@ func (r *Renames) rename(name string) string {
 }
 
 // Restore 把上游返回的工具名还原成客户端声明的名字。
+// IsRenamed 判断某个上游工具名是不是我们改写过名的客户端工具。
+func (r *Renames) IsRenamed(name string) bool {
+	if r == nil {
+		return false
+	}
+	_, ok := r.reverse[name]
+	return ok
+}
+
 func (r *Renames) Restore(name string) string {
 	if r == nil {
 		return name
@@ -91,7 +100,7 @@ func officialTools() []any {
 }
 
 // Build 把客户端的 OpenAI chat 请求整形成官方客户端的形状。
-func Build(payload map[string]any, model string, _ bool) ([]byte, *Renames, error) {
+func Build(payload map[string]any, model string) ([]byte, *Renames, error) {
 	renames := newRenames()
 
 	rawMessages, _ := payload["messages"].([]any)
@@ -116,6 +125,11 @@ func Build(payload map[string]any, model string, _ bool) ([]byte, *Renames, erro
 	system := officialPrompt(model)
 	if len(clientSystem) > 0 {
 		system += "\n\n" + strings.Join(clientSystem, "\n\n")
+	}
+	// 客户端没声明任何工具时，明确告诉模型别用内置工具：它们只是免费层的形状要求，
+	// 客户端执行不了，真被选中也只能在响应侧丢弃。
+	if !hasClientTools(payload) {
+		system += "\n\nThe current client provides no tools. Answer directly in text and do not call any tool."
 	}
 	messages = append([]any{map[string]any{"role": "system", "content": system}}, messages...)
 
@@ -188,6 +202,20 @@ func Build(payload map[string]any, model string, _ bool) ([]byte, *Renames, erro
 	}
 	buffer.WriteByte('}')
 	return buffer.Bytes(), renames, nil
+}
+
+func hasClientTools(payload map[string]any) bool {
+	tools, _ := payload["tools"].([]any)
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, ok := tool["function"].(map[string]any); ok {
+			return true
+		}
+	}
+	return false
 }
 
 func contentText(content any) string {
