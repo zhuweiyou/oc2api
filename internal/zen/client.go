@@ -88,18 +88,20 @@ func New(cfg config.Config) *Client {
 // newTransport 用同一个超时兜住建连、TLS 握手与等响应头；正文流式读取不设上限，
 // 否则长回答会被截断。
 func newTransport(connectTimeout time.Duration) *http.Transport {
+	// 自建中继可能是 http://（不经过 DialTLSContext），所以普通拨号也要挂同一个超时。
+	dialer := &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
 	return &http.Transport{
 		ForceAttemptHTTP2:     false,
 		MaxIdleConnsPerHost:   32,
 		IdleConnTimeout:       90 * time.Second,
 		ResponseHeaderTimeout: connectTimeout,
+		DialContext:           dialer.DialContext,
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			host, _, err := net.SplitHostPort(addr)
 			if err != nil {
 				host = addr
 			}
-			dialer := &net.Dialer{Timeout: connectTimeout}
-			conn, err := dialer.DialContext(ctx, "tcp", addr)
+			conn, err := dialer.DialContext(ctx, network, addr)
 			if err != nil {
 				return nil, err
 			}
