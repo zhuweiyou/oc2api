@@ -6,10 +6,10 @@
 
 ```
 cmd/oc2api/        入口：默认 HTTP 服务；-stdio 起 stdio JSON-RPC（Vercel 用）
-internal/config    环境变量与版本号
-internal/zen       uTLS 传输（Bun ClientHello）、上游请求、ses_ 会话、模型列表
+internal/config    环境变量与版本号：Load() 读一次并校验，之后靠注入传下去
+internal/zen       uTLS 传输（Bun ClientHello）、上游路径与超时、ses_ 会话、模型列表
 internal/shape     官方 system 提示词 + 工具集整形（oc2api_ 改名、32k 上限）
-internal/chat      整形 → 上游 → 非流式聚合与兜底重试
+internal/chat      整形 → 上游 → 非流式聚合与兜底重试（Service 持有注入的 client）
 internal/protocol  SSE 解析、聚合、[DONE]/错误语义、内置工具过滤
 internal/httpapi   本地/Docker HTTP 入口（/、/health、/ip、/v1/*）
 internal/rpc       JSON-RPC 2.0 over stdio（Vercel 薄层用）
@@ -18,6 +18,21 @@ scripts/build-go.sh Vercel 构建期交叉编译 linux/amd64 到 bin/
 ```
 
 依赖方向单向：`config → zen/shape → chat → protocol → httpapi/rpc`。
+
+## 配置怎么传
+
+`internal/config` 是唯一读 `os.Getenv` 的地方（`Load()`，无缓存、无单例）。`main` 启动时
+调一次 `config.Load()`，再把 `config.Config` 注入 `zen.New`、`chat.New`、`httpapi.New`、
+`rpc.New`；其它包不许再自己读环境变量。校验失败直接 `log.Fatalf`，不要静默回落。
+
+`ZEN_API_BASE_URL` 只填**站点根**（默认 `https://opencode.ai`），接口路径写在
+`internal/zen` 的 `chatPath` / `modelsPath` 常量里（`/inference/v1/chat/completions`、
+`/inference/v1/models`，两者实测 200）。上游换路径只改这两行，部署配置不用动。
+
+超时只有一个旋钮 `ZEN_CONNECT_TIMEOUT_MS`（默认 60 秒，1–600000），同时管 TCP 建连、
+TLS 握手和等响应头；正文流式读取不设上限。注意：自定义 `DialTLSContext` 之后
+`http.Transport.TLSHandshakeTimeout` 不生效，握手超时是在 dial 里自己加 deadline 兜的，
+改这里别把 `handshakeCtx` 删了。
 
 ## 为什么必须用 uTLS
 

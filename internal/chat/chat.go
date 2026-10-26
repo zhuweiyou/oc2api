@@ -9,33 +9,41 @@ import (
 	"strings"
 
 	"oc2api/internal/config"
-
 	"oc2api/internal/protocol"
-
 	"oc2api/internal/shape"
 	"oc2api/internal/zen"
 )
 
+// Service 持有一次对话需要的依赖，由 main 注入。
+type Service struct {
+	client *zen.Client
+	debug  bool
+}
+
+// New 注入上游客户端与调试开关。
+func New(cfg config.Config, client *zen.Client) *Service {
+	return &Service{client: client, debug: cfg.Debug}
+}
+
 // Upstream 发起一次上游对话请求（上游只接受流式，非流式由调用方聚合）。
-func Upstream(ctx context.Context, payload map[string]any, model string) (*http.Response, *shape.Renames, error) {
-	return UpstreamWithSession(ctx, payload, model, zen.SessionID())
+func (s *Service) Upstream(ctx context.Context, payload map[string]any, model string) (*http.Response, *shape.Renames, error) {
+	return s.UpstreamWithSession(ctx, payload, model, zen.SessionID())
 }
 
 // UpstreamWithSession 允许复用会话 id，多轮对话可以命中上游 prompt 缓存。
-func UpstreamWithSession(ctx context.Context, payload map[string]any, model, session string) (*http.Response, *shape.Renames, error) {
+func (s *Service) UpstreamWithSession(ctx context.Context, payload map[string]any, model, session string) (*http.Response, *shape.Renames, error) {
 	body, renames, err := shape.Build(payload, model)
 	if err != nil {
 		return nil, nil, err
 	}
-	debug := config.Get().Debug
-	if debug {
+	if s.debug {
 		log.Printf("[chat] model=%s session=%s%s tools=%d body=%dB", model, session, describeMessages(payload), countClientTools(payload), len(body))
 	}
-	resp, err := zen.Post(ctx, "/openai/v1/chat/completions", body, session)
+	resp, err := s.client.Chat(ctx, body, session)
 	if err != nil {
 		return nil, nil, err
 	}
-	if debug {
+	if s.debug {
 		log.Printf("[chat] upstream status=%d retry-after=%s", resp.StatusCode, resp.Header.Get("Retry-After"))
 	}
 	return resp, renames, nil
@@ -81,8 +89,8 @@ func Validate(payload map[string]any) (model string, reason string) {
 const noToolRetry = "（本客户端没有可用的工具，请直接用文字回答，不要调用任何工具。）"
 
 // Complete 返回聚合后的非流式响应。
-func Complete(ctx context.Context, payload map[string]any, model string) (map[string]any, error) {
-	resp, renames, err := Upstream(ctx, payload, model)
+func (s *Service) Complete(ctx context.Context, payload map[string]any, model string) (map[string]any, error) {
+	resp, renames, err := s.Upstream(ctx, payload, model)
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +108,7 @@ func Complete(ctx context.Context, payload map[string]any, model string) (map[st
 	}
 
 	retryPayload := withNudge(payload)
-	resp2, renames2, err := Upstream(ctx, retryPayload, model)
+	resp2, renames2, err := s.Upstream(ctx, retryPayload, model)
 	if err != nil {
 		return result, nil
 	}

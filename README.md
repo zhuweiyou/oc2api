@@ -61,10 +61,9 @@ flowchart TD
 
 <br>
 
-**直接拉取预构建镜像**
+**拉取镜像**
 
-推送到 `main` 或推 `v*` 标签时，`Publish image` 工作流会自动构建 `linux/amd64` 与
-`linux/arm64` 镜像，发布到 [`ghcr.io/zhuweiyou/oc2api`](https://github.com/zhuweiyou/oc2api/pkgs/container/oc2api)：
+现成镜像在 [`ghcr.io/zhuweiyou/oc2api`](https://github.com/zhuweiyou/oc2api/pkgs/container/oc2api)：
 
 ```bash
 docker pull ghcr.io/zhuweiyou/oc2api:latest
@@ -75,13 +74,10 @@ docker run -d --name oc2api --restart unless-stopped \
   ghcr.io/zhuweiyou/oc2api:latest
 ```
 
-| 触发方式               | 镜像标签                                                       |
-| ---------------------- | -------------------------------------------------------------- |
-| 推送到 `main`          | `latest`、`sha-<完整提交 SHA>`                                 |
-| 推送版本标签 `v2.10.0` | `2.10.0`、`2.10`、`sha-<完整提交 SHA>`（`latest` 只跟 `main`） |
-| Actions 页手动运行     | 当前分支或标签的 `sha-<完整提交 SHA>`                          |
+`latest` 跟着最新版本走；要固定版本就把标签换成版本号，例如 `:4.1.0`。
 
-首次发布后如需匿名拉取，在 **Packages → 镜像包 → Package settings** 把可见性设为 **Public**。
+容器监听 `PORT`，默认 `8080`。镜像基于 `scratch`，里面只有静态二进制和 CA 证书。
+云函数环境建议把超时调到 300 秒，否则长回答的流式响应会被提前截断。
 
 **本地构建**
 
@@ -90,9 +86,6 @@ docker run -d --name oc2api --restart unless-stopped \
 ```bash
 cd docker && docker compose up -d --build
 ```
-
-镜像基于 `scratch`，容器内只有静态二进制和 CA 证书，监听 `PORT`（默认 `8080`）。
-云函数环境建议把超时调到 300 秒，否则长回答的流式响应会被提前截断。
 
 </details>
 
@@ -108,8 +101,11 @@ go run ./cmd/oc2api                # 默认 :8080
 API_KEY=your-key PORT=8080 go run ./cmd/oc2api
 ```
 
-- `ZEN_API_BASE_URL`：上游地址，默认 `https://opencode.ai/inference`
-- `ZEN_CONNECT_TIMEOUT_MS`：建连超时，默认 600000 毫秒
+- `PORT`：监听端口，默认 `8080`
+- `API_KEY`：请求鉴权，留空则匿名
+- `ZEN_API_BASE_URL`：上游站点根地址，默认 `https://opencode.ai`；接口路径由程序拼接，
+  自建中继只填根地址即可
+- `ZEN_CONNECT_TIMEOUT_MS`：建连、TLS 握手与等响应头的超时，默认 `60000`，允许 `1`–`600000`
 - `DEBUG`：设为 `true` 输出调试日志
 
 健康检查：

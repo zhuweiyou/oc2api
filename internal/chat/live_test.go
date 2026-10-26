@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"oc2api/internal/config"
 	"oc2api/internal/protocol"
 	"oc2api/internal/zen"
 )
@@ -27,6 +28,7 @@ func TestLiveStreamWithToolThenFollowUp(t *testing.T) {
 
 	const model = "deepseek-v4.1-flash-free"
 	session := zen.SessionID()
+	service := newLiveService(t)
 
 	weather := map[string]any{
 		"type": "function",
@@ -42,7 +44,7 @@ func TestLiveStreamWithToolThenFollowUp(t *testing.T) {
 		"messages": []any{map[string]any{"role": "user", "content": "用 get_weather 查一下北京天气，然后告诉我。"}},
 		"tools":    []any{weather},
 	}
-	text := streamOnce(t, model, session, first, 150*time.Second)
+	text := streamOnce(t, service, model, session, first, 150*time.Second)
 
 	second := map[string]any{
 		"model": model,
@@ -53,16 +55,26 @@ func TestLiveStreamWithToolThenFollowUp(t *testing.T) {
 		},
 		"tools": []any{weather},
 	}
-	streamOnce(t, model, session, second, 150*time.Second)
+	streamOnce(t, service, model, session, second, 150*time.Second)
+}
+
+// newLiveService 用真实环境变量组装对话服务（默认上游、默认超时）。
+func newLiveService(t *testing.T) *Service {
+	t.Helper()
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("读取配置失败: %v", err)
+	}
+	return New(cfg, zen.New(cfg))
 }
 
 // streamOnce 发一次流式请求，返回正文（可能为空），并断言流里有 [DONE]。
-func streamOnce(t *testing.T, model, session string, payload map[string]any, timeout time.Duration) string {
+func streamOnce(t *testing.T, service *Service, model, session string, payload map[string]any, timeout time.Duration) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	resp, renames, err := UpstreamWithSession(ctx, payload, model, session)
+	resp, renames, err := service.UpstreamWithSession(ctx, payload, model, session)
 	if err != nil {
 		t.Fatalf("请求失败: %v", err)
 	}

@@ -38,9 +38,9 @@ func writeOpenAIError(w http.ResponseWriter, status int, message, kind, code str
 	writeJSON(w, status, map[string]any{"error": body}, nil)
 }
 
-// Server 组装路由：/ 与 /health 公开，其余按 API_KEY 鉴权。
-func Server() http.Handler {
-	cfg := config.Get()
+// New 组装路由：/ 与 /health 公开，其余按 API_KEY 鉴权。
+// 配置与上游客户端都由 main 注入，这里不再读环境变量。
+func New(cfg config.Config, client *zen.Client, chats *chat.Service) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", withCORS(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -53,13 +53,13 @@ func Server() http.Handler {
 				writeOpenAIError(w, http.StatusUnauthorized, "Invalid API key", "authentication_error", "")
 				return
 			}
-			models(w, r)
+			models(w, r, client)
 		case "/v1/chat/completions", "/chat/completions":
 			if !authorized(cfg, r) {
 				writeOpenAIError(w, http.StatusUnauthorized, "Invalid API key", "authentication_error", "")
 				return
 			}
-			completions(w, r)
+			completions(w, r, chats)
 		default:
 			writeOpenAIError(w, http.StatusNotFound, "Not found", "invalid_request_error", "")
 		}
@@ -92,8 +92,8 @@ func authorized(cfg config.Config, r *http.Request) bool {
 	return token == cfg.APIKey
 }
 
-func models(w http.ResponseWriter, r *http.Request) {
-	list, err := zen.FetchModels(r.Context())
+func models(w http.ResponseWriter, r *http.Request, client *zen.Client) {
+	list, err := client.Models(r.Context())
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "Upstream error: "+err.Error(), "upstream_error", "upstream_error")
 		return
@@ -111,7 +111,7 @@ func ip(w http.ResponseWriter) {
 	writeJSON(w, http.StatusOK, map[string]any{"ip": found, "source": source}, nil)
 }
 
-func completions(w http.ResponseWriter, r *http.Request) {
+func completions(w http.ResponseWriter, r *http.Request, chats *chat.Service) {
 	if r.Method != http.MethodPost {
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "Not found", "invalid_request_error", "")
 		return
@@ -134,7 +134,7 @@ func completions(w http.ResponseWriter, r *http.Request) {
 	stream, _ := payload["stream"].(bool)
 
 	if !stream {
-		result, err := chat.Complete(r.Context(), payload, model)
+		result, err := chats.Complete(r.Context(), payload, model)
 		if err != nil {
 			var upstream *chat.UpstreamError
 			if errors.As(err, &upstream) {
@@ -152,7 +152,7 @@ func completions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, renames, err := chat.Upstream(r.Context(), payload, model)
+	resp, renames, err := chats.Upstream(r.Context(), payload, model)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "Upstream error: "+err.Error(), "upstream_error", "upstream_error")
 		return
