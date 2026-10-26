@@ -74,7 +74,7 @@ docker run -d --name oc2api --restart unless-stopped \
   ghcr.io/zhuweiyou/oc2api:latest
 ```
 
-`latest` 跟着最新版本走；要固定版本就把标签换成版本号，例如 `:4.1.0`。
+`latest` 跟着最新版本走；要固定版本就把标签换成版本号，例如 `:4.2.0`。
 
 容器监听 `PORT`，默认 `8080`。镜像基于 `scratch`，里面只有静态二进制和 CA 证书。
 云函数环境建议把超时调到 300 秒，否则长回答的流式响应会被提前截断。

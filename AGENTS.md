@@ -1,6 +1,6 @@
 # AGENTS.md
 
-给维护者和 AI 看的开发细节。用户文档在 [README.md](README.md)。当前版本 `4.1.0`。
+给维护者和 AI 看的开发细节。用户文档在 [README.md](README.md)。当前版本 `4.2.0`。
 
 ## 架构
 
