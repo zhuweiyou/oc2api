@@ -103,10 +103,6 @@ func (r *Renames) Restore(name string) string {
 	return name
 }
 
-// reservedToolDescription 让模型别去选内置工具：它们只是免费层的形状要求，
-// 客户端执行不了。这一招沿用旧 Node 实现（只带 read 时同样这样写）。
-const reservedToolDescription = "Reserved for the host runtime; do not call or select this function. Use tools explicitly supplied by the user instead."
-
 // officialPrompt 生成随模型/环境变化的官方系统提示词。
 func officialPrompt(model string) string {
 	// 客户端的工作目录不会经过 API 传上来，这里给一个稳定的占位值，
@@ -140,24 +136,9 @@ func officialTools() []any {
 	if err := json.Unmarshal(toolsJSON, &tools); err != nil {
 		panic("官方工具集解析失败: " + err.Error())
 	}
-	// 免费层只把 read 当作必需门禁：实测只发 read 一样 200，而多发的工具只会让模型
-	// 以为自己有 shell/文件系统。描述统一写“禁止调用”，进一步降低被选中的概率。
-	only := make([]any, 0, 1)
-	for _, raw := range tools {
-		tool, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		fn, ok := tool["function"].(map[string]any)
-		if !ok {
-			continue
-		}
-		fn["description"] = reservedToolDescription
-		if fn["name"] == "read" {
-			only = append(only, tool)
-		}
-	}
-	return only
+	// 与官方客户端一致：整套内置工具都发给上游。
+	// 工具定义本身（描述、schema）保持原样，不做任何改写。
+	return tools
 }
 
 // Build 把客户端的 OpenAI chat 请求整形成官方客户端的形状。
