@@ -12,7 +12,7 @@ import (
 )
 
 // Version 与发布标签保持一致，/health 直接透出。
-const Version = "4.2.0"
+const Version = "4.3.0"
 
 // DefaultZenAPIBaseURL 只到站点根：具体路径由 zen 包拼，上游改路径时不用动部署配置。
 const DefaultZenAPIBaseURL = "https://opencode.ai"
