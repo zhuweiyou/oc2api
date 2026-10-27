@@ -131,13 +131,28 @@ func displayName(model string) string {
 	return strings.Join(parts, " ")
 }
 
+// reservedToolDescription 让模型别去选内置工具：它们只是免费层的形状要求，
+// 客户端执行不了，真被选中也只能在响应侧丢弃。
+const reservedToolDescription = "Reserved for the host runtime; do not call or select this function. Use tools explicitly supplied by the user instead."
+
 func officialTools() []any {
 	var tools []any
 	if err := json.Unmarshal(toolsJSON, &tools); err != nil {
 		panic("官方工具集解析失败: " + err.Error())
 	}
-	// 与官方客户端一致：整套内置工具都发给上游。
-	// 工具定义本身（描述、schema）保持原样，不做任何改写。
+	// 整套内置工具都发给上游（形状校验依赖这一点），但描述统一换成
+	// “禁止调用”：客户端执行不了这些工具，真被选中也只能在响应侧丢弃。
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		fn, ok := tool["function"].(map[string]any)
+		if !ok {
+			continue
+		}
+		fn["description"] = reservedToolDescription
+	}
 	return tools
 }
 

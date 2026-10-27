@@ -15,3 +15,5 @@
 # 部署与本地产物
 .vercel/
 .captures/
+.vercel
+.env*

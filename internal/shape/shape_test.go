@@ -52,11 +52,20 @@ func TestBuildShapesOfficialRequest(t *testing.T) {
 		fn := raw.(map[string]any)["function"].(map[string]any)
 		names = append(names, fn["name"].(string))
 	}
-	// 官方工具集要整套发出去：免费层的形状校验依赖这一点，
-	// 工具定义本身保持原样（不改描述、不改 schema）。
+	// 官方工具集整套发出去（形状校验依赖这一点），但描述统一换成“禁止调用”。
 	for _, want := range []string{"edit", "read", "write", "shell"} {
 		if !contains(names, want) {
 			t.Fatalf("内置工具集缺少 %q: %v", want, names)
+		}
+	}
+	for _, raw := range tools {
+		fn := raw.(map[string]any)["function"].(map[string]any)
+		name := fn["name"].(string)
+		if strings.HasPrefix(name, "oc2api_") {
+			continue
+		}
+		if fn["description"] != reservedToolDescription {
+			t.Fatalf("内置工具 %s 的描述没有换成禁止调用", name)
 		}
 	}
 	if !contains(names, "oc2api_get_weather") {
