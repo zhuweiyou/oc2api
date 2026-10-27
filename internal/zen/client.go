@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -225,10 +224,4 @@ func UpstreamHeaders(session string) map[string]string {
 		"x-session-affinity":    session,
 		"X-Session-Id":          session,
 	}
-}
-
-func randomHex(n int) string {
-	buf := make([]byte, n)
-	_, _ = rand.Read(buf)
-	return hex.EncodeToString(buf)
 }
