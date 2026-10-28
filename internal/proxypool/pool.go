@@ -28,8 +28,8 @@ type Pool struct {
 	url    string
 	client *http.Client
 
-	once    sync.Once
-	loadErr error
+	loadMu sync.Mutex
+	loaded bool
 
 	mu      sync.Mutex
 	entries []*Entry
@@ -101,8 +101,30 @@ func (p *Pool) Size() int {
 }
 
 func (p *Pool) load(ctx context.Context) error {
-	p.once.Do(func() { p.loadErr = p.reload(ctx) })
-	return p.loadErr
+	p.mu.Lock()
+	if p.loaded {
+		p.mu.Unlock()
+		return nil
+	}
+	p.mu.Unlock()
+
+	// 只让一个请求去拉订阅；失败不缓存，下一次请求会重试。
+	p.loadMu.Lock()
+	defer p.loadMu.Unlock()
+	p.mu.Lock()
+	if p.loaded {
+		p.mu.Unlock()
+		return nil
+	}
+	p.mu.Unlock()
+
+	if err := p.reload(ctx); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	p.loaded = true
+	p.mu.Unlock()
+	return nil
 }
 
 func (p *Pool) reload(ctx context.Context) error {

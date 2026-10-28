@@ -84,3 +84,28 @@ func TestEmptyURL(t *testing.T) {
 		t.Fatalf("err = %v, want ErrNotConfigured", err)
 	}
 }
+
+func TestLoadRetriesAfterFailure(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write([]byte("http://1.2.3.4:8080\n"))
+	}))
+	defer srv.Close()
+
+	p := New(srv.URL)
+	if _, err := p.Take(context.Background()); err == nil {
+		t.Fatal("first Take should fail because subscription returns 500")
+	}
+	entry, err := p.Take(context.Background())
+	if err != nil {
+		t.Fatalf("second Take should retry and succeed: %v", err)
+	}
+	if entry.HostPort() != "1.2.3.4:8080" {
+		t.Fatalf("entry = %s", entry.HostPort())
+	}
+}
