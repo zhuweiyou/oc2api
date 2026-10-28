@@ -190,7 +190,13 @@ func ip(w http.ResponseWriter, r *http.Request, cfg config.Config, proxies *prox
 	if directFailed && proxyFailed {
 		status = http.StatusBadGateway
 	}
-	writeJSON(w, status, map[string]any{"direct": direct, "proxy": proxyResult}, nil)
+	payload := map[string]any{"direct": direct, "proxy": proxyResult}
+	// 兼容旧版 /ip：顶层继续给直连的 ip/source，老客户端读取 .ip 不受影响。
+	if ipValue, ok := direct["ip"].(string); ok {
+		payload["ip"] = ipValue
+		payload["source"] = direct["source"]
+	}
+	writeJSON(w, status, payload, nil)
 }
 
 // ipResultMap 把供应商结果转成响应对象；Cloudflare trace 额外的字段一并带上。
