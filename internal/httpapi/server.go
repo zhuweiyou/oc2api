@@ -2,9 +2,11 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 
@@ -12,6 +14,7 @@ import (
 	"oc2api/internal/config"
 	"oc2api/internal/ipinfo"
 	"oc2api/internal/protocol"
+	"oc2api/internal/proxypool"
 	"oc2api/internal/zen"
 )
 
@@ -40,14 +43,14 @@ func writeOpenAIError(w http.ResponseWriter, status int, message, kind, code str
 
 // New 组装路由：/ 与 /health 公开，其余按 API_KEY 鉴权。
 // 配置与上游客户端都由 main 注入，这里不再读环境变量。
-func New(cfg config.Config, client *zen.Client, chats *chat.Service) http.Handler {
+func New(cfg config.Config, client *zen.Client, chats *chat.Service, proxies *proxypool.Pool) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", withCORS(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/", "/health", "":
 			health(w)
 		case "/ip":
-			ip(w)
+			ip(w, r, proxies)
 		case "/v1/models", "/models":
 			if !authorized(cfg, r) {
 				writeOpenAIError(w, http.StatusUnauthorized, "Invalid API key", "authentication_error", "")
@@ -102,7 +105,34 @@ func models(w http.ResponseWriter, r *http.Request, client *zen.Client) {
 }
 
 // ip 与 Node 版一致：依次尝试两个供应商，返回 {ip, source}。
-func ip(w http.ResponseWriter) {
+// 带 ?proxy=1 时走订阅代理池的某个出口，用来核对轮换是否真的换了 IP。
+func ip(w http.ResponseWriter, r *http.Request, proxies *proxypool.Pool) {
+	if r.URL.Query().Get("proxy") != "" {
+		if proxies == nil {
+			writeOpenAIError(w, http.StatusBadRequest, "proxy pool is not configured", "invalid_request_error", "proxy_not_configured")
+			return
+		}
+		entry, err := proxies.Take(r.Context())
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadGateway, "proxy pool unavailable: "+err.Error(), "upstream_error", "proxy_unavailable")
+			return
+		}
+		client := &http.Client{Transport: &http.Transport{
+			ForceAttemptHTTP2: false,
+			DisableKeepAlives: true,
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return entry.Dial(ctx, network, addr)
+			},
+		}}
+		found, source := ipinfo.Lookup(client)
+		if found == "" {
+			writeOpenAIError(w, http.StatusBadGateway, "Upstream error: all IP providers failed", "upstream_error", "upstream_error")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ip": found, "source": source, "via": "proxy", "proxy": entry.HostPort()}, nil)
+		return
+	}
+
 	found, source := ipinfo.Lookup(&http.Client{})
 	if found == "" {
 		writeOpenAIError(w, http.StatusBadGateway, "Upstream error: all IP providers failed", "upstream_error", "upstream_error")

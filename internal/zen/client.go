@@ -68,39 +68,61 @@ func bunClientHello() *utls.ClientHelloSpec {
 	}
 }
 
+// DialFunc 是底层拨号器：返回一条到 addr 的已建立连接（可以是直连，
+// 也可以是经代理 CONNECT/SOCKS5 打出的隧道）。uTLS 握手由 zen 自己完成。
+type DialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+
 // Client 是带上游地址与超时的客户端，连接复用、握手按连接做一次。
 type Client struct {
-	http      *http.Client
-	chatURL   string
-	modelsURL string
+	http           *http.Client
+	chatURL        string
+	modelsURL      string
+	connectTimeout time.Duration
 }
 
 // New 按注入的配置组装上游客户端。
 func New(cfg config.Config) *Client {
 	return &Client{
-		http:      &http.Client{Transport: newTransport(cfg.ZenConnectTimeout), Timeout: 0},
-		chatURL:   cfg.ZenAPIBaseURL + chatPath,
-		modelsURL: cfg.ZenAPIBaseURL + modelsPath,
+		http:           &http.Client{Transport: newTransport(cfg.ZenConnectTimeout, nil, false), Timeout: 0},
+		chatURL:        cfg.ZenAPIBaseURL + chatPath,
+		modelsURL:      cfg.ZenAPIBaseURL + modelsPath,
+		connectTimeout: cfg.ZenConnectTimeout,
+	}
+}
+
+// WithDial 返回一个走指定拨号器的副本（用于代理池轮换）：连接不复用，
+// 每次请求都会新建 TCP —— 这是「每请求换一个出口」的前提。
+func (c *Client) WithDial(dial DialFunc) *Client {
+	return &Client{
+		http:           &http.Client{Transport: newTransport(c.connectTimeout, dial, true), Timeout: 0},
+		chatURL:        c.chatURL,
+		modelsURL:      c.modelsURL,
+		connectTimeout: c.connectTimeout,
 	}
 }
 
 // newTransport 用同一个超时兜住建连、TLS 握手与等响应头；正文流式读取不设上限，
-// 否则长回答会被截断。
-func newTransport(connectTimeout time.Duration) *http.Transport {
+// 否则长回答会被截断。dial 为 nil 时走本机直连；noReuse 为真时禁用连接复用
+// （代理轮换场景必须如此，否则同一连接上会一直用同一个出口 IP）。
+func newTransport(connectTimeout time.Duration, dial DialFunc, noReuse bool) *http.Transport {
 	// 自建中继可能是 http://（不经过 DialTLSContext），所以普通拨号也要挂同一个超时。
 	dialer := &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
+	if dial == nil {
+		dial = dialer.DialContext
+	}
 	return &http.Transport{
 		ForceAttemptHTTP2:     false,
 		MaxIdleConnsPerHost:   32,
 		IdleConnTimeout:       90 * time.Second,
+		DisableKeepAlives:     noReuse,
 		ResponseHeaderTimeout: connectTimeout,
-		DialContext:           dialer.DialContext,
+		DialContext:           dial,
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			host, _, err := net.SplitHostPort(addr)
 			if err != nil {
 				host = addr
 			}
-			conn, err := dialer.DialContext(ctx, network, addr)
+			conn, err := dial(ctx, network, addr)
 			if err != nil {
 				return nil, err
 			}

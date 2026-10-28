@@ -10,6 +10,7 @@ import (
 	"oc2api/internal/chat"
 	"oc2api/internal/config"
 	"oc2api/internal/httpapi"
+	"oc2api/internal/proxypool"
 	"oc2api/internal/rpc"
 	"oc2api/internal/zen"
 )
@@ -26,10 +27,20 @@ func main() {
 	}
 
 	client := zen.New(cfg)
-	chats := chat.New(cfg, client)
+	// 配置了订阅地址才建代理池；池子本身不联网，第一次对话请求时才拉订阅。
+	var proxies *proxypool.Pool
+	if cfg.ProxySubscriptionURL != "" {
+		proxies = proxypool.New(cfg.ProxySubscriptionURL)
+	}
+	chats := chat.New(cfg, client, proxies)
+
+	proxyState := "off"
+	if proxies != nil {
+		proxyState = "on (lazy)"
+	}
 
 	if *stdio {
-		log.Printf("oc2api go (stdio rpc) v%s upstream=%s timeout=%s", config.Version, cfg.ZenAPIBaseURL, cfg.ZenConnectTimeout)
+		log.Printf("oc2api go (stdio rpc) v%s upstream=%s timeout=%s proxy=%s", config.Version, cfg.ZenAPIBaseURL, cfg.ZenConnectTimeout, proxyState)
 		if err := rpc.New(cfg, client, chats).ServeStdio(); err != nil {
 			log.Fatal(err)
 		}
@@ -43,10 +54,10 @@ func main() {
 
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           httpapi.New(cfg, client, chats),
+		Handler:           httpapi.New(cfg, client, chats, proxies),
 		ReadHeaderTimeout: 15 * time.Second,
 	}
-	log.Printf("oc2api go (http) v%s listening on %s upstream=%s timeout=%s", config.Version, addr, cfg.ZenAPIBaseURL, cfg.ZenConnectTimeout)
+	log.Printf("oc2api go (http) v%s listening on %s upstream=%s timeout=%s proxy=%s", config.Version, addr, cfg.ZenAPIBaseURL, cfg.ZenConnectTimeout, proxyState)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}

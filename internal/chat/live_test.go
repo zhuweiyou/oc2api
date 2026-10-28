@@ -65,7 +65,7 @@ func newLiveService(t *testing.T) *Service {
 	if err != nil {
 		t.Fatalf("读取配置失败: %v", err)
 	}
-	return New(cfg, zen.New(cfg))
+	return New(cfg, zen.New(cfg), nil)
 }
 
 // streamOnce 发一次流式请求，返回正文（可能为空），并断言流里有 [DONE]。

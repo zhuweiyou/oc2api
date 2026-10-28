@@ -26,6 +26,13 @@ const (
 	maxZenConnectTimeoutMS = 600000
 )
 
+// PROXY_MAX_ATTEMPTS 默认值与区间：订阅代理模式下，429/403 时最多换几个出口。
+const (
+	DefaultProxyMaxAttempts = 3
+	minProxyMaxAttempts     = 1
+	maxProxyMaxAttempts     = 10
+)
+
 // Config 是启动时定下来的配置快照，运行期不再变化。
 type Config struct {
 	// APIKey 留空表示匿名访问。
@@ -38,6 +45,11 @@ type Config struct {
 	ZenAPIBaseURL string
 	// ZenConnectTimeout 同时覆盖建连、TLS 握手与等待响应头。
 	ZenConnectTimeout time.Duration
+	// ProxySubscriptionURL 非空时启用「订阅代理池」：第一次对话请求时拉取订阅，
+	// 解析成 http/socks5 出口列表，每个请求轮换使用。留空则保持直连。
+	ProxySubscriptionURL string
+	// ProxyMaxAttempts 是遇到 429/403 时最多尝试的出口数（含首次）。
+	ProxyMaxAttempts int
 }
 
 // Load 读取并校验环境变量。不做缓存：由调用方在启动阶段调一次，再把结果注入下游。
@@ -50,12 +62,22 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	proxyURL, err := loadProxySubscriptionURL()
+	if err != nil {
+		return Config{}, err
+	}
+	proxyAttempts, err := loadProxyMaxAttempts()
+	if err != nil {
+		return Config{}, err
+	}
 	return Config{
-		APIKey:            strings.TrimSpace(os.Getenv("API_KEY")),
-		Debug:             os.Getenv("DEBUG") == "true",
-		Port:              loadPort(),
-		ZenAPIBaseURL:     base,
-		ZenConnectTimeout: timeout,
+		APIKey:               strings.TrimSpace(os.Getenv("API_KEY")),
+		Debug:                os.Getenv("DEBUG") == "true",
+		Port:                 loadPort(),
+		ZenAPIBaseURL:        base,
+		ZenConnectTimeout:    timeout,
+		ProxySubscriptionURL: proxyURL,
+		ProxyMaxAttempts:     proxyAttempts,
 	}, nil
 }
 
@@ -101,4 +123,33 @@ func loadZenConnectTimeout() (time.Duration, error) {
 			minZenConnectTimeoutMS, maxZenConnectTimeoutMS, ms)
 	}
 	return time.Duration(ms) * time.Millisecond, nil
+}
+
+// loadProxySubscriptionURL 允许为空（关闭代理池）；非空时必须是 http(s) 订阅地址。
+func loadProxySubscriptionURL() (string, error) {
+	raw := strings.TrimSpace(os.Getenv("PROXY_SUBSCRIPTION_URL"))
+	if raw == "" {
+		return "", nil
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "", fmt.Errorf("PROXY_SUBSCRIPTION_URL 必须是 http(s) 订阅地址，当前为 %q", raw)
+	}
+	return raw, nil
+}
+
+func loadProxyMaxAttempts() (int, error) {
+	raw := strings.TrimSpace(os.Getenv("PROXY_MAX_ATTEMPTS"))
+	if raw == "" {
+		return DefaultProxyMaxAttempts, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("PROXY_MAX_ATTEMPTS 必须是整数，当前为 %q", raw)
+	}
+	if value < minProxyMaxAttempts || value > maxProxyMaxAttempts {
+		return 0, fmt.Errorf("PROXY_MAX_ATTEMPTS 必须在 %d 到 %d 之间，当前为 %d",
+			minProxyMaxAttempts, maxProxyMaxAttempts, value)
+	}
+	return value, nil
 }
