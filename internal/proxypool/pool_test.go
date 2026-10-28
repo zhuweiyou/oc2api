@@ -1,0 +1,86 @@
+package proxypool
+
+import (
+	"context"
+	"encoding/base64"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestParseFormats(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want int
+		skip int
+	}{
+		{"plain", "1.2.3.4:8080\n5.6.7.8:1080:user:pass\n", 2, 0},
+		{"uri", "http://u:p@1.2.3.4:8080\nsocks5://5.6.7.8:1080\nvmess://xxx\n", 2, 1},
+		{"base64", base64.StdEncoding.EncodeToString([]byte("http://1.2.3.4:8080\nsocks5://5.6.7.8:1080\n")), 2, 0},
+		{"clash", "proxies:\n  - name: a\n    type: http\n    server: 1.2.3.4\n    port: 8080\n    username: u\n    password: p\n  - name: b\n    type: socks5\n    server: 5.6.7.8\n    port: 1080\n", 2, 0},
+		{"singbox", `{"outbounds":[{"type":"socks","server":"1.2.3.4","server_port":1080,"username":"u","password":"p"}]}`, 1, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, skipped := ParseContent(c.in)
+			if len(got) != c.want || skipped != c.skip {
+				t.Fatalf("got %d entries, %d skipped; want %d, %d (%v)", len(got), skipped, c.want, c.skip, got)
+			}
+		})
+	}
+}
+
+func TestTakeLazyLoadAndRotate(t *testing.T) {
+	body := "http://1.2.3.4:8080\nhttp://5.6.7.8:8080\nsocks5://9.9.9.9:1080\n"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	p := New(srv.URL)
+	if p.Size() != 0 {
+		t.Fatalf("pool must be empty before first Take")
+	}
+	seen := map[string]bool{}
+	for i := 0; i < 3; i++ {
+		e, err := p.Take(context.Background())
+		if err != nil {
+			t.Fatalf("Take: %v", err)
+		}
+		seen[e.String()] = true
+	}
+	if len(seen) != 3 {
+		t.Fatalf("expected 3 distinct exits, got %v", seen)
+	}
+	if p.Size() != 3 {
+		t.Fatalf("size = %d, want 3", p.Size())
+	}
+}
+
+func TestCooldownSkipsFailedExit(t *testing.T) {
+	body := "http://1.1.1.1:8080\nhttp://2.2.2.2:8080\n"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	p := New(srv.URL)
+	first, _ := p.Take(context.Background())
+	p.Report(first, http.StatusTooManyRequests)
+	for i := 0; i < 5; i++ {
+		e, err := p.Take(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if e.String() == first.String() {
+			t.Fatalf("cooled exit %s must be skipped", e)
+		}
+	}
+}
+
+func TestEmptyURL(t *testing.T) {
+	if _, err := New("").Take(context.Background()); err != ErrNotConfigured {
+		t.Fatalf("err = %v, want ErrNotConfigured", err)
+	}
+}
