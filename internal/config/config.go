@@ -52,8 +52,8 @@ type Config struct {
 	ZenAPIBaseURL string
 	// ZenConnectTimeout 同时覆盖建连、TLS 握手与等待响应头。
 	ZenConnectTimeout time.Duration
-	// ProxySubscriptionURL 非空时启用「订阅代理池」：第一次对话请求时拉取订阅，
-	// 解析成 http/socks5 出口列表，每个请求轮换使用。留空则保持直连。
+	// ProxySubscriptionURL 非空时启用「订阅节点池」：启动时拉取订阅并开始
+	// 健康探测，之后每个请求轮换使用。留空则保持直连。
 	ProxySubscriptionURL string
 	// ProxyMaxAttempts 是遇到 429/403 时最多尝试的出口数（含首次）。
 	ProxyMaxAttempts int

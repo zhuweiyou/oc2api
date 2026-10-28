@@ -36,8 +36,8 @@ type nodeState struct {
 	lastCheck time.Time
 }
 
-// Pool 是「订阅地址 → 懒加载节点池 → 每次取一个」的实现。
-// 第一次 Take 时才去拉订阅（冷启动不阻塞服务启动），随后后台探测节点健康度。
+// Pool 是「订阅地址 → 节点池 → 每次取一个」的实现。
+// 启动时调用 Start 加载订阅并开始健康探测；未调用 Start 时 Take 会兜底加载。
 type Pool struct {
 	url    string
 	client *http.Client
@@ -71,6 +71,12 @@ func New(subscriptionURL string, healthInterval time.Duration) *Pool {
 		firstWait:      probeWait,
 		healthInterval: healthInterval,
 	}
+}
+
+// Start 在启动阶段加载订阅并触发健康探测，之后定时检查。
+// 这样自建/容器场景一启动就开始探测，不用等第一次请求。
+func (p *Pool) Start(ctx context.Context) error {
+	return p.load(ctx)
 }
 
 // Take 取一个可用节点；优先健康节点，其次未探测过的，最后才是还在冷却里的。
@@ -215,7 +221,7 @@ func (p *Pool) load(ctx context.Context) error {
 	}
 	p.mu.Unlock()
 
-	// 只让一个请求去拉订阅；失败不缓存，下一次请求会重试。
+	// 只让一个协程去拉订阅（启动阶段或首个请求兜底）；失败不缓存，下次会重试。
 	p.loadMu.Lock()
 	defer p.loadMu.Unlock()
 	p.mu.Lock()
