@@ -131,14 +131,9 @@ func models(w http.ResponseWriter, r *http.Request, client *zen.Client) {
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": list}, nil)
 }
 
-// ip 与 Node 版一致：依次尝试两个供应商，返回 {ip, source}。
-// 带 ?proxy=1 时走订阅代理池的某个出口，用来核对轮换是否真的换了 IP。
+// ip 默认走订阅节点池（返回真实出口与所用节点）；带 ?direct=1 时强制直连核对本机 IP。
 func ip(w http.ResponseWriter, r *http.Request, cfg config.Config, proxies *proxypool.Pool) {
-	if r.URL.Query().Get("proxy") != "" {
-		if proxies == nil {
-			writeOpenAIError(w, http.StatusBadRequest, "proxy pool is not configured", "invalid_request_error", "proxy_not_configured")
-			return
-		}
+	if proxies != nil && r.URL.Query().Get("direct") == "" {
 		attempts := cfg.ProxyMaxAttempts
 		if attempts < 1 {
 			attempts = 1
