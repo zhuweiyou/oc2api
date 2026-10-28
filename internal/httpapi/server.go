@@ -131,9 +131,22 @@ func models(w http.ResponseWriter, r *http.Request, client *zen.Client) {
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": list}, nil)
 }
 
-// ip 默认走订阅节点池（返回真实出口与所用节点）；带 ?direct=1 时强制直连核对本机 IP。
+// ip 同时返回直连出口和节点池出口：{direct: {...}, proxy: {...}}。
 func ip(w http.ResponseWriter, r *http.Request, cfg config.Config, proxies *proxypool.Pool) {
-	if proxies != nil && r.URL.Query().Get("direct") == "" {
+	directCh := make(chan map[string]any, 1)
+	go func() {
+		found, source := ipinfo.Lookup(&http.Client{})
+		if found == "" {
+			directCh <- map[string]any{"error": "all IP providers failed"}
+			return
+		}
+		directCh <- map[string]any{"ip": found, "source": source}
+	}()
+
+	var proxyResult map[string]any
+	if proxies == nil {
+		proxyResult = map[string]any{"error": "proxy pool is not configured"}
+	} else {
 		attempts := cfg.ProxyMaxAttempts
 		if attempts < 1 {
 			attempts = 1
@@ -156,22 +169,25 @@ func ip(w http.ResponseWriter, r *http.Request, cfg config.Config, proxies *prox
 			client.CloseIdleConnections()
 			if found != "" {
 				proxies.Report(entry, http.StatusOK)
-				writeJSON(w, http.StatusOK, map[string]any{"ip": found, "source": source, "via": "proxy", "proxy": entry.Label()}, nil)
-				return
+				proxyResult = map[string]any{"ip": found, "source": source, "node": entry.Label(), "via": "proxy"}
+				break
 			}
 			proxies.Report(entry, http.StatusBadGateway)
 			lastErr = "all IP providers failed via " + entry.Label()
 		}
-		writeOpenAIError(w, http.StatusBadGateway, "Upstream error: "+lastErr, "upstream_error", "upstream_error")
-		return
+		if proxyResult == nil {
+			proxyResult = map[string]any{"error": lastErr}
+		}
 	}
 
-	found, source := ipinfo.Lookup(&http.Client{})
-	if found == "" {
-		writeOpenAIError(w, http.StatusBadGateway, "Upstream error: all IP providers failed", "upstream_error", "upstream_error")
-		return
+	direct := <-directCh
+	status := http.StatusOK
+	_, directFailed := direct["error"]
+	_, proxyFailed := proxyResult["error"]
+	if directFailed && proxyFailed {
+		status = http.StatusBadGateway
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ip": found, "source": source}, nil)
+	writeJSON(w, status, map[string]any{"direct": direct, "proxy": proxyResult}, nil)
 }
 
 func completions(w http.ResponseWriter, r *http.Request, chats *chat.Service) {

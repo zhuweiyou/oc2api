@@ -147,7 +147,8 @@ docker run -d --name oc2api --restart unless-stopped \
 - 加载后后台并发探测节点（真实 TLS 握手，不消耗上游额度），只把健康节点投入轮换；
 - 默认 `sticky` 填充：固定用一个健康节点，直到它 429/403/传输失败才换下一个；`round_robin` 则每次请求轮询下一个；
 - 每个请求新建连接；429/403/5xx 或节点不通时自动切换；
-- `GET /ip` 默认走订阅节点池，返回真实出口和所用节点；加 `?direct=1` 可强制直连核对本机 IP；
+- `GET /ip` 同时返回 `{"direct": {...}, "proxy": {...}}`：直连出口与节点池出口各一份，
+  proxy 那份带实际节点名，方便直接对比；
 - `GET /health` 返回 `proxy.total / healthy / cooling / unknown`，并默认附带**健康节点列表**
   （`proxy.nodes`）；可用 `?state=healthy|unhealthy|cooling|all` 切换。节点名不算敏感信息，公开可见；
   Vercel 无内核构建只返回统计，不返回节点列表。
@@ -172,7 +173,7 @@ docker run -d --name oc2api --restart unless-stopped \
 | `/v1/chat/completions` 或 `/chat/completions` | POST | Chat 补全（支持 `stream: true` 流式） |
 | `/v1/models` 或 `/models`                     | GET  | 模型列表                              |
 | `/` 或 `/health`                              | GET  | 健康检查（带订阅池时含健康节点列表）  |
-| `/ip`                                         | GET  | 查询出口 IP                           |
+| `/ip`                                         | GET  | 同时查询直连与节点池出口 IP           |
 
 配置 API Key 后，请求携带：
 
