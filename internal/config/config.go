@@ -48,6 +48,13 @@ const (
 	ProxyStrategyRR      = "round_robin"
 )
 
+// PROXY_SUBSCRIPTION_REFRESH_SECONDS：定时重新拉取订阅的间隔，0 表示不刷新。
+const (
+	DefaultProxyRefreshInterval = 30 * time.Minute
+	minProxyRefreshInterval     = 5 * time.Minute
+	maxProxyRefreshInterval     = 24 * time.Hour
+)
+
 // Config 是启动时定下来的配置快照，运行期不再变化。
 type Config struct {
 	// APIKey 留空表示匿名访问。
@@ -67,6 +74,8 @@ type Config struct {
 	ProxyMaxAttempts int
 	// ProxyHealthInterval 是定时健康检查间隔；0 表示只在加载时探测一次。
 	ProxyHealthInterval time.Duration
+	// ProxyRefreshInterval 是定时重新拉取订阅的间隔；0 表示不刷新。
+	ProxyRefreshInterval time.Duration
 	// ProxyStrategy 是节点选择策略：sticky（默认，填充）或 round_robin（轮询）。
 	ProxyStrategy string
 }
@@ -93,6 +102,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	proxyRefresh, err := loadProxyRefreshInterval()
+	if err != nil {
+		return Config{}, err
+	}
 	proxyStrategy, err := loadProxyStrategy()
 	if err != nil {
 		return Config{}, err
@@ -106,6 +119,7 @@ func Load() (Config, error) {
 		ProxySubscriptionURL: proxyURL,
 		ProxyMaxAttempts:     proxyAttempts,
 		ProxyHealthInterval:  proxyHealth,
+		ProxyRefreshInterval: proxyRefresh,
 		ProxyStrategy:        proxyStrategy,
 	}, nil
 }
@@ -200,6 +214,27 @@ func loadProxyHealthInterval() (time.Duration, error) {
 	if interval < minProxyHealthInterval || interval > maxProxyHealthInterval {
 		return 0, fmt.Errorf("PROXY_HEALTH_INTERVAL_SECONDS 必须是 0 或 %d 到 %d 秒，当前为 %d",
 			int(minProxyHealthInterval.Seconds()), int(maxProxyHealthInterval.Seconds()), seconds)
+	}
+	return interval, nil
+}
+
+// loadProxyRefreshInterval 允许 0（不刷新）；非 0 时限制在 5 分钟到 24 小时。
+func loadProxyRefreshInterval() (time.Duration, error) {
+	raw := strings.TrimSpace(os.Getenv("PROXY_SUBSCRIPTION_REFRESH_SECONDS"))
+	if raw == "" {
+		return DefaultProxyRefreshInterval, nil
+	}
+	seconds, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("PROXY_SUBSCRIPTION_REFRESH_SECONDS 必须是整数秒，当前为 %q", raw)
+	}
+	if seconds == 0 {
+		return 0, nil
+	}
+	interval := time.Duration(seconds) * time.Second
+	if interval < minProxyRefreshInterval || interval > maxProxyRefreshInterval {
+		return 0, fmt.Errorf("PROXY_SUBSCRIPTION_REFRESH_SECONDS 必须是 0 或 %d 到 %d 秒，当前为 %d",
+			int(minProxyRefreshInterval.Seconds()), int(maxProxyRefreshInterval.Seconds()), seconds)
 	}
 	return interval, nil
 }

@@ -52,7 +52,7 @@ func (p *Pool) probeDue() {
 	p.mu.Lock()
 	var targets []Dialer
 	for _, d := range p.entries {
-		st := p.states[d]
+		st := p.states[d.Key()]
 		if st == nil || !st.known {
 			targets = append(targets, d)
 			continue
@@ -123,20 +123,20 @@ func (p *Pool) probeBatch(entries []Dialer, initial bool) int {
 			for d := range jobs {
 				ok, latency := probeNode(context.Background(), d)
 				p.mu.Lock()
-				st := p.states[d]
+				st := p.states[d.Key()]
 				if st == nil {
 					st = &nodeState{}
-					p.states[d] = st
+					p.states[d.Key()] = st
 				}
 				st.known = true
 				st.latency = latency
 				st.lastCheck = time.Now()
 				if ok {
 					st.healthy = true
-					delete(p.cooling, d)
+					delete(p.cooling, d.Key())
 				} else {
 					st.healthy = false
-					p.coolLocked(d, failureCooldown)
+					p.coolLocked(d.Key(), failureCooldown)
 				}
 				p.mu.Unlock()
 				if ok {

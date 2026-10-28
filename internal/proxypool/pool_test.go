@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -40,7 +41,7 @@ func TestTakeLazyLoadAndRotate(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	p := New(srv.URL, 0, StrategyRoundRobin)
+	p := New(srv.URL, 0, 0, StrategyRoundRobin)
 	p.skipProbe = true
 	if p.Size() != 0 {
 		t.Fatalf("pool must be empty before first Take")
@@ -68,7 +69,7 @@ func TestCooldownSkipsFailedExit(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	p := New(srv.URL, 0, StrategySticky)
+	p := New(srv.URL, 0, 0, StrategySticky)
 	p.skipProbe = true
 	first, _ := p.Take(context.Background())
 	p.Report(first, http.StatusTooManyRequests)
@@ -84,14 +85,14 @@ func TestCooldownSkipsFailedExit(t *testing.T) {
 }
 
 func TestEmptyURL(t *testing.T) {
-	if _, err := New("", 0, StrategySticky).Take(context.Background()); err != ErrNotConfigured {
+	if _, err := New("", 0, 0, StrategySticky).Take(context.Background()); err != ErrNotConfigured {
 		t.Fatalf("err = %v, want ErrNotConfigured", err)
 	}
 }
 
 func TestErrorRedactsSubscription(t *testing.T) {
 	const secret = "https://secret.example/token123"
-	p := New(secret, 0, StrategySticky)
+	p := New(secret, 0, 0, StrategySticky)
 	err := p.redact(errors.New(`Get "` + secret + `": dial failed`))
 	if strings.Contains(err.Error(), "token123") {
 		t.Fatalf("error leaks subscription token: %v", err)
@@ -113,7 +114,7 @@ func TestLoadRetriesAfterFailure(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	p := New(srv.URL, 0, StrategySticky)
+	p := New(srv.URL, 0, 0, StrategySticky)
 	p.skipProbe = true
 	if _, err := p.Take(context.Background()); err == nil {
 		t.Fatal("first Take should fail because subscription returns 500")
@@ -133,7 +134,7 @@ func newTwoNodePool(t *testing.T, strategy Strategy) *Pool {
 		_, _ = w.Write([]byte("http://1.1.1.1:8080\nhttp://2.2.2.2:8080\n"))
 	}))
 	t.Cleanup(srv.Close)
-	p := New(srv.URL, 0, strategy)
+	p := New(srv.URL, 0, 0, strategy)
 	p.skipProbe = true
 	return p
 }
@@ -198,5 +199,95 @@ func TestNodesFilterByState(t *testing.T) {
 	}
 	if p.Strategy() != string(StrategySticky) {
 		t.Fatalf("strategy = %s", p.Strategy())
+	}
+}
+
+func TestRefreshSwapsNodesAndPreservesState(t *testing.T) {
+	var mu sync.Mutex
+	body := "http://1.1.1.1:8080\nhttp://2.2.2.2:8080\n"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	p := New(srv.URL, 0, 0, StrategySticky)
+	p.skipProbe = true
+	ctx := context.Background()
+
+	first, err := p.Take(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 换到第二个节点并标健康。
+	p.Report(first, http.StatusInternalServerError)
+	second, err := p.Take(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Label() == first.Label() {
+		t.Fatalf("expected to switch away from cooled node")
+	}
+	p.Report(second, http.StatusOK)
+
+	// 新订阅：删掉 first，保留 second，新增 third。
+	mu.Lock()
+	body = "http://2.2.2.2:8080\nhttp://3.3.3.3:8080\n"
+	mu.Unlock()
+	p.refreshSubscription(ctx)
+
+	if p.Size() != 2 {
+		t.Fatalf("size after refresh = %d, want 2", p.Size())
+	}
+	healthy := p.Nodes("healthy")
+	if len(healthy) != 1 || healthy[0].Label != second.Label() {
+		t.Fatalf("preserved healthy = %+v, want %s", healthy, second.Label())
+	}
+	for _, node := range p.Nodes("all") {
+		if node.Label == first.Label() {
+			t.Fatalf("removed node %s still present", first.Label())
+		}
+	}
+}
+
+func TestRefreshFailureKeepsExistingNodes(t *testing.T) {
+	var mu sync.Mutex
+	fail := false
+	body := "http://1.1.1.1:8080\nhttp://2.2.2.2:8080\n"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if fail {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	p := New(srv.URL, 0, 0, StrategySticky)
+	p.skipProbe = true
+	ctx := context.Background()
+	if _, err := p.Take(ctx); err != nil {
+		t.Fatal(err)
+	}
+	before := p.Size()
+
+	mu.Lock()
+	fail = true
+	mu.Unlock()
+	p.refreshSubscription(ctx)
+	if p.Size() != before {
+		t.Fatalf("failed refresh changed size: %d -> %d", before, p.Size())
+	}
+
+	mu.Lock()
+	fail = false
+	body = "vmess://unsupported\n"
+	mu.Unlock()
+	p.refreshSubscription(ctx)
+	if p.Size() != before {
+		t.Fatalf("empty refresh changed size: %d -> %d", before, p.Size())
 	}
 }

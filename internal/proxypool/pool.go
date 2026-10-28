@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -38,6 +39,7 @@ type nodeState struct {
 
 // Pool 是「订阅地址 → 节点池 → 每次取一个」的实现。
 // 启动时调用 Start 加载订阅并开始健康探测；未调用 Start 时 Take 会兜底加载。
+// 节点状态按 Dialer.Key() 存，订阅刷新后未变的节点能保留状态。
 type Pool struct {
 	url    string
 	client *http.Client
@@ -53,31 +55,33 @@ type Pool struct {
 	skipProbe      bool
 	healthOnce     sync.Once
 	healthInterval time.Duration
+	refreshOnce    sync.Once
+	refreshEvery   time.Duration
 
 	mu       sync.Mutex
 	entries  []Dialer
 	next     int
 	current  Dialer
 	strategy Strategy
-	cooling  map[Dialer]time.Time
-	states   map[Dialer]*nodeState
+	cooling  map[string]time.Time
+	states   map[string]*nodeState
 }
 
-// New 只保存订阅地址、健康检查间隔与选节点策略，不做任何网络请求。
-func New(subscriptionURL string, healthInterval time.Duration, strategy Strategy) *Pool {
+// New 只保存订阅地址、健康检查/刷新间隔与选节点策略，不做任何网络请求。
+func New(subscriptionURL string, healthInterval, refreshInterval time.Duration, strategy Strategy) *Pool {
 	return &Pool{
 		url:            subscriptionURL,
 		client:         &http.Client{Timeout: 30 * time.Second},
-		cooling:        make(map[Dialer]time.Time),
-		states:         make(map[Dialer]*nodeState),
+		cooling:        make(map[string]time.Time),
+		states:         make(map[string]*nodeState),
 		firstWait:      probeWait,
 		healthInterval: healthInterval,
+		refreshEvery:   refreshInterval,
 		strategy:       ParseStrategy(string(strategy)),
 	}
 }
 
-// Start 在启动阶段加载订阅并触发健康探测，之后定时检查。
-// 这样自建/容器场景一启动就开始探测，不用等第一次请求。
+// Start 在启动阶段加载订阅并触发健康探测，之后定时健康检查与订阅刷新。
 func (p *Pool) Start(ctx context.Context) error {
 	return p.load(ctx)
 }
@@ -117,10 +121,10 @@ func (p *Pool) Take(ctx context.Context) (Dialer, error) {
 
 // usableLocked 判断当前节点还能不能继续用（不在冷却，且不是已判定不健康）。
 func (p *Pool) usableLocked(e Dialer, now time.Time) bool {
-	if p.coolingActiveLocked(e, now) {
+	if p.coolingActiveLocked(e.Key(), now) {
 		return false
 	}
-	if st := p.states[e]; st != nil && st.known && !st.healthy {
+	if st := p.states[e.Key()]; st != nil && st.known && !st.healthy {
 		return false
 	}
 	return true
@@ -134,10 +138,10 @@ func (p *Pool) pickLocked(now time.Time) Dialer {
 	for i := 0; i < n; i++ {
 		e := p.entries[p.next%n]
 		p.next = (p.next + 1) % n
-		if p.coolingActiveLocked(e, now) {
+		if p.coolingActiveLocked(e.Key(), now) {
 			continue
 		}
-		if st := p.states[e]; st != nil && st.healthy {
+		if st := p.states[e.Key()]; st != nil && st.healthy {
 			return e
 		}
 	}
@@ -145,10 +149,10 @@ func (p *Pool) pickLocked(now time.Time) Dialer {
 	for i := 0; i < n; i++ {
 		e := p.entries[p.next%n]
 		p.next = (p.next + 1) % n
-		if p.coolingActiveLocked(e, now) {
+		if p.coolingActiveLocked(e.Key(), now) {
 			continue
 		}
-		if st := p.states[e]; st == nil || !st.known {
+		if st := p.states[e.Key()]; st == nil || !st.known {
 			return e
 		}
 	}
@@ -156,7 +160,7 @@ func (p *Pool) pickLocked(now time.Time) Dialer {
 	for i := 0; i < n; i++ {
 		e := p.entries[p.next%n]
 		p.next = (p.next + 1) % n
-		if p.coolingActiveLocked(e, now) {
+		if p.coolingActiveLocked(e.Key(), now) {
 			continue
 		}
 		return e
@@ -165,7 +169,7 @@ func (p *Pool) pickLocked(now time.Time) Dialer {
 	var best Dialer
 	var bestUntil time.Time
 	for _, e := range p.entries {
-		until := p.cooling[e]
+		until := p.cooling[e.Key()]
 		if best == nil || until.Before(bestUntil) {
 			best, bestUntil = e, until
 		}
@@ -178,49 +182,50 @@ func (p *Pool) Report(e Dialer, status int) {
 	if e == nil {
 		return
 	}
+	key := e.Key()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	st := p.states[e]
+	st := p.states[key]
 	if st == nil {
 		st = &nodeState{}
-		p.states[e] = st
+		p.states[key] = st
 	}
 	switch {
 	case status >= 200 && status < 300:
 		st.healthy = true
 		st.known = true
-		delete(p.cooling, e)
+		delete(p.cooling, key)
 	case status == http.StatusForbidden || status == http.StatusTooManyRequests:
-		p.coolLocked(e, quotaCooldown)
-		if p.current == e {
+		p.coolLocked(key, quotaCooldown)
+		if p.current != nil && p.current.Key() == key {
 			p.current = nil
 		}
 	case status >= 500:
 		st.healthy = false
 		st.known = true
-		p.coolLocked(e, failureCooldown)
-		if p.current == e {
+		p.coolLocked(key, failureCooldown)
+		if p.current != nil && p.current.Key() == key {
 			p.current = nil
 		}
 	}
 }
 
-func (p *Pool) coolLocked(e Dialer, d time.Duration) {
+func (p *Pool) coolLocked(key string, d time.Duration) {
 	until := time.Now().Add(d)
-	if existing, ok := p.cooling[e]; !ok || until.After(existing) {
-		p.cooling[e] = until
+	if existing, ok := p.cooling[key]; !ok || until.After(existing) {
+		p.cooling[key] = until
 	}
 }
 
-func (p *Pool) coolingActiveLocked(e Dialer, now time.Time) bool {
-	until, ok := p.cooling[e]
+func (p *Pool) coolingActiveLocked(key string, now time.Time) bool {
+	until, ok := p.cooling[key]
 	if !ok {
 		return false
 	}
 	if until.After(now) {
 		return true
 	}
-	delete(p.cooling, e)
+	delete(p.cooling, key)
 	return false
 }
 
@@ -238,14 +243,14 @@ func (p *Pool) Stats() (total, healthy, coolingCount, unknown int) {
 	now := time.Now()
 	total = len(p.entries)
 	for _, e := range p.entries {
-		st := p.states[e]
+		st := p.states[e.Key()]
 		if st != nil && st.healthy {
 			healthy++
 		}
 		if st == nil || !st.known {
 			unknown++
 		}
-		if until, ok := p.cooling[e]; ok && until.After(now) {
+		if until, ok := p.cooling[e.Key()]; ok && until.After(now) {
 			coolingCount++
 		}
 	}
@@ -275,7 +280,7 @@ func (p *Pool) Nodes(state string) []NodeInfo {
 	now := time.Now()
 	out := make([]NodeInfo, 0, len(p.entries))
 	for _, e := range p.entries {
-		st := p.states[e]
+		st := p.states[e.Key()]
 		info := NodeInfo{Label: e.Label()}
 		if kinded, ok := e.(interface{ Kind() string }); ok {
 			info.Kind = kinded.Kind()
@@ -288,7 +293,7 @@ func (p *Pool) Nodes(state string) []NodeInfo {
 				info.LastCheck = st.lastCheck.Format(time.RFC3339)
 			}
 		}
-		if until, ok := p.cooling[e]; ok && until.After(now) {
+		if until, ok := p.cooling[e.Key()]; ok && until.After(now) {
 			info.Cooling = true
 		}
 		switch state {
@@ -336,43 +341,56 @@ func (p *Pool) load(ctx context.Context) error {
 	p.mu.Unlock()
 	p.startProbe()
 	p.startHealthLoop()
+	p.startRefreshLoop()
 	return nil
 }
 
 func (p *Pool) reload(ctx context.Context) error {
-	if p.url == "" {
-		return ErrNotConfigured
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.url, nil)
-	if err != nil {
-		return p.redact(err)
-	}
-	req.Header.Set("User-Agent", "oc2api-proxypool/1")
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return p.redact(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("fetch subscription: HTTP %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxSubscriptionBytes))
+	dialers, skipped, err := p.fetchDialers(ctx)
 	if err != nil {
 		return err
 	}
-	dialers, skipped := ParseSubscription(body)
-	if len(dialers) == 0 {
-		return fmt.Errorf("%w (skipped %d unsupported entries)", ErrEmpty, skipped)
+	states := make(map[string]*nodeState, len(dialers))
+	for _, d := range dialers {
+		states[d.Key()] = &nodeState{}
 	}
 	p.mu.Lock()
 	p.entries = dialers
 	p.next = 0
-	p.states = make(map[Dialer]*nodeState, len(dialers))
-	for _, d := range dialers {
-		p.states[d] = &nodeState{}
-	}
+	p.cooling = make(map[string]time.Time)
+	p.states = states
 	p.mu.Unlock()
+	log.Printf("[proxypool] subscription loaded: %d nodes (skipped %d)", len(dialers), skipped)
 	return nil
+}
+
+// fetchDialers 拉取并解析订阅；只有成功且至少一个节点时才返回 nil error。
+func (p *Pool) fetchDialers(ctx context.Context) ([]Dialer, int, error) {
+	if p.url == "" {
+		return nil, 0, ErrNotConfigured
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.url, nil)
+	if err != nil {
+		return nil, 0, p.redact(err)
+	}
+	req.Header.Set("User-Agent", "oc2api-proxypool/1")
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, 0, p.redact(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, 0, fmt.Errorf("fetch subscription: HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxSubscriptionBytes))
+	if err != nil {
+		return nil, 0, err
+	}
+	dialers, skipped := ParseSubscription(body)
+	if len(dialers) == 0 {
+		return nil, skipped, fmt.Errorf("%w (skipped %d unsupported entries)", ErrEmpty, skipped)
+	}
+	return dialers, skipped, nil
 }
 
 // redact 把错误信息里的订阅地址替换掉，避免把带 token 的 URL 写进日志或返回给客户端。

@@ -6,6 +6,7 @@ package proxypool
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/netip"
@@ -21,6 +22,7 @@ import (
 type mihomoNode struct {
 	name  string
 	kind  string
+	key   string
 	proxy C.Proxy
 }
 
@@ -30,6 +32,9 @@ func (n *mihomoNode) Label() string {
 	}
 	return n.kind + ":" + n.name
 }
+
+// Key 返回跨订阅刷新的稳定标识：节点配置（去掉会变的显示名）的哈希。
+func (n *mihomoNode) Key() string { return n.key }
 
 // Kind 返回协议类型（ss/vmess/vless/trojan/hysteria2 等）。
 func (n *mihomoNode) Kind() string { return n.kind }
@@ -83,7 +88,23 @@ func parseClash(body []byte) (nodes []Dialer, skipped int, ok bool) {
 		}
 		name, _ := raw["name"].(string)
 		kind, _ := raw["type"].(string)
-		nodes = append(nodes, &mihomoNode{name: name, kind: kind, proxy: proxy})
+		nodes = append(nodes, &mihomoNode{name: name, kind: kind, key: clashKey(raw), proxy: proxy})
 	}
 	return nodes, skipped, true
+}
+
+// clashKey 用去掉 name 的节点配置生成稳定 key；显示名变了不算新节点。
+func clashKey(raw map[string]any) string {
+	identity := make(map[string]any, len(raw))
+	for key, value := range raw {
+		if key == "name" {
+			continue
+		}
+		identity[key] = value
+	}
+	encoded, err := json.Marshal(identity)
+	if err != nil {
+		return fmt.Sprint(raw["type"], "|", raw["server"], "|", raw["port"])
+	}
+	return hashKey(string(encoded))
 }

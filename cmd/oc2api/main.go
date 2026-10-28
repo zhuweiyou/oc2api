@@ -31,7 +31,7 @@ func main() {
 	// 配置了订阅地址：启动阶段就加载订阅并开始健康探测，不等第一次请求。
 	var proxies *proxypool.Pool
 	if cfg.ProxySubscriptionURL != "" {
-		proxies = proxypool.New(cfg.ProxySubscriptionURL, cfg.ProxyHealthInterval, proxypool.Strategy(cfg.ProxyStrategy))
+		proxies = proxypool.New(cfg.ProxySubscriptionURL, cfg.ProxyHealthInterval, cfg.ProxyRefreshInterval, proxypool.Strategy(cfg.ProxyStrategy))
 		if err := proxies.Start(context.Background()); err != nil {
 			log.Printf("代理池加载失败: %v（服务继续启动，后续请求会重试）", err)
 		} else {
