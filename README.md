@@ -107,28 +107,7 @@ API_KEY=your-key PORT=8080 go run ./cmd/oc2api
   自建中继只填根地址即可
 - `ZEN_CONNECT_TIMEOUT_MS`：建连、TLS 握手与等响应头的超时，默认 `60000`，允许 `1`–`600000`
 - `DEBUG`：设为 `true` 输出调试日志
-- `PROXY_SUBSCRIPTION_URL`：可选，代理订阅地址（http/https）。**冷启动不联网**，第一次对话请求时
-  才拉取并解析成内存节点池，之后每个请求轮换一个节点。Clash YAML（`proxies:`）由内置的 mihomo
-  内核解析，支持 `ss / vmess / vless / trojan / hysteria2 / http / socks5` 等；纯文本
-  `IP:PORT[(:USER:PASS)]`、`http://` / `socks5://` URI 行、base64 包裹也支持。带 `dialer-proxy`
-  的链式节点会跳过。留空则直连。
-- `PROXY_MAX_ATTEMPTS`：可选，遇到 429/403/5xx 或节点不通时最多尝试几个节点，默认 `5`，允许 `1`–`10`
-- `PROXY_HEALTH_INTERVAL_SECONDS`：可选，定时健康检查间隔秒数，默认 `600`（10 分钟），
-  允许 `60`–`86400`；设为 `0` 关闭。定时检查会重试冷却到期的死节点，并每 30 分钟复检健康节点。
-
-用 `GET /ip?proxy=1` 可以核对代理池当前出口（返回 `via: "proxy"` 和实际代理地址）。
-`GET /health` 会返回 `proxy.total / healthy / cooling / unknown`。
-
-### 构建变体（内核体积）
-
-| 构建 | 命令 | 二进制约 | 订阅能力 |
-| --- | --- | --- | --- |
-| 无内核（Vercel） | `go build -tags nomihomo ...` | **8.4 MB** | 仅 http/socks5（纯文本、URI、base64） |
-| 带内核（本地 / Docker） | 不加 tag | **46.4 MB** | Clash YAML 全协议：ss/vmess/vless/trojan/hysteria2 等 |
-
-- Vercel 的 `scripts/build-go.sh` 已固定加 `-tags nomihomo`，所以函数包很小；
-- Docker 默认不加 tag（带内核）。想要瘦身镜像可 `docker build --build-arg GO_TAGS=nomihomo ...`；
-- 本地直接 `go run ./cmd/oc2api` 默认带内核，方便跑全协议订阅。
+- 代理订阅相关环境变量（`PROXY_*`）见下方「[Clash / Mihomo 订阅支持](#clash--mihomo-订阅支持)」。
 
 健康检查：
 
@@ -137,6 +116,48 @@ curl http://localhost:8080/health
 ```
 
 </details>
+
+## Clash / Mihomo 订阅支持
+
+**Docker 部署和本地运行都适用**：这两种构建都内置 mihomo 内核，可以直接把一个订阅地址变成程序内的节点池——
+**冷启动不联网**，第一次对话请求时才拉取解析，之后每个请求轮换一个节点，失败自动换下一个。
+Vercel 函数版为了控制包体积不含内核，限制见本节末尾「构建变体」。
+
+### 环境变量
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `PROXY_SUBSCRIPTION_URL` | 空（直连） | 订阅地址（http/https）。Clash YAML 由内置 mihomo 解析，支持 `ss / vmess / vless / trojan / hysteria2 / http / socks5`；也支持纯文本 `IP:PORT[(:USER:PASS)]`、`http://` / `socks5://` URI 行、base64 包裹。带 `dialer-proxy` 的链式节点会跳过。 |
+| `PROXY_MAX_ATTEMPTS` | `5` | 遇到 429/403/5xx 或节点不通时最多尝试几个节点，允许 `1`–`10` |
+| `PROXY_HEALTH_INTERVAL_SECONDS` | `600` | 定时健康检查间隔秒数，允许 `60`–`86400`；`0` 关闭。定时检查会重试所有死节点，并每 30 分钟复检健康节点 |
+
+Docker 示例：
+
+```bash
+docker run -d --name oc2api --restart unless-stopped \
+  -p 8080:8080 \
+  -e API_KEY=your-key \
+  -e PROXY_SUBSCRIPTION_URL='https://你的订阅地址' \
+  ghcr.io/zhuweiyou/oc2api:latest
+```
+
+### 运行行为
+
+- 加载后后台并发探测节点（真实 TLS 握手，不消耗上游额度），只把健康节点投入轮换；
+- 每个请求新建连接、轮换节点；429/403/5xx 或节点不通时自动切换；
+- `GET /ip?proxy=1` 核对当前出口（返回 `via: "proxy"` 和节点名）；
+- `GET /health` 返回 `proxy.total / healthy / cooling / unknown`。
+
+### 构建变体（内核体积）
+
+| 构建 | 命令 | 二进制约 | 订阅能力 |
+| --- | --- | --- | --- |
+| 无内核（Vercel） | `go build -tags nomihomo ...` | **8.4 MB** | 仅 http/socks5（纯文本、URI、base64）；Clash 多协议不可用 |
+| 带内核（本地 / Docker） | 不加 tag | **46.4 MB** | Clash YAML 全协议：ss/vmess/vless/trojan/hysteria2 等 |
+
+- Vercel 的 `scripts/build-go.sh` 固定加 `-tags nomihomo`；
+- Docker 默认带内核；想要瘦身镜像可 `docker build --build-arg GO_TAGS=nomihomo ...`；
+- 本地 `go run ./cmd/oc2api` 默认带内核。
 
 ## API
 
