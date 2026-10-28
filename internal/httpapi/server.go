@@ -132,15 +132,16 @@ func models(w http.ResponseWriter, r *http.Request, client *zen.Client) {
 }
 
 // ip 同时返回直连出口和节点池出口：{direct: {...}, proxy: {...}}。
+// 每个出口都让多个供应商（ipquery / ip-api / 1.1.1.1 trace）并发竞速，先回先得。
 func ip(w http.ResponseWriter, r *http.Request, cfg config.Config, proxies *proxypool.Pool) {
 	directCh := make(chan map[string]any, 1)
 	go func() {
-		found, source := ipinfo.Lookup(&http.Client{})
-		if found == "" {
+		result := ipinfo.LookupResult(&http.Client{})
+		if result.IP == "" {
 			directCh <- map[string]any{"error": "all IP providers failed"}
 			return
 		}
-		directCh <- map[string]any{"ip": found, "source": source}
+		directCh <- ipResultMap(result)
 	}()
 
 	var proxyResult map[string]any
@@ -165,11 +166,13 @@ func ip(w http.ResponseWriter, r *http.Request, cfg config.Config, proxies *prox
 					return entry.Dial(ctx, network, addr)
 				},
 			}}
-			found, source := ipinfo.Lookup(client)
+			result := ipinfo.LookupResult(client)
 			client.CloseIdleConnections()
-			if found != "" {
+			if result.IP != "" {
 				proxies.Report(entry, http.StatusOK)
-				proxyResult = map[string]any{"ip": found, "source": source, "node": entry.Label(), "via": "proxy"}
+				proxyResult = ipResultMap(result)
+				proxyResult["node"] = entry.Label()
+				proxyResult["via"] = "proxy"
 				break
 			}
 			proxies.Report(entry, http.StatusBadGateway)
@@ -188,6 +191,21 @@ func ip(w http.ResponseWriter, r *http.Request, cfg config.Config, proxies *prox
 		status = http.StatusBadGateway
 	}
 	writeJSON(w, status, map[string]any{"direct": direct, "proxy": proxyResult}, nil)
+}
+
+// ipResultMap 把供应商结果转成响应对象；Cloudflare trace 额外的字段一并带上。
+func ipResultMap(result ipinfo.Result) map[string]any {
+	m := map[string]any{"ip": result.IP, "source": result.Source}
+	if result.Warp != "" {
+		m["warp"] = result.Warp
+	}
+	if result.Loc != "" {
+		m["loc"] = result.Loc
+	}
+	if result.Colo != "" {
+		m["colo"] = result.Colo
+	}
+	return m
 }
 
 func completions(w http.ResponseWriter, r *http.Request, chats *chat.Service) {
