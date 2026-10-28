@@ -113,8 +113,22 @@ API_KEY=your-key PORT=8080 go run ./cmd/oc2api
   `IP:PORT[(:USER:PASS)]`、`http://` / `socks5://` URI 行、base64 包裹也支持。带 `dialer-proxy`
   的链式节点会跳过。留空则直连。
 - `PROXY_MAX_ATTEMPTS`：可选，遇到 429/403/5xx 或节点不通时最多尝试几个节点，默认 `5`，允许 `1`–`10`
+- `PROXY_HEALTH_INTERVAL_SECONDS`：可选，定时健康检查间隔秒数，默认 `600`（10 分钟），
+  允许 `60`–`86400`；设为 `0` 关闭。定时检查会重试冷却到期的死节点，并每 30 分钟复检健康节点。
 
 用 `GET /ip?proxy=1` 可以核对代理池当前出口（返回 `via: "proxy"` 和实际代理地址）。
+`GET /health` 会返回 `proxy.total / healthy / cooling / unknown`。
+
+### 构建变体（内核体积）
+
+| 构建 | 命令 | 二进制约 | 订阅能力 |
+| --- | --- | --- | --- |
+| 无内核（Vercel） | `go build -tags nomihomo ...` | **8.4 MB** | 仅 http/socks5（纯文本、URI、base64） |
+| 带内核（本地 / Docker） | 不加 tag | **46.4 MB** | Clash YAML 全协议：ss/vmess/vless/trojan/hysteria2 等 |
+
+- Vercel 的 `scripts/build-go.sh` 已固定加 `-tags nomihomo`，所以函数包很小；
+- Docker 默认不加 tag（带内核）。想要瘦身镜像可 `docker build --build-arg GO_TAGS=nomihomo ...`；
+- 本地直接 `go run ./cmd/oc2api` 默认带内核，方便跑全协议订阅。
 
 健康检查：
 

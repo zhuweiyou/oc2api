@@ -33,6 +33,13 @@ const (
 	maxProxyMaxAttempts     = 10
 )
 
+// PROXY_HEALTH_INTERVAL_SECONDS：定时健康检查间隔，0 表示关闭。
+const (
+	DefaultProxyHealthInterval = 10 * time.Minute
+	minProxyHealthInterval     = time.Minute
+	maxProxyHealthInterval     = 24 * time.Hour
+)
+
 // Config 是启动时定下来的配置快照，运行期不再变化。
 type Config struct {
 	// APIKey 留空表示匿名访问。
@@ -50,6 +57,8 @@ type Config struct {
 	ProxySubscriptionURL string
 	// ProxyMaxAttempts 是遇到 429/403 时最多尝试的出口数（含首次）。
 	ProxyMaxAttempts int
+	// ProxyHealthInterval 是定时健康检查间隔；0 表示只在加载时探测一次。
+	ProxyHealthInterval time.Duration
 }
 
 // Load 读取并校验环境变量。不做缓存：由调用方在启动阶段调一次，再把结果注入下游。
@@ -70,6 +79,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	proxyHealth, err := loadProxyHealthInterval()
+	if err != nil {
+		return Config{}, err
+	}
 	return Config{
 		APIKey:               strings.TrimSpace(os.Getenv("API_KEY")),
 		Debug:                os.Getenv("DEBUG") == "true",
@@ -78,6 +91,7 @@ func Load() (Config, error) {
 		ZenConnectTimeout:    timeout,
 		ProxySubscriptionURL: proxyURL,
 		ProxyMaxAttempts:     proxyAttempts,
+		ProxyHealthInterval:  proxyHealth,
 	}, nil
 }
 
@@ -152,4 +166,25 @@ func loadProxyMaxAttempts() (int, error) {
 			minProxyMaxAttempts, maxProxyMaxAttempts, value)
 	}
 	return value, nil
+}
+
+// loadProxyHealthInterval 允许 0（关闭定时检查）；非 0 时限制在 1 分钟到 24 小时。
+func loadProxyHealthInterval() (time.Duration, error) {
+	raw := strings.TrimSpace(os.Getenv("PROXY_HEALTH_INTERVAL_SECONDS"))
+	if raw == "" {
+		return DefaultProxyHealthInterval, nil
+	}
+	seconds, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("PROXY_HEALTH_INTERVAL_SECONDS 必须是整数秒，当前为 %q", raw)
+	}
+	if seconds == 0 {
+		return 0, nil
+	}
+	interval := time.Duration(seconds) * time.Second
+	if interval < minProxyHealthInterval || interval > maxProxyHealthInterval {
+		return 0, fmt.Errorf("PROXY_HEALTH_INTERVAL_SECONDS 必须是 0 或 %d 到 %d 秒，当前为 %d",
+			int(minProxyHealthInterval.Seconds()), int(maxProxyHealthInterval.Seconds()), seconds)
+	}
+	return interval, nil
 }

@@ -30,7 +30,7 @@ func main() {
 	// 配置了订阅地址才建代理池；池子本身不联网，第一次对话请求时才拉订阅。
 	var proxies *proxypool.Pool
 	if cfg.ProxySubscriptionURL != "" {
-		proxies = proxypool.New(cfg.ProxySubscriptionURL)
+		proxies = proxypool.New(cfg.ProxySubscriptionURL, cfg.ProxyHealthInterval)
 	}
 	chats := chat.New(cfg, client, proxies)
 

@@ -1,3 +1,7 @@
+//go:build !nomihomo
+
+// 带内核构建：Clash 订阅的 ss/vmess/vless/trojan/hysteria2 等由 mihomo 解析。
+// Vercel 用 -tags nomihomo 排除本文件，二进制从 ~46MB 降到 ~8MB。
 package proxypool
 
 import (
@@ -52,22 +56,7 @@ func (n *mihomoNode) Dial(ctx context.Context, network, addr string) (net.Conn, 
 	return conn, nil
 }
 
-// ParseSubscription 把订阅正文变成出口列表：
-//  1. 先按 Clash YAML（proxies:）交给 mihomo 解析，支持 ss/vmess/vless/trojan/
-//     hysteria2/http/socks5 等；
-//  2. 不是 Clash 配置时，退回纯文本/URI/base64/sing-box 解析（只支持 http/socks）。
-func ParseSubscription(body []byte) ([]Dialer, int) {
-	if nodes, skipped, ok := parseClash(body); ok && len(nodes) > 0 {
-		return nodes, skipped
-	}
-	entries, skipped := ParseContent(string(body))
-	dialers := make([]Dialer, 0, len(entries))
-	for i := range entries {
-		dialers = append(dialers, &entries[i])
-	}
-	return dialers, skipped
-}
-
+// ParseSubscription 已移到 subscription.go（根据构建标签选择是否带内核）。
 func parseClash(body []byte) (nodes []Dialer, skipped int, ok bool) {
 	var doc struct {
 		Proxies []map[string]any `yaml:"proxies"`

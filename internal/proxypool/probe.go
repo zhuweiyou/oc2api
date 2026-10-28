@@ -11,6 +11,9 @@ import (
 const (
 	probeWorkers = 16
 	probeTimeout = 7 * time.Second
+	// healthyRecheck 是健康节点的复检周期：定时健康检查里，超过这个时间没测过的
+	// 健康节点会再测一次，防止节点悄悄失效。
+	healthyRecheck = 30 * time.Minute
 )
 
 // startProbe 在订阅加载完成后后台并发探测所有节点，不阻塞第一次请求。
@@ -25,6 +28,51 @@ func (p *Pool) startProbe() {
 		p.mu.Unlock()
 		go p.probeAll(entries)
 	})
+}
+
+// startHealthLoop 启动定时健康检查：死节点冷却到期后重试，健康节点定期复检。
+func (p *Pool) startHealthLoop() {
+	if p.skipProbe || p.healthInterval <= 0 {
+		return
+	}
+	p.healthOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(p.healthInterval)
+			defer ticker.Stop()
+			for range ticker.C {
+				p.probeDue()
+			}
+		}()
+	})
+}
+
+// probeDue 挑出「冷却已到期的死节点 + 超过复检周期的健康节点 + 还没测过的节点」重测。
+func (p *Pool) probeDue() {
+	now := time.Now()
+	p.mu.Lock()
+	var targets []Dialer
+	for _, d := range p.entries {
+		st := p.states[d]
+		if st == nil || !st.known {
+			targets = append(targets, d)
+			continue
+		}
+		if st.healthy {
+			if now.Sub(st.lastCheck) >= healthyRecheck {
+				targets = append(targets, d)
+			}
+			continue
+		}
+		// 死节点每轮都重试（冷却只影响“被选中服务”，不影响探测）。
+		targets = append(targets, d)
+	}
+	p.mu.Unlock()
+	if len(targets) == 0 {
+		return
+	}
+	log.Printf("[proxypool] health check start: targets=%d", len(targets))
+	healthy := p.probeBatch(targets, false)
+	log.Printf("[proxypool] health check done: scanned=%d healthy=%d", len(targets), healthy)
 }
 
 // waitProbe 让第一次请求最多等 probeWait，看能不能等到健康节点消息。
@@ -49,6 +97,20 @@ func (p *Pool) waitProbe(ctx context.Context) {
 
 func (p *Pool) probeAll(entries []Dialer) {
 	started := time.Now()
+	healthy := p.probeBatch(entries, true)
+	p.probeReadyOnce.Do(func() { close(p.probeReady) })
+	log.Printf("[proxypool] probe done: total=%d healthy=%d dead=%d in %s",
+		len(entries), healthy, len(entries)-healthy, time.Since(started).Round(time.Second))
+}
+
+// probeBatch 并发探测一批节点，返回健康数量。initial 为真时，一旦出现第一个健康
+// 节点就关闭 probeReady，让第一次请求能尽快放行。
+func (p *Pool) probeBatch(entries []Dialer, initial bool) int {
+	if !p.probeRunMu.TryLock() {
+		return 0 // 上一轮还没跑完，跳过这一轮，避免叠加
+	}
+	defer p.probeRunMu.Unlock()
+
 	jobs := make(chan Dialer)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -68,6 +130,7 @@ func (p *Pool) probeAll(entries []Dialer) {
 				}
 				st.known = true
 				st.latency = latency
+				st.lastCheck = time.Now()
 				if ok {
 					st.healthy = true
 					delete(p.cooling, d)
@@ -79,7 +142,7 @@ func (p *Pool) probeAll(entries []Dialer) {
 				if ok {
 					mu.Lock()
 					healthy++
-					if healthy == 1 {
+					if initial && healthy == 1 {
 						p.probeReadyOnce.Do(func() { close(p.probeReady) })
 					}
 					mu.Unlock()
@@ -93,10 +156,7 @@ func (p *Pool) probeAll(entries []Dialer) {
 	}
 	close(jobs)
 	wg.Wait()
-
-	p.probeReadyOnce.Do(func() { close(p.probeReady) })
-	log.Printf("[proxypool] probe done: total=%d healthy=%d dead=%d in %s",
-		len(entries), healthy, len(entries)-healthy, time.Since(started).Round(time.Second))
+	return healthy
 }
 
 // probeNode 做两段真实 TLS 握手：先 1.1.1.1 验隧道，再 opencode.ai 验目标可达。

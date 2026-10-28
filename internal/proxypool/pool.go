@@ -30,9 +30,10 @@ const (
 )
 
 type nodeState struct {
-	healthy bool
-	known   bool
-	latency time.Duration
+	healthy   bool
+	known     bool
+	latency   time.Duration
+	lastCheck time.Time
 }
 
 // Pool 是「订阅地址 → 懒加载节点池 → 每次取一个」的实现。
@@ -47,8 +48,11 @@ type Pool struct {
 	probeOnce      sync.Once
 	probeReady     chan struct{}
 	probeReadyOnce sync.Once
+	probeRunMu     sync.Mutex
 	firstWait      time.Duration
 	skipProbe      bool
+	healthOnce     sync.Once
+	healthInterval time.Duration
 
 	mu      sync.Mutex
 	entries []Dialer
@@ -57,14 +61,15 @@ type Pool struct {
 	states  map[Dialer]*nodeState
 }
 
-// New 只保存订阅地址，不做任何网络请求。
-func New(subscriptionURL string) *Pool {
+// New 只保存订阅地址与健康检查间隔，不做任何网络请求。
+func New(subscriptionURL string, healthInterval time.Duration) *Pool {
 	return &Pool{
-		url:       subscriptionURL,
-		client:    &http.Client{Timeout: 30 * time.Second},
-		cooling:   make(map[Dialer]time.Time),
-		states:    make(map[Dialer]*nodeState),
-		firstWait: probeWait,
+		url:            subscriptionURL,
+		client:         &http.Client{Timeout: 30 * time.Second},
+		cooling:        make(map[Dialer]time.Time),
+		states:         make(map[Dialer]*nodeState),
+		firstWait:      probeWait,
+		healthInterval: healthInterval,
 	}
 }
 
@@ -227,6 +232,7 @@ func (p *Pool) load(ctx context.Context) error {
 	p.loaded = true
 	p.mu.Unlock()
 	p.startProbe()
+	p.startHealthLoop()
 	return nil
 }
 

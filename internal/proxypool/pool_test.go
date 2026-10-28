@@ -40,7 +40,7 @@ func TestTakeLazyLoadAndRotate(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	p := New(srv.URL)
+	p := New(srv.URL, 0)
 	p.skipProbe = true
 	if p.Size() != 0 {
 		t.Fatalf("pool must be empty before first Take")
@@ -68,7 +68,7 @@ func TestCooldownSkipsFailedExit(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	p := New(srv.URL)
+	p := New(srv.URL, 0)
 	p.skipProbe = true
 	first, _ := p.Take(context.Background())
 	p.Report(first, http.StatusTooManyRequests)
@@ -84,14 +84,14 @@ func TestCooldownSkipsFailedExit(t *testing.T) {
 }
 
 func TestEmptyURL(t *testing.T) {
-	if _, err := New("").Take(context.Background()); err != ErrNotConfigured {
+	if _, err := New("", 0).Take(context.Background()); err != ErrNotConfigured {
 		t.Fatalf("err = %v, want ErrNotConfigured", err)
 	}
 }
 
 func TestErrorRedactsSubscription(t *testing.T) {
 	const secret = "https://secret.example/token123"
-	p := New(secret)
+	p := New(secret, 0)
 	err := p.redact(errors.New(`Get "` + secret + `": dial failed`))
 	if strings.Contains(err.Error(), "token123") {
 		t.Fatalf("error leaks subscription token: %v", err)
@@ -113,7 +113,7 @@ func TestLoadRetriesAfterFailure(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	p := New(srv.URL)
+	p := New(srv.URL, 0)
 	p.skipProbe = true
 	if _, err := p.Take(context.Background()); err == nil {
 		t.Fatal("first Take should fail because subscription returns 500")

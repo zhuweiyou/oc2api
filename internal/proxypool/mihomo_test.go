@@ -1,3 +1,5 @@
+//go:build !nomihomo
+
 package proxypool
 
 import "testing"
