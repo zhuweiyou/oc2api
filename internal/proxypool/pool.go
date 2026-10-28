@@ -378,7 +378,7 @@ func (p *Pool) fetchDialers(ctx context.Context) ([]Dialer, int, error) {
 	if err != nil {
 		return nil, 0, p.redact(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return nil, 0, fmt.Errorf("fetch subscription: HTTP %d", resp.StatusCode)
 	}

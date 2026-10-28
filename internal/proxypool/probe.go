@@ -179,7 +179,7 @@ func tlsProbe(ctx context.Context, d Dialer, addr, serverName string, insecure b
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if deadline, ok := probeCtx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
 	}

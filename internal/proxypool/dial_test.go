@@ -16,7 +16,7 @@ func TestEntryDialHTTPConnect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	done := make(chan error, 1)
 	go func() {
@@ -25,7 +25,7 @@ func TestEntryDialHTTPConnect(t *testing.T) {
 			done <- err
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		br := bufio.NewReader(conn)
 		line, err := br.ReadString('\n')
 		if err != nil {
@@ -65,7 +65,7 @@ func TestEntryDialHTTPConnect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if _, err := conn.Write([]byte("ping")); err != nil {
 		t.Fatal(err)
@@ -88,7 +88,7 @@ func TestEntryDialSOCKS5(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	done := make(chan error, 1)
 	go func() {
@@ -97,7 +97,7 @@ func TestEntryDialSOCKS5(t *testing.T) {
 			done <- err
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		br := bufio.NewReader(conn)
 
 		greeting := make([]byte, 2)
@@ -157,7 +157,7 @@ func TestEntryDialSOCKS5(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if _, err := conn.Write([]byte("pong")); err != nil {
 		t.Fatal(err)
