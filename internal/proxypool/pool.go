@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -235,12 +236,12 @@ func (p *Pool) reload(ctx context.Context) error {
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.url, nil)
 	if err != nil {
-		return err
+		return p.redact(err)
 	}
 	req.Header.Set("User-Agent", "oc2api-proxypool/1")
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("fetch subscription: %w", err)
+		return p.redact(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -263,4 +264,16 @@ func (p *Pool) reload(ctx context.Context) error {
 	}
 	p.mu.Unlock()
 	return nil
+}
+
+// redact 把错误信息里的订阅地址替换掉，避免把带 token 的 URL 写进日志或返回给客户端。
+func (p *Pool) redact(err error) error {
+	if err == nil {
+		return nil
+	}
+	message := err.Error()
+	if p.url != "" {
+		message = strings.ReplaceAll(message, p.url, "<subscription>")
+	}
+	return errors.New(message)
 }

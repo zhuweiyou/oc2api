@@ -3,8 +3,10 @@ package proxypool
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -84,6 +86,18 @@ func TestCooldownSkipsFailedExit(t *testing.T) {
 func TestEmptyURL(t *testing.T) {
 	if _, err := New("").Take(context.Background()); err != ErrNotConfigured {
 		t.Fatalf("err = %v, want ErrNotConfigured", err)
+	}
+}
+
+func TestErrorRedactsSubscription(t *testing.T) {
+	const secret = "https://secret.example/token123"
+	p := New(secret)
+	err := p.redact(errors.New(`Get "` + secret + `": dial failed`))
+	if strings.Contains(err.Error(), "token123") {
+		t.Fatalf("error leaks subscription token: %v", err)
+	}
+	if !strings.Contains(err.Error(), "<subscription>") {
+		t.Fatalf("error was not redacted: %v", err)
 	}
 }
 
