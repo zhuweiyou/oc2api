@@ -180,3 +180,23 @@ func TestRoundRobinSwitchesEachTime(t *testing.T) {
 		t.Fatalf("round_robin used %d distinct nodes, want 2: %v", len(seen), seen)
 	}
 }
+
+func TestNodesFilterByState(t *testing.T) {
+	p := newTwoNodePool(t, StrategySticky)
+	ctx := context.Background()
+	first, err := p.Take(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Report(first, http.StatusOK)
+	healthy := p.Nodes("healthy")
+	if len(healthy) != 1 || healthy[0].Label != first.Label() {
+		t.Fatalf("healthy nodes = %+v, want only %s", healthy, first.Label())
+	}
+	if all := p.Nodes("all"); len(all) != 2 {
+		t.Fatalf("all nodes = %d, want 2", len(all))
+	}
+	if p.Strategy() != string(StrategySticky) {
+		t.Fatalf("strategy = %s", p.Strategy())
+	}
+}

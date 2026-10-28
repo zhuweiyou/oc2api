@@ -48,7 +48,7 @@ func New(cfg config.Config, client *zen.Client, chats *chat.Service, proxies *pr
 	mux.HandleFunc("/", withCORS(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/", "/health", "":
-			health(w, proxies)
+			health(w, r, proxies)
 		case "/ip":
 			ip(w, r, cfg, proxies)
 		case "/v1/models", "/models":
@@ -70,7 +70,10 @@ func New(cfg config.Config, client *zen.Client, chats *chat.Service, proxies *pr
 	return mux
 }
 
-func health(w http.ResponseWriter, proxies *proxypool.Pool) {
+// health 返回状态；配置了订阅池时附带节点统计。默认返回健康节点列表，
+// 可用 ?state=healthy|unhealthy|cooling|all 切换。节点名不算敏感信息，公开返回。
+// Vercel 的无内核构建只返回统计，不返回节点列表。
+func health(w http.ResponseWriter, r *http.Request, proxies *proxypool.Pool) {
 	payload := map[string]any{
 		"status":    "ok",
 		"version":   config.Version,
@@ -78,9 +81,26 @@ func health(w http.ResponseWriter, proxies *proxypool.Pool) {
 	}
 	if proxies != nil {
 		total, healthy, cooling, unknown := proxies.Stats()
-		payload["proxy"] = map[string]any{
+		kernel := proxypool.KernelAvailable()
+		proxy := map[string]any{
 			"total": total, "healthy": healthy, "cooling": cooling, "unknown": unknown,
+			"strategy": proxies.Strategy(), "kernel": kernel,
 		}
+		if kernel {
+			state := r.URL.Query().Get("state")
+			if state == "" {
+				state = "healthy"
+			}
+			switch state {
+			case "healthy", "unhealthy", "cooling", "all":
+			default:
+				writeOpenAIError(w, http.StatusBadRequest, "state must be healthy, unhealthy, cooling or all", "invalid_request_error", "")
+				return
+			}
+			proxy["state"] = state
+			proxy["nodes"] = proxies.Nodes(state)
+		}
+		payload["proxy"] = proxy
 	}
 	writeJSON(w, http.StatusOK, payload, nil)
 }

@@ -39,6 +39,9 @@ func (e Entry) String() string { return e.URL().String() }
 // HostPort 返回不含凭据的 host:port，用于日志与诊断展示。
 func (e Entry) HostPort() string { return net.JoinHostPort(e.Host, e.Port) }
 
+// Kind 返回协议类型（http/socks5 等），用于节点列表展示。
+func (e Entry) Kind() string { return e.Scheme }
+
 var supported = map[string]bool{
 	"http": true, "https": true, "socks5": true, "socks5h": true,
 }

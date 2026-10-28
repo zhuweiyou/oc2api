@@ -252,6 +252,64 @@ func (p *Pool) Stats() (total, healthy, coolingCount, unknown int) {
 	return
 }
 
+// NodeInfo 是节点在诊断接口里的可见视图（不含服务器地址与凭据）。
+type NodeInfo struct {
+	Label     string `json:"label"`
+	Kind      string `json:"kind"`
+	Healthy   bool   `json:"healthy"`
+	Known     bool   `json:"known"`
+	Cooling   bool   `json:"cooling"`
+	LatencyMS int64  `json:"latency_ms"`
+	LastCheck string `json:"last_check,omitempty"`
+}
+
+// Strategy 返回当前的节点选择策略。
+func (p *Pool) Strategy() string {
+	return string(p.strategy)
+}
+
+// Nodes 返回节点列表；state 支持 healthy（默认）、unhealthy、cooling、all。
+func (p *Pool) Nodes(state string) []NodeInfo {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	out := make([]NodeInfo, 0, len(p.entries))
+	for _, e := range p.entries {
+		st := p.states[e]
+		info := NodeInfo{Label: e.Label()}
+		if kinded, ok := e.(interface{ Kind() string }); ok {
+			info.Kind = kinded.Kind()
+		}
+		if st != nil {
+			info.Healthy = st.healthy
+			info.Known = st.known
+			info.LatencyMS = st.latency.Milliseconds()
+			if !st.lastCheck.IsZero() {
+				info.LastCheck = st.lastCheck.Format(time.RFC3339)
+			}
+		}
+		if until, ok := p.cooling[e]; ok && until.After(now) {
+			info.Cooling = true
+		}
+		switch state {
+		case "healthy":
+			if !info.Healthy {
+				continue
+			}
+		case "unhealthy":
+			if !info.Known || info.Healthy {
+				continue
+			}
+		case "cooling":
+			if !info.Cooling {
+				continue
+			}
+		}
+		out = append(out, info)
+	}
+	return out
+}
+
 func (p *Pool) load(ctx context.Context) error {
 	p.mu.Lock()
 	if p.loaded {

@@ -31,6 +31,9 @@ func (n *mihomoNode) Label() string {
 	return n.kind + ":" + n.name
 }
 
+// Kind 返回协议类型（ss/vmess/vless/trojan/hysteria2 等）。
+func (n *mihomoNode) Kind() string { return n.kind }
+
 func (n *mihomoNode) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
 	if network != "tcp" && network != "tcp4" && network != "tcp6" {
 		return nil, fmt.Errorf("mihomo node %s only supports tcp, got %q", n.Label(), network)
@@ -57,6 +60,9 @@ func (n *mihomoNode) Dial(ctx context.Context, network, addr string) (net.Conn, 
 }
 
 // ParseSubscription 已移到 subscription.go（根据构建标签选择是否带内核）。
+// KernelAvailable 表示当前构建是否带 mihomo 内核（Vercel 的 nomihomo 构建为 false）。
+func KernelAvailable() bool { return true }
+
 func parseClash(body []byte) (nodes []Dialer, skipped int, ok bool) {
 	var doc struct {
 		Proxies []map[string]any `yaml:"proxies"`

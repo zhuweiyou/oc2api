@@ -31,3 +31,9 @@ func TestParseClashNodes(t *testing.T) {
 		t.Fatalf("label = %q, want ss:a", nodes[0].Label())
 	}
 }
+
+func TestKernelAvailable(t *testing.T) {
+	if !KernelAvailable() {
+		t.Fatal("kernel should be available in default build")
+	}
+}
