@@ -49,8 +49,8 @@ TLS 握手和等响应头；正文流式读取不设上限。注意：自定义 
   ss/vmess/vless/trojan/hysteria2/http/socks5；带 `dialer-proxy` 的链式节点会跳过；
 - 健康探测只做真实 TLS 握手（`1.1.1.1:443` + `opencode.ai:443`），不消耗上游额度；
   `PROXY_HEALTH_INTERVAL_SECONDS` 定时重试死节点、复检健康节点；
-- `PROXY_SUBSCRIPTION_REFRESH_SECONDS` 定时重拉订阅；失败/为空保留旧池，节点状态按
-  `Dialer.Key()`（协议+地址+凭据哈希）跨刷新保留，新增节点立即补探；
+- `PROXY_SUBSCRIPTION_REFRESH_SECONDS` 定时重拉订阅；**新节点先在旧池外探测完再整体切换**，
+  失败/为空/新池无健康节点都保留旧池；节点状态按 `Dialer.Key()`（协议+地址+凭据哈希）跨刷新保留；
 - `/health` 返回统计与健康节点列表（`?state=` 可切），`/ip` 同时返回直连与代理出口，
   两个出口都由 ipquery / ip-api / 1.1.1.1 trace 并发竞速。
 

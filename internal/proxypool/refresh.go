@@ -3,11 +3,17 @@ package proxypool
 import (
 	"context"
 	"log"
+	"sync"
 	"time"
 )
 
-// startRefreshLoop 定时重新拉取订阅。只有成功解析出节点才替换；
-// 拉取失败或解析为空时完整保留旧节点池，绝不清空。
+type nodeProbeResult struct {
+	healthy bool
+	latency time.Duration
+}
+
+// startRefreshLoop 定时重新拉取订阅。默认策略是「先把新节点探测完，再整体切换」，
+// 这样刷新过程中旧节点一直可用，也不会把请求打到未验证的新节点上。
 func (p *Pool) startRefreshLoop() {
 	if p.skipProbe || p.refreshEvery <= 0 {
 		return
@@ -23,7 +29,8 @@ func (p *Pool) startRefreshLoop() {
 	})
 }
 
-// refreshSubscription 拉取新订阅并替换节点池，同时按稳定 Key 保留未变节点的状态。
+// refreshSubscription 拉取新订阅，先探测所有新增节点，再整体替换节点池。
+// 拉取失败、解析为空、或新池探测后没有任何健康节点时，完整保留旧节点池。
 func (p *Pool) refreshSubscription(ctx context.Context) {
 	dialers, skipped, err := p.fetchDialers(ctx)
 	if err != nil {
@@ -31,26 +38,61 @@ func (p *Pool) refreshSubscription(ctx context.Context) {
 		return
 	}
 
-	now := time.Now()
 	p.mu.Lock()
 	oldStates := p.states
 	oldCooling := p.cooling
+	oldCount := len(p.entries)
+	var newDialers []Dialer
+	for _, d := range dialers {
+		if _, ok := oldStates[d.Key()]; !ok {
+			newDialers = append(newDialers, d)
+		}
+	}
+	p.mu.Unlock()
+
+	// 关键：新节点先在旧池之外探测完，再切换。
+	results := map[string]nodeProbeResult{}
+	if len(newDialers) > 0 {
+		log.Printf("[proxypool] refresh probing %d new nodes before switching", len(newDialers))
+		results = p.probeCandidates(newDialers)
+	}
+
+	now := time.Now()
+	p.mu.Lock()
 	states := make(map[string]*nodeState, len(dialers))
 	cooling := make(map[string]time.Time, len(dialers))
-	added := 0
+	added, healthy := 0, 0
 	for _, d := range dialers {
 		key := d.Key()
 		if st, ok := oldStates[key]; ok {
 			states[key] = st
+			if st.healthy {
+				healthy++
+			}
 		} else {
-			states[key] = &nodeState{}
+			st := &nodeState{known: true, lastCheck: now}
+			if result, ok := results[key]; ok {
+				st.healthy = result.healthy
+				st.latency = result.latency
+			}
+			states[key] = st
 			added++
+			if st.healthy {
+				healthy++
+			} else {
+				cooling[key] = now.Add(failureCooldown)
+			}
 		}
 		if until, ok := oldCooling[key]; ok && until.After(now) {
 			cooling[key] = until
 		}
 	}
-	oldCount := len(p.entries)
+	if healthy == 0 {
+		p.mu.Unlock()
+		log.Printf("[proxypool] refresh produced 0 healthy nodes, keeping existing %d nodes", oldCount)
+		return
+	}
+
 	p.entries = dialers
 	p.next = 0
 	p.states = states
@@ -62,26 +104,38 @@ func (p *Pool) refreshSubscription(ctx context.Context) {
 	}
 	p.mu.Unlock()
 
-	log.Printf("[proxypool] subscription refreshed: %d -> %d nodes (added=%d skipped=%d)",
-		oldCount, len(dialers), added, skipped)
-	if added > 0 {
-		go p.probeNew(dialers)
-	}
+	log.Printf("[proxypool] subscription refreshed: %d -> %d nodes (added=%d healthy=%d skipped=%d)",
+		oldCount, len(dialers), added, healthy, skipped)
 }
 
-// probeNew 立即探测刷新后新增、还没有状态的节点，避免等下一个健康检查周期。
-func (p *Pool) probeNew(dialers []Dialer) {
-	p.mu.Lock()
-	targets := make([]Dialer, 0, len(dialers))
-	for _, d := range dialers {
-		if st := p.states[d.Key()]; st == nil || !st.known {
-			targets = append(targets, d)
-		}
+// probeCandidates 在切换前探测一批新节点，只返回结果，不改动当前节点池。
+func (p *Pool) probeCandidates(entries []Dialer) map[string]nodeProbeResult {
+	results := make(map[string]nodeProbeResult, len(entries))
+	if p.skipProbe {
+		return results
 	}
-	p.mu.Unlock()
-	if len(targets) == 0 {
-		return
+	p.probeRunMu.Lock()
+	defer p.probeRunMu.Unlock()
+
+	jobs := make(chan Dialer)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	for i := 0; i < probeWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for d := range jobs {
+				ok, latency := probeNode(context.Background(), d)
+				mu.Lock()
+				results[d.Key()] = nodeProbeResult{healthy: ok, latency: latency}
+				mu.Unlock()
+			}
+		}()
 	}
-	healthy := p.probeBatch(targets, false)
-	log.Printf("[proxypool] new nodes probed: scanned=%d healthy=%d", len(targets), healthy)
+	for _, d := range entries {
+		jobs <- d
+	}
+	close(jobs)
+	wg.Wait()
+	return results
 }
