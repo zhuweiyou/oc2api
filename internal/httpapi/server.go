@@ -48,9 +48,9 @@ func New(cfg config.Config, client *zen.Client, chats *chat.Service, proxies *pr
 	mux.HandleFunc("/", withCORS(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/", "/health", "":
-			health(w)
+			health(w, proxies)
 		case "/ip":
-			ip(w, r, proxies)
+			ip(w, r, cfg, proxies)
 		case "/v1/models", "/models":
 			if !authorized(cfg, r) {
 				writeOpenAIError(w, http.StatusUnauthorized, "Invalid API key", "authentication_error", "")
@@ -70,12 +70,19 @@ func New(cfg config.Config, client *zen.Client, chats *chat.Service, proxies *pr
 	return mux
 }
 
-func health(w http.ResponseWriter) {
-	writeJSON(w, http.StatusOK, map[string]any{
+func health(w http.ResponseWriter, proxies *proxypool.Pool) {
+	payload := map[string]any{
 		"status":    "ok",
 		"version":   config.Version,
 		"endpoints": endpointList,
-	}, nil)
+	}
+	if proxies != nil {
+		total, healthy, cooling, unknown := proxies.Stats()
+		payload["proxy"] = map[string]any{
+			"total": total, "healthy": healthy, "cooling": cooling, "unknown": unknown,
+		}
+	}
+	writeJSON(w, http.StatusOK, payload, nil)
 }
 
 // authorized 与 Node 版 authenticate 等价：authorization 优先，回退 x-api-key；
@@ -106,30 +113,41 @@ func models(w http.ResponseWriter, r *http.Request, client *zen.Client) {
 
 // ip 与 Node 版一致：依次尝试两个供应商，返回 {ip, source}。
 // 带 ?proxy=1 时走订阅代理池的某个出口，用来核对轮换是否真的换了 IP。
-func ip(w http.ResponseWriter, r *http.Request, proxies *proxypool.Pool) {
+func ip(w http.ResponseWriter, r *http.Request, cfg config.Config, proxies *proxypool.Pool) {
 	if r.URL.Query().Get("proxy") != "" {
 		if proxies == nil {
 			writeOpenAIError(w, http.StatusBadRequest, "proxy pool is not configured", "invalid_request_error", "proxy_not_configured")
 			return
 		}
-		entry, err := proxies.Take(r.Context())
-		if err != nil {
-			writeOpenAIError(w, http.StatusBadGateway, "proxy pool unavailable: "+err.Error(), "upstream_error", "proxy_unavailable")
-			return
+		attempts := cfg.ProxyMaxAttempts
+		if attempts < 1 {
+			attempts = 1
 		}
-		client := &http.Client{Transport: &http.Transport{
-			ForceAttemptHTTP2: false,
-			DisableKeepAlives: true,
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return entry.Dial(ctx, network, addr)
-			},
-		}}
-		found, source := ipinfo.Lookup(client)
-		if found == "" {
-			writeOpenAIError(w, http.StatusBadGateway, "Upstream error: all IP providers failed", "upstream_error", "upstream_error")
-			return
+		var lastErr string
+		for i := 0; i < attempts; i++ {
+			entry, err := proxies.Take(r.Context())
+			if err != nil {
+				lastErr = "proxy pool unavailable: " + err.Error()
+				break
+			}
+			client := &http.Client{Transport: &http.Transport{
+				ForceAttemptHTTP2: false,
+				DisableKeepAlives: true,
+				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					return entry.Dial(ctx, network, addr)
+				},
+			}}
+			found, source := ipinfo.Lookup(client)
+			client.CloseIdleConnections()
+			if found != "" {
+				proxies.Report(entry, http.StatusOK)
+				writeJSON(w, http.StatusOK, map[string]any{"ip": found, "source": source, "via": "proxy", "proxy": entry.Label()}, nil)
+				return
+			}
+			proxies.Report(entry, http.StatusBadGateway)
+			lastErr = "all IP providers failed via " + entry.Label()
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ip": found, "source": source, "via": "proxy", "proxy": entry.HostPort()}, nil)
+		writeOpenAIError(w, http.StatusBadGateway, "Upstream error: "+lastErr, "upstream_error", "upstream_error")
 		return
 	}
 

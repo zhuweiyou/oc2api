@@ -108,10 +108,11 @@ API_KEY=your-key PORT=8080 go run ./cmd/oc2api
 - `ZEN_CONNECT_TIMEOUT_MS`：建连、TLS 握手与等响应头的超时，默认 `60000`，允许 `1`–`600000`
 - `DEBUG`：设为 `true` 输出调试日志
 - `PROXY_SUBSCRIPTION_URL`：可选，代理订阅地址（http/https）。**冷启动不联网**，第一次对话请求时
-  才拉取并解析成内存 IP 池，之后每个请求轮换一个出口。支持纯文本 `IP:PORT[(:USER:PASS)]`、
-  `http://` / `socks5://` URI 行、base64 包裹、Clash YAML、sing-box JSON；`vmess/vless/trojan/ss`
-  这类非 HTTP 代理节点会被跳过。留空则直连。
-- `PROXY_MAX_ATTEMPTS`：可选，遇到 429/403/5xx 时最多尝试几个出口，默认 `3`，允许 `1`–`10`
+  才拉取并解析成内存节点池，之后每个请求轮换一个节点。Clash YAML（`proxies:`）由内置的 mihomo
+  内核解析，支持 `ss / vmess / vless / trojan / hysteria2 / http / socks5` 等；纯文本
+  `IP:PORT[(:USER:PASS)]`、`http://` / `socks5://` URI 行、base64 包裹也支持。带 `dialer-proxy`
+  的链式节点会跳过。留空则直连。
+- `PROXY_MAX_ATTEMPTS`：可选，遇到 429/403/5xx 或节点不通时最多尝试几个节点，默认 `5`，允许 `1`–`10`
 
 用 `GET /ip?proxy=1` 可以核对代理池当前出口（返回 `via: "proxy"` 和实际代理地址）。
 

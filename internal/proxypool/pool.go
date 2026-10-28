@@ -13,17 +13,29 @@ import (
 var (
 	// ErrNotConfigured 表示没有配置订阅地址。
 	ErrNotConfigured = errors.New("proxy subscription URL is empty")
-	// ErrEmpty 表示订阅里没有可用的 http/socks5 出口。
-	ErrEmpty = errors.New("no usable proxy entry in subscription")
+	// ErrEmpty 表示订阅里没有可用的出口。
+	ErrEmpty = errors.New("no usable node in subscription")
 )
 
 const (
 	maxSubscriptionBytes = 8 << 20
-	rotationCooldown     = 60 * time.Second
+	// quotaCooldown：429/403 是出口额度问题，短暂冷却后可能恢复。
+	quotaCooldown = 60 * time.Second
+	// failureCooldown：传输失败（EOF/超时/认证失败）说明节点本身挂了，
+	// 冷却久一点，避免每条请求都反复踩同一个死节点。
+	failureCooldown = 10 * time.Minute
+	// probeWait：第一次请求最多等这么久看有没有探出健康节点。
+	probeWait = 8 * time.Second
 )
 
-// Pool 是「订阅地址 → 懒加载 IP 池 → 每次取一个」的实现。
-// 第一次 Take 时才去拉订阅（冷启动不阻塞服务启动），之后轮询分配。
+type nodeState struct {
+	healthy bool
+	known   bool
+	latency time.Duration
+}
+
+// Pool 是「订阅地址 → 懒加载节点池 → 每次取一个」的实现。
+// 第一次 Take 时才去拉订阅（冷启动不阻塞服务启动），随后后台探测节点健康度。
 type Pool struct {
 	url    string
 	client *http.Client
@@ -31,42 +43,78 @@ type Pool struct {
 	loadMu sync.Mutex
 	loaded bool
 
+	probeOnce      sync.Once
+	probeReady     chan struct{}
+	probeReadyOnce sync.Once
+	firstWait      time.Duration
+	skipProbe      bool
+
 	mu      sync.Mutex
-	entries []*Entry
+	entries []Dialer
 	next    int
-	cooling map[*Entry]time.Time
+	cooling map[Dialer]time.Time
+	states  map[Dialer]*nodeState
 }
 
 // New 只保存订阅地址，不做任何网络请求。
 func New(subscriptionURL string) *Pool {
 	return &Pool{
-		url:     subscriptionURL,
-		client:  &http.Client{Timeout: 30 * time.Second},
-		cooling: make(map[*Entry]time.Time),
+		url:       subscriptionURL,
+		client:    &http.Client{Timeout: 30 * time.Second},
+		cooling:   make(map[Dialer]time.Time),
+		states:    make(map[Dialer]*nodeState),
+		firstWait: probeWait,
 	}
 }
 
-// Take 取一个可用出口；第一次调用会同步加载订阅。
-func (p *Pool) Take(ctx context.Context) (*Entry, error) {
+// Take 取一个可用节点；优先健康节点，其次未探测过的，最后才是还在冷却里的。
+func (p *Pool) Take(ctx context.Context) (Dialer, error) {
 	if err := p.load(ctx); err != nil {
 		return nil, err
 	}
+	p.waitProbe(ctx)
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
+	if len(p.entries) == 0 {
+		return nil, ErrEmpty
+	}
 	now := time.Now()
 	n := len(p.entries)
+
+	// 1) 健康且不在冷却
 	for i := 0; i < n; i++ {
 		e := p.entries[p.next%n]
 		p.next = (p.next + 1) % n
-		if until, ok := p.cooling[e]; ok && until.After(now) {
+		if p.coolingActiveLocked(e, now) {
 			continue
 		}
-		delete(p.cooling, e)
+		if st := p.states[e]; st != nil && st.healthy {
+			return e, nil
+		}
+	}
+	// 2) 还没探测过且不在冷却（边用边探）
+	for i := 0; i < n; i++ {
+		e := p.entries[p.next%n]
+		p.next = (p.next + 1) % n
+		if p.coolingActiveLocked(e, now) {
+			continue
+		}
+		if st := p.states[e]; st == nil || !st.known {
+			return e, nil
+		}
+	}
+	// 3) 探测过但暂时没判死的
+	for i := 0; i < n; i++ {
+		e := p.entries[p.next%n]
+		p.next = (p.next + 1) % n
+		if p.coolingActiveLocked(e, now) {
+			continue
+		}
 		return e, nil
 	}
-	// 全部在冷却：返回最早解冻的那个，别让请求直接失败。
-	var best *Entry
+	// 全部冷却：返回最早解冻的那个，别让请求直接失败。
+	var best Dialer
 	var bestUntil time.Time
 	for _, e := range p.entries {
 		until := p.cooling[e]
@@ -80,24 +128,77 @@ func (p *Pool) Take(ctx context.Context) (*Entry, error) {
 	return best, nil
 }
 
-// Report 把上游结果反馈给池子：429/403 等视为出口问题，冷却一阵子。
-func (p *Pool) Report(e *Entry, status int) {
+// Report 把结果反馈给池子：2xx 标健康，429/403 短期冷却，传输错误长期冷却。
+func (p *Pool) Report(e Dialer, status int) {
 	if e == nil {
 		return
 	}
-	switch status {
-	case http.StatusForbidden, http.StatusTooManyRequests,
-		http.StatusBadGateway, http.StatusGatewayTimeout:
-		p.mu.Lock()
-		p.cooling[e] = time.Now().Add(rotationCooldown)
-		p.mu.Unlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	st := p.states[e]
+	if st == nil {
+		st = &nodeState{}
+		p.states[e] = st
+	}
+	switch {
+	case status >= 200 && status < 300:
+		st.healthy = true
+		st.known = true
+		delete(p.cooling, e)
+	case status == http.StatusForbidden || status == http.StatusTooManyRequests:
+		p.coolLocked(e, quotaCooldown)
+	case status >= 500:
+		st.healthy = false
+		st.known = true
+		p.coolLocked(e, failureCooldown)
 	}
 }
 
+func (p *Pool) coolLocked(e Dialer, d time.Duration) {
+	until := time.Now().Add(d)
+	if existing, ok := p.cooling[e]; !ok || until.After(existing) {
+		p.cooling[e] = until
+	}
+}
+
+func (p *Pool) coolingActiveLocked(e Dialer, now time.Time) bool {
+	until, ok := p.cooling[e]
+	if !ok {
+		return false
+	}
+	if until.After(now) {
+		return true
+	}
+	delete(p.cooling, e)
+	return false
+}
+
+// Size 返回节点总数。
 func (p *Pool) Size() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.entries)
+}
+
+// Stats 返回池子的健康度快照，供 /health 展示。
+func (p *Pool) Stats() (total, healthy, coolingCount, unknown int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	total = len(p.entries)
+	for _, e := range p.entries {
+		st := p.states[e]
+		if st != nil && st.healthy {
+			healthy++
+		}
+		if st == nil || !st.known {
+			unknown++
+		}
+		if until, ok := p.cooling[e]; ok && until.After(now) {
+			coolingCount++
+		}
+	}
+	return
 }
 
 func (p *Pool) load(ctx context.Context) error {
@@ -124,6 +225,7 @@ func (p *Pool) load(ctx context.Context) error {
 	p.mu.Lock()
 	p.loaded = true
 	p.mu.Unlock()
+	p.startProbe()
 	return nil
 }
 
@@ -148,17 +250,17 @@ func (p *Pool) reload(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	parsed, skipped := ParseContent(string(body))
-	if len(parsed) == 0 {
-		return fmt.Errorf("%w (skipped %d unsupported lines)", ErrEmpty, skipped)
-	}
-	entries := make([]*Entry, 0, len(parsed))
-	for i := range parsed {
-		entries = append(entries, &parsed[i])
+	dialers, skipped := ParseSubscription(body)
+	if len(dialers) == 0 {
+		return fmt.Errorf("%w (skipped %d unsupported entries)", ErrEmpty, skipped)
 	}
 	p.mu.Lock()
-	p.entries = entries
+	p.entries = dialers
 	p.next = 0
+	p.states = make(map[Dialer]*nodeState, len(dialers))
+	for _, d := range dialers {
+		p.states[d] = &nodeState{}
+	}
 	p.mu.Unlock()
 	return nil
 }

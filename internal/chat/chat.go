@@ -67,26 +67,23 @@ func (s *Service) UpstreamWithSession(ctx context.Context, payload map[string]an
 			s.proxies.Report(entry, http.StatusBadGateway)
 			lastErr = err
 			if s.debug {
-				log.Printf("[chat] proxy=%s attempt=%d 传输失败: %v", entry.HostPort(), i+1, err)
+				log.Printf("[chat] proxy=%s attempt=%d 传输失败: %v", entry.Label(), i+1, err)
 			}
 			continue
 		}
 		if s.debug {
 			log.Printf("[chat] proxy=%s attempt=%d upstream status=%d retry-after=%s",
-				entry.HostPort(), i+1, resp.StatusCode, resp.Header.Get("Retry-After"))
+				entry.Label(), i+1, resp.StatusCode, resp.Header.Get("Retry-After"))
 		}
 		if retryableProxyStatus(resp.StatusCode) && i+1 < s.attempts {
 			s.proxies.Report(entry, resp.StatusCode)
 			if s.debug {
-				log.Printf("[chat] proxy=%s 返回 %d，换下一个出口", entry.HostPort(), resp.StatusCode)
+				log.Printf("[chat] proxy=%s 返回 %d，换下一个出口", entry.Label(), resp.StatusCode)
 			}
 			drainAndClose(resp.Body)
 			continue
 		}
-		if retryableProxyStatus(resp.StatusCode) {
-			// 已经是最后一次：把出口标坏，但把上游原始响应透给客户端。
-			s.proxies.Report(entry, resp.StatusCode)
-		}
+		s.proxies.Report(entry, resp.StatusCode)
 		return resp, renames, nil
 	}
 	if lastErr == nil {

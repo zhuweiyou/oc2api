@@ -28,7 +28,7 @@ const (
 
 // PROXY_MAX_ATTEMPTS 默认值与区间：订阅代理模式下，429/403 时最多换几个出口。
 const (
-	DefaultProxyMaxAttempts = 3
+	DefaultProxyMaxAttempts = 5
 	minProxyMaxAttempts     = 1
 	maxProxyMaxAttempts     = 10
 )

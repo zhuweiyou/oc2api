@@ -39,6 +39,7 @@ func TestTakeLazyLoadAndRotate(t *testing.T) {
 	defer srv.Close()
 
 	p := New(srv.URL)
+	p.skipProbe = true
 	if p.Size() != 0 {
 		t.Fatalf("pool must be empty before first Take")
 	}
@@ -48,7 +49,7 @@ func TestTakeLazyLoadAndRotate(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Take: %v", err)
 		}
-		seen[e.String()] = true
+		seen[e.Label()] = true
 	}
 	if len(seen) != 3 {
 		t.Fatalf("expected 3 distinct exits, got %v", seen)
@@ -66,6 +67,7 @@ func TestCooldownSkipsFailedExit(t *testing.T) {
 	defer srv.Close()
 
 	p := New(srv.URL)
+	p.skipProbe = true
 	first, _ := p.Take(context.Background())
 	p.Report(first, http.StatusTooManyRequests)
 	for i := 0; i < 5; i++ {
@@ -73,7 +75,7 @@ func TestCooldownSkipsFailedExit(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if e.String() == first.String() {
+		if e.Label() == first.Label() {
 			t.Fatalf("cooled exit %s must be skipped", e)
 		}
 	}
@@ -98,6 +100,7 @@ func TestLoadRetriesAfterFailure(t *testing.T) {
 	defer srv.Close()
 
 	p := New(srv.URL)
+	p.skipProbe = true
 	if _, err := p.Take(context.Background()); err == nil {
 		t.Fatal("first Take should fail because subscription returns 500")
 	}
@@ -105,7 +108,7 @@ func TestLoadRetriesAfterFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second Take should retry and succeed: %v", err)
 	}
-	if entry.HostPort() != "1.2.3.4:8080" {
-		t.Fatalf("entry = %s", entry.HostPort())
+	if entry.Label() != "1.2.3.4:8080" {
+		t.Fatalf("entry = %s", entry.Label())
 	}
 }
