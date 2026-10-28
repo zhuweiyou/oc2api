@@ -51,6 +51,9 @@ flowchart TD
 首次部署大概 1–2 分钟。Vercel 的 Go runtime 会缓冲整段响应，所以 Vercel 上的流式由
 `api/index.js` 这层薄 Node 转发实现，业务逻辑仍然全在 Go 二进制里。
 
+Vercel 版用 `-tags nomihomo` 构建，**不打包 mihomo 内核**（二进制约 8 MB），所以只能使用
+纯文本 / URI / base64 里的 http、socks5 代理；Clash 多协议订阅需要 Docker 或本地版本。
+
 你也可以 Fork 后部署多个 Vercel Project 做轮询、负载分摊；多个项目不保证出口 IP 不同，
 需通过各自实例的 `/ip` 核对。
 
@@ -77,6 +80,8 @@ docker run -d --name oc2api --restart unless-stopped \
 `latest` 跟着最新版本走；要固定版本就用具体的版本 tag。
 
 容器监听 `PORT`，默认 `8080`。镜像基于 `scratch`，里面只有静态二进制和 CA 证书。
+当前镜像带 mihomo 内核（约 47 MB）；想要轻量镜像可构建时加
+`--build-arg GO_TAGS=nomihomo`（约 9 MB，仅 http/socks5）。
 云函数环境建议把超时调到 300 秒，否则长回答的流式响应会被提前截断。
 
 **本地构建**
@@ -120,7 +125,8 @@ curl http://localhost:8080/health
 ## Clash / Mihomo 订阅支持
 
 **Docker 部署和本地运行都适用**：这两种构建都内置 mihomo 内核，可以直接把一个订阅地址变成程序内的节点池——
-**启动时即拉取订阅并开始健康探测**，之后每个请求轮换一个节点，失败自动换下一个。
+**启动时即拉取订阅并开始健康探测**，之后按 `PROXY_STRATEGY` 选节点（默认 `sticky` 固定一个用到不可用，
+`round_robin` 则每次轮询），失败自动换下一个。
 Vercel 函数版为了控制包体积不含内核，限制见本节末尾「构建变体」。
 
 ### 环境变量
@@ -213,9 +219,12 @@ Authorization: Bearer <api-key>
 ## 开发
 
 ```bash
-go test ./...              # 离线单元测试
+go test ./...                     # 离线单元测试
+go test -tags nomihomo ./...      # 无内核构建（Vercel 用）也要过
 go vet ./...
-golangci-lint run ./...    # lint（配置见 .golangci.yml）
+golangci-lint run ./...           # lint（配置见 .golangci.yml）
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags nomihomo ./cmd/oc2api  # ~8MB
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ./cmd/oc2api                 # ~46MB，带内核
 ```
 
 实现细节（为什么用 uTLS、免费层的形状要求、Vercel 为什么是薄 Node 层）见 [AGENTS.md](AGENTS.md)。
