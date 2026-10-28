@@ -54,15 +54,17 @@ type Pool struct {
 	healthOnce     sync.Once
 	healthInterval time.Duration
 
-	mu      sync.Mutex
-	entries []Dialer
-	next    int
-	cooling map[Dialer]time.Time
-	states  map[Dialer]*nodeState
+	mu       sync.Mutex
+	entries  []Dialer
+	next     int
+	current  Dialer
+	strategy Strategy
+	cooling  map[Dialer]time.Time
+	states   map[Dialer]*nodeState
 }
 
-// New 只保存订阅地址与健康检查间隔，不做任何网络请求。
-func New(subscriptionURL string, healthInterval time.Duration) *Pool {
+// New 只保存订阅地址、健康检查间隔与选节点策略，不做任何网络请求。
+func New(subscriptionURL string, healthInterval time.Duration, strategy Strategy) *Pool {
 	return &Pool{
 		url:            subscriptionURL,
 		client:         &http.Client{Timeout: 30 * time.Second},
@@ -70,6 +72,7 @@ func New(subscriptionURL string, healthInterval time.Duration) *Pool {
 		states:         make(map[Dialer]*nodeState),
 		firstWait:      probeWait,
 		healthInterval: healthInterval,
+		strategy:       ParseStrategy(string(strategy)),
 	}
 }
 
@@ -92,6 +95,39 @@ func (p *Pool) Take(ctx context.Context) (Dialer, error) {
 		return nil, ErrEmpty
 	}
 	now := time.Now()
+
+	if p.strategy == StrategySticky {
+		if p.current != nil {
+			if p.usableLocked(p.current, now) {
+				return p.current, nil
+			}
+			p.current = nil
+		}
+	}
+
+	e := p.pickLocked(now)
+	if e == nil {
+		return nil, ErrEmpty
+	}
+	if p.strategy == StrategySticky {
+		p.current = e
+	}
+	return e, nil
+}
+
+// usableLocked 判断当前节点还能不能继续用（不在冷却，且不是已判定不健康）。
+func (p *Pool) usableLocked(e Dialer, now time.Time) bool {
+	if p.coolingActiveLocked(e, now) {
+		return false
+	}
+	if st := p.states[e]; st != nil && st.known && !st.healthy {
+		return false
+	}
+	return true
+}
+
+// pickLocked 按「健康 → 未探测 → 其它未冷却 → 最早解冻」的顺序挑一个节点。
+func (p *Pool) pickLocked(now time.Time) Dialer {
 	n := len(p.entries)
 
 	// 1) 健康且不在冷却
@@ -102,7 +138,7 @@ func (p *Pool) Take(ctx context.Context) (Dialer, error) {
 			continue
 		}
 		if st := p.states[e]; st != nil && st.healthy {
-			return e, nil
+			return e
 		}
 	}
 	// 2) 还没探测过且不在冷却（边用边探）
@@ -113,7 +149,7 @@ func (p *Pool) Take(ctx context.Context) (Dialer, error) {
 			continue
 		}
 		if st := p.states[e]; st == nil || !st.known {
-			return e, nil
+			return e
 		}
 	}
 	// 3) 探测过但暂时没判死的
@@ -123,7 +159,7 @@ func (p *Pool) Take(ctx context.Context) (Dialer, error) {
 		if p.coolingActiveLocked(e, now) {
 			continue
 		}
-		return e, nil
+		return e
 	}
 	// 全部冷却：返回最早解冻的那个，别让请求直接失败。
 	var best Dialer
@@ -134,10 +170,7 @@ func (p *Pool) Take(ctx context.Context) (Dialer, error) {
 			best, bestUntil = e, until
 		}
 	}
-	if best == nil {
-		return nil, ErrEmpty
-	}
-	return best, nil
+	return best
 }
 
 // Report 把结果反馈给池子：2xx 标健康，429/403 短期冷却，传输错误长期冷却。
@@ -159,10 +192,16 @@ func (p *Pool) Report(e Dialer, status int) {
 		delete(p.cooling, e)
 	case status == http.StatusForbidden || status == http.StatusTooManyRequests:
 		p.coolLocked(e, quotaCooldown)
+		if p.current == e {
+			p.current = nil
+		}
 	case status >= 500:
 		st.healthy = false
 		st.known = true
 		p.coolLocked(e, failureCooldown)
+		if p.current == e {
+			p.current = nil
+		}
 	}
 }
 

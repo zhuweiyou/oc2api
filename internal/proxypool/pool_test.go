@@ -40,7 +40,7 @@ func TestTakeLazyLoadAndRotate(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	p := New(srv.URL, 0)
+	p := New(srv.URL, 0, StrategyRoundRobin)
 	p.skipProbe = true
 	if p.Size() != 0 {
 		t.Fatalf("pool must be empty before first Take")
@@ -68,7 +68,7 @@ func TestCooldownSkipsFailedExit(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	p := New(srv.URL, 0)
+	p := New(srv.URL, 0, StrategySticky)
 	p.skipProbe = true
 	first, _ := p.Take(context.Background())
 	p.Report(first, http.StatusTooManyRequests)
@@ -84,14 +84,14 @@ func TestCooldownSkipsFailedExit(t *testing.T) {
 }
 
 func TestEmptyURL(t *testing.T) {
-	if _, err := New("", 0).Take(context.Background()); err != ErrNotConfigured {
+	if _, err := New("", 0, StrategySticky).Take(context.Background()); err != ErrNotConfigured {
 		t.Fatalf("err = %v, want ErrNotConfigured", err)
 	}
 }
 
 func TestErrorRedactsSubscription(t *testing.T) {
 	const secret = "https://secret.example/token123"
-	p := New(secret, 0)
+	p := New(secret, 0, StrategySticky)
 	err := p.redact(errors.New(`Get "` + secret + `": dial failed`))
 	if strings.Contains(err.Error(), "token123") {
 		t.Fatalf("error leaks subscription token: %v", err)
@@ -113,7 +113,7 @@ func TestLoadRetriesAfterFailure(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	p := New(srv.URL, 0)
+	p := New(srv.URL, 0, StrategySticky)
 	p.skipProbe = true
 	if _, err := p.Take(context.Background()); err == nil {
 		t.Fatal("first Take should fail because subscription returns 500")
@@ -124,5 +124,59 @@ func TestLoadRetriesAfterFailure(t *testing.T) {
 	}
 	if entry.Label() != "1.2.3.4:8080" {
 		t.Fatalf("entry = %s", entry.Label())
+	}
+}
+
+func newTwoNodePool(t *testing.T, strategy Strategy) *Pool {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("http://1.1.1.1:8080\nhttp://2.2.2.2:8080\n"))
+	}))
+	t.Cleanup(srv.Close)
+	p := New(srv.URL, 0, strategy)
+	p.skipProbe = true
+	return p
+}
+
+func TestStickyKeepsNodeUntilUnusable(t *testing.T) {
+	p := newTwoNodePool(t, StrategySticky)
+	ctx := context.Background()
+	first, err := p.Take(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		again, err := p.Take(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if again.Label() != first.Label() {
+			t.Fatalf("sticky changed node: %s -> %s", first.Label(), again.Label())
+		}
+	}
+	// 标记当前节点不可用，下一次必须换。
+	p.Report(first, http.StatusBadGateway)
+	next, err := p.Take(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.Label() == first.Label() {
+		t.Fatalf("sticky did not switch after failure: %s", next.Label())
+	}
+}
+
+func TestRoundRobinSwitchesEachTime(t *testing.T) {
+	p := newTwoNodePool(t, StrategyRoundRobin)
+	ctx := context.Background()
+	seen := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		e, err := p.Take(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seen[e.Label()] = true
+	}
+	if len(seen) != 2 {
+		t.Fatalf("round_robin used %d distinct nodes, want 2: %v", len(seen), seen)
 	}
 }

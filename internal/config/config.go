@@ -40,6 +40,14 @@ const (
 	maxProxyHealthInterval     = 24 * time.Hour
 )
 
+// PROXY_STRATEGY：节点选择策略。sticky=填充（默认，用到不可用再换），
+// round_robin=轮询（每次请求换一个）。
+const (
+	DefaultProxyStrategy = "sticky"
+	ProxyStrategySticky  = "sticky"
+	ProxyStrategyRR      = "round_robin"
+)
+
 // Config 是启动时定下来的配置快照，运行期不再变化。
 type Config struct {
 	// APIKey 留空表示匿名访问。
@@ -59,6 +67,8 @@ type Config struct {
 	ProxyMaxAttempts int
 	// ProxyHealthInterval 是定时健康检查间隔；0 表示只在加载时探测一次。
 	ProxyHealthInterval time.Duration
+	// ProxyStrategy 是节点选择策略：sticky（默认，填充）或 round_robin（轮询）。
+	ProxyStrategy string
 }
 
 // Load 读取并校验环境变量。不做缓存：由调用方在启动阶段调一次，再把结果注入下游。
@@ -83,6 +93,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	proxyStrategy, err := loadProxyStrategy()
+	if err != nil {
+		return Config{}, err
+	}
 	return Config{
 		APIKey:               strings.TrimSpace(os.Getenv("API_KEY")),
 		Debug:                os.Getenv("DEBUG") == "true",
@@ -92,6 +106,7 @@ func Load() (Config, error) {
 		ProxySubscriptionURL: proxyURL,
 		ProxyMaxAttempts:     proxyAttempts,
 		ProxyHealthInterval:  proxyHealth,
+		ProxyStrategy:        proxyStrategy,
 	}, nil
 }
 
@@ -187,4 +202,17 @@ func loadProxyHealthInterval() (time.Duration, error) {
 			int(minProxyHealthInterval.Seconds()), int(maxProxyHealthInterval.Seconds()), seconds)
 	}
 	return interval, nil
+}
+
+// loadProxyStrategy 归一化节点选择策略；未知值直接报错，避免“以为在轮询其实一直是填充”。
+func loadProxyStrategy() (string, error) {
+	raw := strings.TrimSpace(strings.ToLower(os.Getenv("PROXY_STRATEGY")))
+	switch raw {
+	case "", "sticky", "fill", "sticky-until-failure":
+		return ProxyStrategySticky, nil
+	case "round_robin", "round-robin", "rr", "roundrobin", "polling":
+		return ProxyStrategyRR, nil
+	default:
+		return "", fmt.Errorf("PROXY_STRATEGY 只能是 sticky（填充）或 round_robin（轮询），当前为 %q", raw)
+	}
 }

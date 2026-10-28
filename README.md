@@ -129,6 +129,7 @@ Vercel 函数版为了控制包体积不含内核，限制见本节末尾「构�
 | --- | --- | --- |
 | `PROXY_SUBSCRIPTION_URL` | 空（直连） | 订阅地址（http/https）。Clash YAML 由内置 mihomo 解析，支持 `ss / vmess / vless / trojan / hysteria2 / http / socks5`；也支持纯文本 `IP:PORT[(:USER:PASS)]`、`http://` / `socks5://` URI 行、base64 包裹。带 `dialer-proxy` 的链式节点会跳过。 |
 | `PROXY_MAX_ATTEMPTS` | `5` | 遇到 429/403/5xx 或节点不通时最多尝试几个节点，允许 `1`–`10` |
+| `PROXY_STRATEGY` | `sticky` | 节点选择策略：`sticky`（填充，默认）——一个节点一直用到不可用（429/403/传输失败）才换下一个；`round_robin`——每次请求都轮询下一个健康节点 |
 | `PROXY_HEALTH_INTERVAL_SECONDS` | `600` | 定时健康检查间隔秒数，允许 `60`–`86400`；`0` 关闭。定时检查会重试所有死节点，并每 30 分钟复检健康节点 |
 
 Docker 示例：
@@ -144,7 +145,8 @@ docker run -d --name oc2api --restart unless-stopped \
 ### 运行行为
 
 - 加载后后台并发探测节点（真实 TLS 握手，不消耗上游额度），只把健康节点投入轮换；
-- 每个请求新建连接、轮换节点；429/403/5xx 或节点不通时自动切换；
+- 默认 `sticky` 填充：固定用一个健康节点，直到它 429/403/传输失败才换下一个；`round_robin` 则每次请求轮询下一个；
+- 每个请求新建连接；429/403/5xx 或节点不通时自动切换；
 - `GET /ip?proxy=1` 核对当前出口（返回 `via: "proxy"` 和节点名）；
 - `GET /health` 返回 `proxy.total / healthy / cooling / unknown`。
 
