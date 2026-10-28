@@ -112,7 +112,7 @@ API_KEY=your-key PORT=8080 go run ./cmd/oc2api
   自建中继只填根地址即可
 - `ZEN_CONNECT_TIMEOUT_MS`：建连、TLS 握手与等响应头的超时，默认 `60000`，允许 `1`–`600000`
 - `DEBUG`：设为 `true` 输出调试日志
-- 代理订阅相关环境变量（`PROXY_*`）见下方「[Clash / Mihomo 订阅支持](#clash--mihomo-订阅支持)」。
+- 代理订阅相关环境变量（`PROXY_*`）见下方「[代理订阅与节点池](#代理订阅与节点池)」。
 
 健康检查：
 
@@ -122,18 +122,22 @@ curl http://localhost:8080/health
 
 </details>
 
-## Clash / Mihomo 订阅支持
+## 代理订阅与节点池
 
-**Docker 部署和本地运行都适用**：这两种构建都内置 mihomo 内核，可以直接把一个订阅地址变成程序内的节点池——
+**Docker 部署和本地运行都适用**：这两种构建内置 mihomo 内核，可以把一个代理订阅转成程序内的节点池——
 **启动时即拉取订阅并开始健康探测**，之后按 `PROXY_STRATEGY` 选节点（默认 `sticky` 固定一个用到不可用，
 `round_robin` 则每次轮询），失败自动换下一个。
+
+订阅格式不限于 Clash：支持 Clash / Mihomo 的 YAML（`proxies:`）、纯文本 `IP:PORT[:USER:PASS]`、
+`http://` / `socks5://` 等 URI 行、base64 包裹；其中 Clash YAML 的多协议节点
+（ss / vmess / vless / trojan / hysteria2 等）由内置 mihomo 解析并拨号。
 Vercel 函数版为了控制包体积不含内核，限制见本节末尾「构建变体」。
 
 ### 环境变量
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `PROXY_SUBSCRIPTION_URL` | 空（直连） | 订阅地址（http/https）。Clash YAML 由内置 mihomo 解析，支持 `ss / vmess / vless / trojan / hysteria2 / http / socks5`；也支持纯文本 `IP:PORT[(:USER:PASS)]`、`http://` / `socks5://` URI 行、base64 包裹。带 `dialer-proxy` 的链式节点会跳过。 |
+| `PROXY_SUBSCRIPTION_URL` | 空（直连） | 订阅地址（http/https）。支持 Clash/Mihomo YAML（`proxies:`）、纯文本 `IP:PORT[(:USER:PASS)]`、`http://` / `socks5://` URI 行、base64 包裹；Clash YAML 里的多协议节点（ss / vmess / vless / trojan / hysteria2 等）由内置 mihomo 解析，带 `dialer-proxy` 的链式节点会跳过。 |
 | `PROXY_MAX_ATTEMPTS` | `5` | 遇到 429/403/5xx 或节点不通时最多尝试几个节点，允许 `1`–`10` |
 | `PROXY_STRATEGY` | `sticky` | 节点选择策略：`sticky`（填充，默认）——一个节点一直用到不可用（429/403/传输失败）才换下一个；`round_robin`——每次请求都轮询下一个健康节点 |
 | `PROXY_HEALTH_INTERVAL_SECONDS` | `600` | 定时健康检查间隔秒数，允许 `60`–`86400`；`0` 关闭。定时检查会重试所有死节点，并每 30 分钟复检健康节点 |

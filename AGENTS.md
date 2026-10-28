@@ -39,7 +39,7 @@ TLS 握手和等响应头；正文流式读取不设上限。注意：自定义 
 `http.Transport.TLSHandshakeTimeout` 不生效，握手超时是在 dial 里自己加 deadline 兜的，
 改这里别把 `handshakeCtx` 删了。
 
-## 订阅节点池（mihomo）与双构建
+## 订阅节点池与双构建
 
 订阅相关逻辑全在 `internal/proxypool`：
 
