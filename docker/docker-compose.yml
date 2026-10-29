@@ -5,6 +5,9 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      args:
+        # 本地构建可用 VERSION=4.5.0 docker compose build 注入版本号，默认 0.0.0。
+        VERSION: "${VERSION:-0.0.0}"
     container_name: oc2api
     ports:
       - "${PORT:-8080}:8080"

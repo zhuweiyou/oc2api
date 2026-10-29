@@ -86,6 +86,8 @@ docker run -d --name oc2api --restart unless-stopped \
 容器监听 `PORT`，默认 `8080`。镜像基于 `scratch`，里面只有静态二进制和 CA 证书。
 当前镜像带 mihomo 内核（约 47 MB）；想要轻量镜像可构建时加
 `--build-arg GO_TAGS=nomihomo`（约 9 MB，仅 http/socks5）。
+镜像里的版本号由构建参数注入：`--build-arg VERSION=4.5.0`，不传则为 `0.0.0`（`/health` 可见）。
+官方 CI 构建时：tag 发布用 `4.5.0`，其余（`main`/`latest`、PR）用快照号 `4.4.0-SNAPSHOT-<sha>`。
 云函数环境建议把超时调到 300 秒，否则长回答的流式响应会被提前截断。
 
 **本地构建**

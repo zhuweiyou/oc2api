@@ -11,8 +11,11 @@ import (
 	"time"
 )
 
-// Version 与发布标签保持一致，/health 直接透出。
-const Version = "4.4.0"
+// Version 由构建期注入，不在源码里写死：
+//   -ldflags "-X oc2api/internal/config.Version=x.y.z"
+// 未注入时为 0.0.0。正式镜像由 .github/workflows/release.yml 按填写的 tag 传入版本号，
+// /health 直接透出。所以这里必须是 var（const 无法被 -X 覆盖），也不要手改。
+var Version = "0.0.0"
 
 // DefaultZenAPIBaseURL 只到站点根：具体路径由 zen 包拼，上游改路径时不用动部署配置。
 const DefaultZenAPIBaseURL = "https://opencode.ai"

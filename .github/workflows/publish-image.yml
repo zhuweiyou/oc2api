@@ -1,7 +1,7 @@
 name: Publish image
 
-# 推送到 main、推版本标签（v*）或手动触发时构建并发布；
-# PR 只构建两种架构验证 Dockerfile，不登录 GHCR、不发布。
+# 推送到 main、推版本标签（v*）或手动触发时构建并发布（amd64 + arm64）；
+# PR 只构建 linux/amd64 验证 Dockerfile，不登录 GHCR、不发布（arm64 走 QEMU 太慢，PR 不划算）。
 on:
   push:
     branches:
@@ -34,12 +34,32 @@ jobs:
         uses: actions/checkout@v7
         with:
           persist-credentials: false
+          # 需要 tag 历史：非 tag 构建用 git describe 推导快照号。
+          fetch-depth: 0
 
       - name: Read source revision
         id: source
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
+      # 版本号注入规则：
+      #   tag v4.5.0                    -> 4.5.0
+      #   其它（main / PR / 手动分支）   -> 快照号 <最近tag>-SNAPSHOT-<短sha>，如 4.4.0-SNAPSHOT-8d598e3
+      # PR 只构建不发布，快照号带上 sha 也没有副作用。
+      - name: Resolve build version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            value="${GITHUB_REF_NAME#v}"
+          else
+            base="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)"
+            base="${base#v}"
+            short="$(git rev-parse --short HEAD)"
+            value="${base:-0.0.0}-SNAPSHOT-${short}"
+          fi
+          echo "value=${value}" >> "$GITHUB_OUTPUT"
+
       - name: Set up QEMU
+        if: github.event_name != 'pull_request'
         uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
@@ -61,6 +81,7 @@ jobs:
             type=raw,value=sha-${{ steps.source.outputs.sha }}
           labels: |
             org.opencontainers.image.revision=${{ steps.source.outputs.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.value }}
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
@@ -75,9 +96,12 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile
-          platforms: linux/amd64,linux/arm64
+          # PR 只用 amd64 验证 Dockerfile；发布分支/标签才构建 arm64（需 QEMU）。
+          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.version.outputs.value }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

@@ -129,6 +129,38 @@ Vercel 的 Go runtime 会**缓冲整段响应**：用 700ms 间隔 flush 的测�
 `/robots.txt` 返回的是静态 etag），放了 `index.html` 就会抢走 `/`，拿不到和 `/health` 同构的
 JSON。仓库里没有 `public/`，`.gitignore` 和 `.vercelignore` 都排除它。
 
+## 发布 / 版本号
+
+版本号**不在源码里写死**：`internal/config/config.go` 是 `var Version = "0.0.0"`，由构建期
+`-ldflags "-X oc2api/internal/config.Version=x.y.z"` 注入，`/health` 直接透出。没注入就是
+`0.0.0`。所以发布不需要改代码、不需要回写提交，只打 tag 即可。
+
+不同构建的版本号来源（见 `publish-image.yml` 的 Resolve build version）：
+
+| 构建 | 版本号 |
+| --- | --- |
+| tag `v4.5.0` | `4.5.0`（标签发布，打 GHCR 版本 tag） |
+| 其它（`main` / 手动分支 / PR） | `4.4.0-SNAPSHOT-8d598e3`（最近 tag + `-SNAPSHOT-` + 短 sha，goreleaser 风格）；PR 只构建不发布，带 sha 无副作用 |
+
+**不要手改 `Version`、也不要手动 `git tag`**，统一走 GitHub Actions 的填表发布：
+
+1. 打开 Actions → **Release** → Run workflow（`workflow_dispatch`），填两个输入：
+   - `version`：`vX.Y.Z`（例 `v4.5.0`），必须符合该格式，且 tag 不能已存在；
+   - `description`：会作为 GitHub Release 正文。
+2. 工作流（`.github/workflows/release.yml`）会依次：校验版本 → 打 annotated tag →
+   `gh release create` → 显式 `gh workflow run publish-image.yml --ref <tag>`。
+3. 显式派发是必须的：用 `GITHUB_TOKEN` 推的 tag **不会**再触发 `push` 事件（GitHub 限制），
+   所以要手动触发 `publish-image`。它把 `refs/tags/vX.Y.Z` 解析成 `4.5.0`，作为
+   `--build-arg VERSION=4.5.0` 传给 `docker/Dockerfile`，产出带版本号的 GHCR 镜像
+   （`latest` 仍只跟 `main`）。
+
+前提：**release.yml 必须在默认分支上**，`workflow_dispatch` 的 Run workflow 按钮才会出现；
+一般做法是先把本分支合进 `main`。另外推 tag 需要 Actions 有 `contents: write`，且默认分支
+不要用分支保护挡住 tag 推送。发布不需要 npm，也没有 npm 包。
+
+本地构建要带版本号时同样走构建参数：`VERSION=4.5.0 docker compose build`
+（见 `docker/docker-compose.yml`），或 `docker build --build-arg VERSION=4.5.0 ...`。
+
 ## 测试
 
 ```bash

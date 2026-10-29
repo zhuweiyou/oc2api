@@ -1,0 +1,74 @@
+name: Release
+
+# 只允许“手动填表”触发；推送到 main 不会触发发布。
+# 版本号在构建期注入（-ldflags -X .../config.Version），所以这里不回写任何源码：
+# 只负责校验版本、打 tag、建 GitHub Release，再触发 publish-image 按该 tag 构建镜像。
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号，格式 vX.Y.Z（例：v4.5.0）"
+        required: true
+        type: string
+      description:
+        description: "Release 说明（会作为 GitHub Release 正文）"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  # 用 GITHUB_TOKEN 推的 tag 不会触发 push 事件（GitHub 限制），
+  # 需要显式 workflow_dispatch 触发 publish-image，故要 actions: write。
+  actions: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          # 需要完整 tag 历史来判断 tag 是否已存在。
+          fetch-depth: 0
+
+      - name: Validate version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ! printf '%s' "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::version 必须形如 vX.Y.Z，收到：$VERSION"
+            exit 1
+          fi
+          TAG="$VERSION"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error::tag $TAG 已存在"
+            exit 1
+          fi
+
+      - name: Create and push tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "$TAG"
+          git push origin "$TAG"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTES: ${{ inputs.description }}
+        run: |
+          gh release create "$TAG" --title "$TAG" --notes "$NOTES"
+
+      - name: Trigger image publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # publish-image 会从 tag vX.Y.Z 解析出版本号 4.5.0 注入二进制，
+          # 构建并推送带版本号的 GHCR 镜像（latest 仍只跟 main）。
+          gh workflow run publish-image.yml --ref "$TAG"
