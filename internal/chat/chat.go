@@ -136,6 +136,11 @@ func countClientTools(payload map[string]any) int {
 	return len(tools)
 }
 
+// ModelAllowed 判断模型是否在免费层白名单里（big-pickle 或 *-free）。
+func ModelAllowed(model string) bool {
+	return model == "big-pickle" || strings.HasSuffix(model, "-free")
+}
+
 // Validate 与 Node 版保持同一套门面校验：只拦明显不合法的请求，
 // 其余字段原样交给上游。返回空字符串表示通过。
 func Validate(payload map[string]any) (model string, reason string) {
@@ -143,8 +148,9 @@ func Validate(payload map[string]any) (model string, reason string) {
 	if strings.TrimSpace(model) == "" {
 		return "", "model must be a non-empty string"
 	}
-	if model != "big-pickle" && !strings.HasSuffix(model, "-free") {
-		return "", "Only big-pickle and models ending in -free are allowed"
+	if !ModelAllowed(model) {
+		// 未知模型应让调用方知道“这个模型不存在”，而不是当成普通参数错误反复重试。
+		return model, "model not found: " + model
 	}
 	messages, _ := payload["messages"].([]any)
 	if len(messages) == 0 {

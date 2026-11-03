@@ -114,9 +114,13 @@ func (h *Handler) handleChat(ctx context.Context, req request, emit emitter) {
 	}
 	model, reason := chat.Validate(payload)
 	if reason != "" {
+		status := http.StatusBadRequest
+		if model != "" && !chat.ModelAllowed(model) {
+			status = http.StatusNotFound
+		}
 		emitResult(emit, req.ID, map[string]any{
-			"status": http.StatusBadRequest,
-			"error":  protocol.ErrorBody(http.StatusBadRequest, reason),
+			"status": status,
+			"error":  protocol.ErrorBody(status, reason),
 		})
 		return
 	}

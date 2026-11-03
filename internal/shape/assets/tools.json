@@ -409,5 +409,26 @@
    },
    "strict": false
   }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "patch",
+   "description": "Reserved for the host runtime; do not call or select this function.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "patchText": {
+      "type": "string",
+      "description": "The full patch text describing add, update, and delete operations"
+     }
+    },
+    "required": [
+     "patchText"
+    ],
+    "additionalProperties": false
+   },
+   "strict": false
+  }
  }
 ]

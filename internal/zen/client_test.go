@@ -2,6 +2,7 @@ package zen
 
 import (
 	"context"
+	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -9,6 +10,35 @@ import (
 
 	"oc2api/internal/config"
 )
+
+// project id 必须是官方同款的 40 位十六进制，而且每请求不同：
+// 固定值会让所有部署共用一个免费层配额桶（热门出口被打爆后本机也 429）。
+func TestRandomProjectIDShape(t *testing.T) {
+	first := randomProjectID()
+	second := randomProjectID()
+	for _, id := range []string{first, second} {
+		if len(id) != 40 {
+			t.Fatalf("project id 长度应为 40，实际 %d: %q", len(id), id)
+		}
+		if _, err := hex.DecodeString(id); err != nil {
+			t.Fatalf("project id 不是十六进制: %q (%v)", id, err)
+		}
+	}
+	if first == second {
+		t.Fatal("project id 每次都一样，说明还是固定值")
+	}
+}
+
+// v2 请求不要自己带 Accept：抓包的真实客户端没有这个头。
+func TestUpstreamHeadersOmitAccept(t *testing.T) {
+	headers := UpstreamHeaders("ses_x")
+	if _, ok := headers["Accept"]; ok {
+		t.Fatal("请求头不应自己设置 Accept")
+	}
+	if headers["x-opencode-project"] == "" {
+		t.Fatal("缺少 x-opencode-project")
+	}
+}
 
 // 基址只到站点根，路径由包内常量拼：上游换路径只改常量，这里守住拼接结果。
 func TestURLJoining(t *testing.T) {

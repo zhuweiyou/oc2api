@@ -8,7 +8,7 @@
 cmd/oc2api/        入口：默认 HTTP 服务；-stdio 起 stdio JSON-RPC（Vercel 用）
 internal/config    环境变量与版本号：Load() 读一次并校验，之后靠注入传下去
 internal/zen       uTLS 传输（Bun ClientHello）、上游路径与超时、ses_ 会话、模型列表
-internal/shape     官方 system 提示词 + 工具集整形（oc2api_ 改名、32k 上限）
+internal/shape     官方 system 提示词 + 工具集整形（工具名摘要化、32k 上限）
 internal/proxypool 订阅节点池：Clash/mihomo 解析、启动健康探测、sticky/round_robin 轮换
 internal/ipinfo    出口 IP 查询（ipquery / ip-api / 1.1.1.1 trace 并发竞速）
 internal/chat      整形 → 上游 → 非流式聚合；带节点池时按策略轮换、失败换节点
@@ -86,29 +86,38 @@ TLS 握手和等响应头；正文流式读取不设上限。注意：自定义 
   都可以删（均已实测）。
 - **工作目录写 `./`**：绝对路径会让模型以为自己能访问那个目录。由 `shape.go` 的
   `workdir` 常量填充。
-- **`tools` 必须是官方工具集整套**：`internal/shape/assets/tools.json` 里的 12 个（`edit`、
-  `glob`、`grep`、`question`、`read`、`shell`、`skill`、`subagent`、`webfetch`、`websearch`、
-  `write`、`execute`）缺一不可。去掉、置空或只挑几个（旧实现只发 `read`）都会被上游拒；
+- **`tools` 必须是官方工具集整套**：`internal/shape/assets/tools.json` 里的 13 个（`edit`、
+  `glob`、`grep`、`patch`、`question`、`read`、`shell`、`skill`、`subagent`、`webfetch`、
+  `websearch`、`write`、`execute`）缺一不可。去掉、置空或只挑几个（旧实现只发 `read`）都会被上游拒；
   唯一的改动是每个工具的描述统一换成禁止调用（见下节）。
 - `stream: true` + `stream_options.include_usage`；`stream:false` 也 429，非流式在本地聚合。
-- `max_completion_tokens: 32000`。
+- `max_completion_tokens`：客户端显式给了就用它的（`max_completion_tokens` 优先，其次
+  `max_tokens`），没给才补官方客户端的 `32000`。
 - `ses_` 会话 id：12 位倒序十六进制时间戳 + 14 位 base62。时间戳取当前毫秒，
   **毫秒内序号从 1 开始**（序号 0 会落到 0xFFF 被拒）。
 
 提示词占位符只有四个：`{{MODEL}}`、`{{MODELNAME}}`、`{{DATE}}`、`{{WORKDIR}}`。
 
-请求头里 `x-opencode-project` 用固定哈希即可；UA 固定 `opencode/latest/2.1.1/cli`（对齐 v2 通道的
-官方客户端）。`b3` / `traceparent` 官方客户端不发，实现里已经删掉，别再加回来。
+请求头里 `x-opencode-project` 每请求随机生成一个 40 位十六进制（git 根提交形状）：免费层
+按 project id + 出口 IP 计费，固定值等于所有部署共用一个配额桶，热门出口被打爆后本机也会 429。
+UA 固定 `opencode/latest/2.1.1/cli`（对齐 v2 通道的官方客户端）。`b3` / `traceparent` 官方客户端
+不发，实现里已经删掉，别再加回来。
 
 ## 工具整形
 
-1. 客户端声明的工具改名 `oc2api_<sanitized>`（`internal/shape` 的 `ToolPrefix`），
-   响应侧按同一前缀还原；
-2. 官方工具**整套发送**（12 个，见上节），但每个的描述都换成 "Reserved for the host runtime;
+1. 客户端声明的工具改成一个不透明的 `oc2api_<sha256 前 12 位 hex>`（`internal/shape` 的
+   `ToolPrefix` + `clientToolDigestLength`），响应侧按映射还原。**原始工具名一个字符都不能
+   发往上游**：免费层会拒绝“工具列表里仍带着别的客户端词汇”的请求体（Claude Code 的
+   `ReportFindings` + `ScheduleWakeup` 就够触发），回的是和额度耗尽一样的 429；
+2. 官方工具**整套发送**（13 个，见上节），但每个的描述都换成 "Reserved for the host runtime;
    do not call or select this function. Use tools explicitly supplied by the user instead."，
    客户端执行不了它们，真被选中也只能在响应侧丢掉；
 3. 客户端没声明任何工具时，system 末尾补一句“不要调用工具”；
-4. 兜底：`internal/protocol` 按 `index` 缓冲工具调用，确认不是 `oc2api_` 的整条丢弃，
+4. 采样/工具控制参数（`temperature`、`top_p`、`reasoning_effort`、`parallel_tool_calls`、
+   `prompt_cache_key`、`tool_choice`，见 `forwardedParams`）按白名单透传，`tool_choice`/`function_call`
+   里的工具名同步摘要化；请求体编码用 `SetEscapeHTML(false)`，与真实客户端的 `JSON.stringify`
+   字节一致（上游连 body 也做指纹）；
+5. 兜底：`internal/protocol` 按 `index` 缓冲工具调用，确认不是 `oc2api_` 的整条丢弃，
    `finish_reason` 从 `tool_calls` 回退 `stop`；非流式没有正文时带更强提示重试一次。
 
 ## Vercel 为什么是「薄 Node + Go 二进制」

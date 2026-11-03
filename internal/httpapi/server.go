@@ -214,9 +214,17 @@ func completions(w http.ResponseWriter, r *http.Request, chats *chat.Service) {
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "Not found", "invalid_request_error", "")
 		return
 	}
-	raw, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
+	if r.ContentLength > maxBodyBytes {
+		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request body too large", "invalid_request_error", "payload_too_large")
+		return
+	}
+	raw, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "Invalid JSON body", "invalid_request_error", "")
+		return
+	}
+	if len(raw) > maxBodyBytes {
+		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request body too large", "invalid_request_error", "payload_too_large")
 		return
 	}
 	var payload map[string]any
@@ -226,7 +234,15 @@ func completions(w http.ResponseWriter, r *http.Request, chats *chat.Service) {
 	}
 	model, reason := chat.Validate(payload)
 	if reason != "" {
-		writeOpenAIError(w, http.StatusBadRequest, reason, "invalid_request_error", "")
+		// 未知模型回 404 model_not_found：客户端/编排器据此停止重试不存在的模型，
+		// 而不是把 400 当成参数错误反复重试。
+		status := http.StatusBadRequest
+		code := ""
+		if model != "" && !chat.ModelAllowed(model) {
+			status = http.StatusNotFound
+			code = "model_not_found"
+		}
+		writeOpenAIError(w, status, reason, "invalid_request_error", code)
 		return
 	}
 	stream, _ := payload["stream"].(bool)
