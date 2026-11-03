@@ -12,7 +12,9 @@ import (
 )
 
 // Version 由构建期注入，不在源码里写死：
-//   -ldflags "-X oc2api/internal/config.Version=x.y.z"
+//
+//	-ldflags "-X oc2api/internal/config.Version=x.y.z"
+//
 // 未注入时为 dev。正式镜像由 .github/workflows/release.yml 按填写的 tag 传入版本号，
 // /health 直接透出。所以这里必须是 var（const 无法被 -X 覆盖），也不要手改。
 var Version = "dev"

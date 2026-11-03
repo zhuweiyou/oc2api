@@ -2,10 +2,11 @@ package shape
 
 import (
 	"bytes"
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"strings"
 	"time"
 )
@@ -21,6 +22,10 @@ const (
 	// ToolPrefix 是客户端工具发往上游时加的前缀；请求侧加、响应侧剥，都用它。
 	ToolPrefix  = "oc2api_"
 	outputLimit = 32000
+	// clientToolDigestLength 是客户端工具名摘要取多少位十六进制字符。12 位对一次
+	// 请求里那几个工具远不到碰撞线。关键是上游不能看到原始工具名：免费层会拒绝
+	// “工具列表里仍带着别的客户端词汇”的请求体（和额度耗尽同样是 429）。
+	clientToolDigestLength = 12
 )
 
 // Renames 记录客户端工具名与发往上游的名字之间的双向映射。
@@ -57,9 +62,9 @@ func newRenames() *Renames {
 	return &Renames{forward: map[string]string{}, reverse: map[string]string{}}
 }
 
-var unsafeToolChars = regexp.MustCompile(`[^A-Za-z0-9_-]`)
-
-// rename 把客户端工具名换成 <ToolPrefix><sanitized>，并保证不与已用的名字冲突。
+// rename 把客户端工具名换成一个不透明的 <ToolPrefix><摘要>，并保证不与已用的
+// 名字冲突。摘要固定取 SHA-256 的前 12 位十六进制，同一个客户端工具在同一进程内
+// 始终映射到同一个上游名字；原始工具名一个字符都不出现在请求体里。
 func (r *Renames) rename(name string) string {
 	if name == "" {
 		return name
@@ -67,7 +72,8 @@ func (r *Renames) rename(name string) string {
 	if mapped, ok := r.forward[name]; ok {
 		return mapped
 	}
-	base := ToolPrefix + unsafeToolChars.ReplaceAllString(name, "_")
+	digest := sha256.Sum256([]byte(name))
+	base := ToolPrefix + hex.EncodeToString(digest[:])[:clientToolDigestLength]
 	if len(base) > 64 {
 		base = base[:64]
 	}
@@ -219,21 +225,24 @@ func Build(payload map[string]any, model string) ([]byte, *Renames, error) {
 		}
 	}
 
-	// 键顺序对齐官方客户端：model, messages, tools, stream, stream_options, max_completion_tokens
+	// 键顺序对齐官方客户端：model, messages, tools, stream, stream_options,
+	// max_completion_tokens 打头，其余透传参数按固定顺序追加。
 	var buffer bytes.Buffer
 	buffer.WriteByte('{')
+	first := true
 	write := func(key string, value any) error {
-		if buffer.Len() > 1 {
+		keyJSON, err := marshalValue(key)
+		if err != nil {
+			return err
+		}
+		valueJSON, err := marshalValue(value)
+		if err != nil {
+			return err
+		}
+		if !first {
 			buffer.WriteByte(',')
 		}
-		keyJSON, err := json.Marshal(key)
-		if err != nil {
-			return err
-		}
-		valueJSON, err := json.Marshal(value)
-		if err != nil {
-			return err
-		}
+		first = false
 		buffer.Write(keyJSON)
 		buffer.WriteByte(':')
 		buffer.Write(valueJSON)
@@ -241,7 +250,7 @@ func Build(payload map[string]any, model string) ([]byte, *Renames, error) {
 	}
 	// 上游只接受流式请求：stream:false 直接换回 429，所以一律发 stream:true，
 	// 客户端要非流式时由 Aggregate 在本地聚合。
-	fields := []struct {
+	for _, field := range []struct {
 		key   string
 		value any
 	}{
@@ -250,15 +259,111 @@ func Build(payload map[string]any, model string) ([]byte, *Renames, error) {
 		{"tools", tools},
 		{"stream", true},
 		{"stream_options", map[string]any{"include_usage": true}},
-		{"max_completion_tokens", outputLimit},
-	}
-	for _, field := range fields {
+		{"max_completion_tokens", completionLimit(payload)},
+	} {
 		if err := write(field.key, field.value); err != nil {
+			return nil, nil, err
+		}
+	}
+	// 透传客户端的采样与工具控制参数。官方客户端会带这些字段，丢掉会让
+	// temperature / tool_choice 等静默失效。只透传已知安全的白名单字段。
+	for _, key := range forwardedParams {
+		value, ok := payload[key]
+		if !ok || value == nil {
+			continue
+		}
+		if key == "tool_choice" {
+			value = rewriteToolChoice(value, renames)
+		}
+		if err := write(key, value); err != nil {
+			return nil, nil, err
+		}
+	}
+	if legacy, ok := payload["function_call"]; ok && legacy != nil {
+		if err := write("function_call", rewriteFunctionCall(legacy, renames)); err != nil {
 			return nil, nil, err
 		}
 	}
 	buffer.WriteByte('}')
 	return buffer.Bytes(), renames, nil
+}
+
+// forwardedParams 是从客户端请求原样透传给上游的参数白名单（顺序固定）。
+// stream / stream_options / max_completion_tokens 由整形逻辑统一决定，不放这里。
+var forwardedParams = []string{
+	"temperature", "top_p",
+	"reasoning_effort", "parallel_tool_calls", "prompt_cache_key",
+	"tool_choice",
+}
+
+// completionLimit 决定请求体里的输出上限：客户端显式给了就尊重它
+// （max_completion_tokens 优先，其次 max_tokens），否则用官方客户端的 32000。
+func completionLimit(payload map[string]any) any {
+	if value, ok := payload["max_completion_tokens"]; ok && value != nil {
+		return value
+	}
+	if value, ok := payload["max_tokens"]; ok && value != nil {
+		return value
+	}
+	return outputLimit
+}
+
+// rewriteToolChoice 把 tool_choice 里引用的客户端工具名改写成发往上游的摘要名；
+// 否则 tool_choice 指向的工具在上游不存在，请求会自相矛盾。
+// 返回克隆后的对象，绝不原地改客户端 payload：非流式为空时我们会用同一份
+// payload 重试一次，原地改名会把已经改过的名字再哈希一遍。
+func rewriteToolChoice(value any, renames *Renames) any {
+	choice, ok := value.(map[string]any)
+	if !ok {
+		return value
+	}
+	cloned := make(map[string]any, len(choice))
+	for key, item := range choice {
+		cloned[key] = item
+	}
+	if fn, ok := choice["function"].(map[string]any); ok {
+		fnCloned := make(map[string]any, len(fn))
+		for key, item := range fn {
+			fnCloned[key] = item
+		}
+		if name, ok := fnCloned["name"].(string); ok && name != "" {
+			fnCloned["name"] = renames.rename(name)
+		}
+		cloned["function"] = fnCloned
+	}
+	if name, ok := cloned["name"].(string); ok && name != "" {
+		cloned["name"] = renames.rename(name)
+	}
+	return cloned
+}
+
+// rewriteFunctionCall 处理旧版 function_call 里的工具名，同样返回克隆对象。
+func rewriteFunctionCall(value any, renames *Renames) any {
+	call, ok := value.(map[string]any)
+	if !ok {
+		return value
+	}
+	cloned := make(map[string]any, len(call))
+	for key, item := range call {
+		cloned[key] = item
+	}
+	if name, ok := cloned["name"].(string); ok && name != "" {
+		cloned["name"] = renames.rename(name)
+	}
+	return cloned
+}
+
+// marshalValue 按 JSON.stringify 的方式编码：不把 < > & 转义成 \u003c 等。
+// encoding/json 默认会转义，而工具描述、代码片段里到处都是这些字符，转义后
+// 请求体字节就和真实客户端不同（上游连请求体也做指纹）。
+func marshalValue(value any) ([]byte, error) {
+	var buffer bytes.Buffer
+	encoder := json.NewEncoder(&buffer)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buffer.Bytes(), []byte("\n")), nil
 }
 
 func hasClientTools(payload map[string]any) bool {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,14 +21,27 @@ import (
 )
 
 const (
-	clientUA  = "opencode/latest/2.1.1/cli"
-	projectID = "3f3f7816fd9ceeaf0c3df15f6048b06b7f4e1787"
+	clientUA = "opencode/latest/2.1.1/cli"
 
 	// 上游接口路径集中在这两行：ZEN_API_BASE_URL 只给站点根，
 	// 上游换路径（/zen/v1 → /inference/v1 这类）时只改这里，部署配置不用动。
 	chatPath   = "/inference/v1/chat/completions"
 	modelsPath = "/inference/v1/models"
 )
+
+// fallbackProjectID 只在 crypto/rand 失败时兜底，正常不会走到。
+const fallbackProjectID = "3f3f7816fd9ceeaf0c3df15f6048b06b7f4e1787"
+
+// randomProjectID 生成官方客户端同款的 40 位十六进制 project id（git 根提交形状）。
+// 免费层按 project id + 出口 IP 一起计费：固定值等于所有部署共用一个配额桶，热门
+// 出口被打爆后即使本机额度还在也会 429，所以客户端没带 project 时每次请求随机生成。
+func randomProjectID() string {
+	buf := make([]byte, 20)
+	if _, err := rand.Read(buf); err != nil {
+		return fallbackProjectID
+	}
+	return hex.EncodeToString(buf)
+}
 
 // Bun 的 ClientHello：免费层按传输层指纹识别客户端，Go 自带的 crypto/tls
 // 握手会被判成非 OpenCode 流量并回 429，所以这里用 uTLS 复刻 Bun 的握手。
@@ -238,9 +252,8 @@ func UpstreamHeaders(session string) map[string]string {
 		"Content-Type":          "application/json",
 		"Authorization":         "Bearer " + token,
 		"User-Agent":            clientUA,
-		"Accept":                "*/*",
 		"x-opencode-client":     "cli",
-		"x-opencode-project":    projectID,
+		"x-opencode-project":    randomProjectID(),
 		"x-opencode-session":    session,
 		"x-opencode-session-id": session,
 		"x-session-affinity":    session,

@@ -88,3 +88,40 @@ func TestStreamKeepsUnknownToolCalls(t *testing.T) {
 		t.Fatalf("放行时 finish_reason 应保持 tool_calls: %s", output)
 	}
 }
+
+// 流式 reasoning 的空白分片不能被裁掉：只含空格的分片、内部连续空格都必须原样保留。
+func TestAggregatePreservesWhitespaceReasoning(t *testing.T) {
+	chunks := []string{
+		`data: {"id":"c1","created":1,"model":"m","choices":[{"index":0,"delta":{"reasoning_content":" "}}]}` + "\n\n",
+		`data: {"choices":[{"index":0,"delta":{"reasoning_content":"a  b"}}]}` + "\n\n",
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n",
+		"data: [DONE]\n\n",
+	}
+	result, _, err := Aggregate(sseResponse(chunks...), shape.EmptyRenames())
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := result["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if got := message["reasoning_content"].(string); got != " a  b" {
+		t.Fatalf("reasoning 空白被裁掉了: %q", got)
+	}
+}
+
+func TestStreamPreservesWhitespaceDelta(t *testing.T) {
+	chunks := []string{
+		`data: {"choices":[{"index":0,"delta":{"reasoning_content":" "}}]}` + "\n\n",
+		`data: {"choices":[{"index":0,"delta":{"content":" "}}]}` + "\n\n",
+		"data: [DONE]\n\n",
+	}
+	var buffer strings.Builder
+	if err := Stream(&stringWriter{&buffer}, sseResponse(chunks...), shape.EmptyRenames()); err != nil {
+		t.Fatal(err)
+	}
+	output := buffer.String()
+	if !strings.Contains(output, `"reasoning_content":" "`) {
+		t.Fatalf("流式 reasoning 空白分片被丢弃: %s", output)
+	}
+	if !strings.Contains(output, `"content":" "`) {
+		t.Fatalf("流式 content 空白分片被丢弃: %s", output)
+	}
+}
