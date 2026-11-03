@@ -15,8 +15,10 @@ permissions:
   contents: read
 
 concurrency:
+  # 同一 PR / 同一分支只保留最新一次构建：main 有新提交时旧的没必要再跑。
+  # tag 构建（ref_type=tag）不取消，避免打断正式发布。
   group: publish-image-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref_type == 'branch' }}
 
 env:
   REGISTRY: ghcr.io
