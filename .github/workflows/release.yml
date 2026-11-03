@@ -2,18 +2,20 @@ name: Release
 
 # 只允许“手动填表”触发；推送到 main 不会触发发布。
 # 版本号在构建期注入（-ldflags -X .../config.Version），所以这里不回写任何源码：
-# 只负责校验版本、打 tag、建 GitHub Release，再触发 publish-image 按该 tag 构建镜像。
+# 选择升级类型（patch/minor/major），工作流自动推算下一个版本、抓取提交标题作为
+# Release 正文，打 tag、建 GitHub Release，再触发 publish-image 按该 tag 构建镜像。
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: "版本号，格式 vX.Y.Z（例：v4.5.0）"
+      bump:
+        description: "版本升级类型"
         required: true
-        type: string
-      description:
-        description: "Release 说明（会作为 GitHub Release 正文）"
-        required: true
-        type: string
+        type: choice
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
 
 permissions:
   contents: write
@@ -33,26 +35,95 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          # 需要完整 tag 历史来判断 tag 是否已存在。
+          # 需要完整 tag 历史来判断 tag 是否已存在、并生成 Release 正文。
           fetch-depth: 0
 
-      - name: Validate version
+      - name: Resolve next version
+        id: version
         env:
-          VERSION: ${{ inputs.version }}
+          BUMP: ${{ inputs.bump }}
         run: |
-          if ! printf '%s' "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "::error::version 必须形如 vX.Y.Z，收到：$VERSION"
-            exit 1
+          set -euo pipefail
+          PREV_TAG="$(git describe --tags --abbrev=0 --match 'v*' HEAD 2>/dev/null || true)"
+          echo "PREV_TAG=$PREV_TAG" >> "$GITHUB_ENV"
+          BASE="${PREV_TAG#v}"
+          # 没有可用 tag 时以 0.0.0 作为 semver 推算基线（patch -> v0.0.1，需要 1.0.0 请选 major）。
+          if ! printf '%s' "$BASE" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            BASE="0.0.0"
           fi
-          TAG="$VERSION"
-          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          IFS=. read -r MAJOR MINOR PATCH <<< "$BASE"
+          case "$BUMP" in
+            major) MAJOR=$((MAJOR+1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR+1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH+1)) ;;
+            *) echo "::error::未知的 bump 类型：$BUMP"; exit 1 ;;
+          esac
+          SEMVER="$MAJOR.$MINOR.$PATCH"
+          TAG="v$SEMVER"
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
             echo "::error::tag $TAG 已存在"
             exit 1
           fi
+          echo "SEMVER=$SEMVER" >> "$GITHUB_ENV"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "semver=$SEMVER" >> "$GITHUB_OUTPUT"
+          echo "从 ${PREV_TAG:-<无 tag>} 按 $BUMP 升级到 $TAG"
+
+      - name: Generate release notes
+        run: |
+          set -euo pipefail
+          RANGE="HEAD"
+          if [ -n "${PREV_TAG:-}" ]; then
+            RANGE="${PREV_TAG}..HEAD"
+          fi
+          git log "$RANGE" --pretty=format:'%s' > /tmp/subjects.txt
+
+          {
+            echo "## What's Changed"
+            if [ -n "${PREV_TAG:-}" ]; then
+              echo
+              echo "Compared to ${PREV_TAG}"
+            fi
+            found=0
+            for pair in "feat:Features" "fix:Fixes" "perf:Performance" "refactor:Refactor" \
+                        "docs:Docs" "test:Tests" "build:Build" "ci:CI" "style:Style" "chore:Chores"; do
+              key="${pair%%:*}"
+              title="${pair#*:}"
+              mapfile -t items < <(
+                grep -E "^${key}(\([^)]*\))?!?:[[:space:]]+" /tmp/subjects.txt \
+                  | grep -v -i '^chore(release)' \
+                  | sed -E "s/^${key}(\([^)]*\))?!?:[[:space:]]+//"
+              )
+              if [ "${#items[@]}" -gt 0 ]; then
+                echo
+                echo "### ${title}"
+                printf -- '- %s\n' "${items[@]}"
+                found=1
+              fi
+            done
+            mapfile -t others < <(
+              grep -vE '^(feat|fix|perf|refactor|docs|test|build|ci|style|chore)(\([^)]*\))?!?:[[:space:]]+' /tmp/subjects.txt \
+                | grep -v -i '^chore(release)' \
+                | grep -v '^$'
+            )
+            if [ "${#others[@]}" -gt 0 ]; then
+              echo
+              echo "### Other"
+              printf -- '- %s\n' "${others[@]}"
+              found=1
+            fi
+            if [ "$found" -eq 0 ]; then
+              echo
+              echo "No commits"
+            fi
+          } > release-notes.md
+          echo "----- release-notes.md -----"
+          cat release-notes.md
 
       - name: Create and push tag
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "$TAG" -m "$TAG"
@@ -61,14 +132,15 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          NOTES: ${{ inputs.description }}
         run: |
-          gh release create "$TAG" --title "$TAG" --notes "$NOTES"
+          set -euo pipefail
+          gh release create "$TAG" --title "$TAG" --notes-file release-notes.md
 
       - name: Trigger image publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # publish-image 会从 tag vX.Y.Z 解析出版本号 4.5.0 注入二进制，
+          set -euo pipefail
+          # publish-image 从 tag vX.Y.Z 解析出版本号并注入二进制，
           # 构建并推送带版本号的 GHCR 镜像（latest 仍只跟 main）。
           gh workflow run publish-image.yml --ref "$TAG"

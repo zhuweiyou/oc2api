@@ -54,7 +54,7 @@ jobs:
             base="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)"
             base="${base#v}"
             short="$(git rev-parse --short HEAD)"
-            value="${base:-0.0.0}-SNAPSHOT-${short}"
+            value="${base:-dev}-SNAPSHOT-${short}"
           fi
           echo "value=${value}" >> "$GITHUB_OUTPUT"
 

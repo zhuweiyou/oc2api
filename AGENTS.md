@@ -131,9 +131,9 @@ JSON。仓库里没有 `public/`，`.gitignore` 和 `.vercelignore` 都排除它
 
 ## 发布 / 版本号
 
-版本号**不在源码里写死**：`internal/config/config.go` 是 `var Version = "0.0.0"`，由构建期
+版本号**不在源码里写死**：`internal/config/config.go` 是 `var Version = "dev"`，由构建期
 `-ldflags "-X oc2api/internal/config.Version=x.y.z"` 注入，`/health` 直接透出。没注入就是
-`0.0.0`。所以发布不需要改代码、不需要回写提交，只打 tag 即可。
+`dev`。所以发布不需要改代码、不需要回写提交，只打 tag 即可。
 
 不同构建的版本号来源（见 `publish-image.yml` 的 Resolve build version）：
 
@@ -144,11 +144,12 @@ JSON。仓库里没有 `public/`，`.gitignore` 和 `.vercelignore` 都排除它
 
 **不要手改 `Version`、也不要手动 `git tag`**，统一走 GitHub Actions 的填表发布：
 
-1. 打开 Actions → **Release** → Run workflow（`workflow_dispatch`），填两个输入：
-   - `version`：`vX.Y.Z`（例 `v4.5.0`），必须符合该格式，且 tag 不能已存在；
-   - `description`：会作为 GitHub Release 正文。
-2. 工作流（`.github/workflows/release.yml`）会依次：校验版本 → 打 annotated tag →
-   `gh release create` → 显式 `gh workflow run publish-image.yml --ref <tag>`。
+1. 打开 Actions → **Release** → Run workflow（`workflow_dispatch`），只填一个输入：
+   - `bump`：版本升级类型，`patch` / `minor` / `major`（默认 `patch`）。
+2. 工作流（`.github/workflows/release.yml`）会自动：读最近一个 `v*` tag → 按 `bump`
+   推算下一个版本（没有 tag 时从 `0.0.0` 起算）→ 校验 tag 不存在 → 用 `git log`
+   抓取上个 tag 到当前 HEAD 的提交标题、按类型分组生成 Release 正文 → 打 annotated tag →
+   `gh release create --notes-file` → 显式 `gh workflow run publish-image.yml --ref <tag>`。
 3. 显式派发是必须的：用 `GITHUB_TOKEN` 推的 tag **不会**再触发 `push` 事件（GitHub 限制），
    所以要手动触发 `publish-image`。它把 `refs/tags/vX.Y.Z` 解析成 `4.5.0`，作为
    `--build-arg VERSION=4.5.0` 传给 `docker/Dockerfile`，产出带版本号的 GHCR 镜像

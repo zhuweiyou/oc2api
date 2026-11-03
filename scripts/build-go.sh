@@ -5,16 +5,16 @@ set -euo pipefail
 
 GO_VERSION="${GO_VERSION:-1.24.13}"
 # 版本号构建期注入：优先用显式 VERSION；否则生成 goreleaser 风格快照号
-# <最近tag>-SNAPSHOT-<短sha>（如 4.4.0-SNAPSHOT-8d598e3）；取不到 git 时退回 0.0.0。
+# <最近tag>-SNAPSHOT-<短sha>（如 4.4.0-SNAPSHOT-8d598e3）；取不到 git 时退回 dev。
 VERSION="${VERSION:-}"
 if [ -z "$VERSION" ]; then
   short="$(git rev-parse --short HEAD 2>/dev/null || true)"
   base="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)"
   base="${base#v}"
   if [ -n "$short" ]; then
-    VERSION="${base:-0.0.0}-SNAPSHOT-${short}"
+    VERSION="${base:-dev}-SNAPSHOT-${short}"
   else
-    VERSION="0.0.0"
+    VERSION="dev"
   fi
 fi
 
