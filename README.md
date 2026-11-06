@@ -1,3 +1,7 @@
+<h1 align="center">🚫 本仓库已停止维护，建议使用 <a href="https://github.com/zhuweiyou/codearts2api">zhuweiyou/codearts2api</a></h1>
+
+---
+
 # oc2api
 
 OpenCode 免费模型的 OpenAI 兼容代理，纯 Go 实现，支持 SSE 流式，可部署到 Vercel、Docker 或本地。
